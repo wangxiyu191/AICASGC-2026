@@ -15,8 +15,52 @@ except ImportError:
     # For testing without PIL
     class Image:
         pass
+import os
 import torch
+from viztracer import VizTracer
 from transformers import AutoModelForImageTextToText, AutoProcessor
+
+
+class ModelWrapper:
+    """Transparent wrapper around the HF model.
+    
+    - Proxies all attribute access to the underlying model via __getattr__
+    - Intercepts generate() for tracing and future optimizations
+    - Benchmark calls vlm.model.generate() which hits this wrapper
+    """
+
+    def __init__(self, model):
+        self._model = model
+        self._enable_trace = os.environ.get("ENABLE_VIZTRACE", "0") == "1"
+        self._call_count = 0
+        if self._enable_trace:
+            self._trace_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "traces")
+            os.makedirs(self._trace_dir, exist_ok=True)
+            print(f"[ModelWrapper] Trace enabled, files will be saved to {self._trace_dir}")
+
+    def generate(self, *args, **kwargs):
+        self._call_count += 1
+        if not self._enable_trace:
+            return self._model.generate(*args, **kwargs)
+
+        trace_file = os.path.join(self._trace_dir, f"generate_{self._call_count}.json")
+        tracer = VizTracer(
+            log_torch=True,
+            output_file=trace_file,
+            max_stack_depth=15,
+            verbose=0,
+        )
+        tracer.start()
+        try:
+            result = self._model.generate(*args, **kwargs)
+        finally:
+            tracer.stop()
+            tracer.save()
+            print(f"[ModelWrapper] Trace saved: {trace_file}")
+        return result
+
+    def __getattr__(self, name):
+        return getattr(self._model, name)
 
 
 class VLMModel:
@@ -58,10 +102,11 @@ class VLMModel:
         )
         self._model.eval()
         
+        # Wrap model for tracing and future optimizations
+        self._wrapped_model = ModelWrapper(self._model)
+        
         # Track applied optimizations
         self._optimizations_applied = []
-        
-      
         
         print(f"[VLMModel] Model loaded successfully on {device}")
         if self._optimizations_applied:
@@ -270,10 +315,10 @@ class VLMModel:
         """
         Required by benchmark for direct model.generate() calls.
         
-        Benchmark directly calls self.model.generate() for performance testing.
-        Your optimizations should modify this model object or its operators.
+        Returns ModelWrapper which proxies to underlying model,
+        intercepting generate() for tracing and optimizations.
         """
-        return self._model
+        return self._wrapped_model
     
     @property
     def device(self):
@@ -323,9 +368,9 @@ class VLMModel:
             return_tensors="pt"
         ).to(self._device)
         
-        # Generate
+        # Generate (goes through ModelWrapper, tracing included if enabled)
         with torch.no_grad():
-            output_ids = self._model.generate(
+            output_ids = self._wrapped_model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
