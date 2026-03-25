@@ -1,0 +1,14 @@
+比赛介绍：README_CN.md
+第二赛季提交说明：UPLOAD_README.md
+优化要求：
+1. 不允许使用量化、稀疏化等等，任何修改模型或者参数的优化方式。
+2. 评测方式为单batch评测，指标包括TTFT、吞吐、准确度。具体参考 README_CN.md
+3. GPU为单张 NVIDIA A800 80GB PCIe
+参考项目（部分）：
+./reference/vllm/
+./reference/sglang/
+./reference/llama.cpp/
+开发环境：所有开发完全在./venv环境中进行。
+优化习惯：将每一步的优化动作和测试结果记录在result.csv中。
+官方信息更新：
+1. 评测环境机器没有配置连接外网。安装受限。（但是本地已经安装了flash-attn2.8.3了）。

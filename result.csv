@@ -1,0 +1,2 @@
+step,optimization,ttft_ms,throughput_tok_s,num_samples,gpu,notes
+0,baseline (FP16 no optimization),133.13,37.22,30,A10,"原始 evaluation_wrapper.py, 仅 use_cache=True"

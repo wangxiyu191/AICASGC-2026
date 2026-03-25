@@ -107,6 +107,8 @@ class VLMModel:
         
         # Track applied optimizations
         self._optimizations_applied = []
+
+        self._optimize_kv_cache()
         
         print(f"[VLMModel] Model loaded successfully on {device}")
         if self._optimizations_applied:

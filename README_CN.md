@@ -126,9 +126,7 @@ class VLMModel:
         
         # 4. Flash Attention 优化
         # self._enable_flash_attention()
-        
-        # 5. 量化优化
-        # self._apply_quantization()
+
 ```
 
 #### 3.3 实现优化代码
