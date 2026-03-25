@@ -61,30 +61,7 @@ class VLMModel:
         # Track applied optimizations
         self._optimizations_applied = []
         
-        # ================================================================
-        # Participant Optimization Area - Enable/disable optimizations here
-        # Uncomment the optimization methods you want to apply
-        # ================================================================
-        
-        # 1. Vision Encoder Acceleration
-        # self._optimize_vision_encoder()
-        
-        # 2. KV Cache Management
-        # self._optimize_kv_cache()
-        
-        # 3. Cross-modal Connector Optimization
-        # self._optimize_cross_modal_connector()
-        
-        # 4. Flash Attention Optimization
-        # self._enable_flash_attention()
-        
-        # 5. Quantization
-        # self._apply_quantization()
-        
-        # Optional: Explore model structure before optimization
-        # self._explore_model_structure()
-        
-        # ================================================================
+      
         
         print(f"[VLMModel] Model loaded successfully on {device}")
         if self._optimizations_applied:
@@ -277,35 +254,6 @@ class VLMModel:
         if 'flash_attention' not in self._optimizations_applied:
             self._optimizations_applied.append('flash_attention')
     
-    def _apply_quantization(self):
-        """
-        Apply quantization to reduce model size and speed up inference.
-        
-        Optimization Directions:
-        1. INT8 quantization (8-bit integer)
-        2. FP8 quantization (8-bit floating point)
-        3. Mixed precision quantization
-        4. Dynamic vs static quantization
-        
-        Implementation Steps:
-        1. Choose quantization strategy based on accuracy/performance trade-off
-        2. Use quantization libraries (BitsAndBytes, TensorRT, etc.)
-        3. Calibrate quantized model on validation data
-        4. Verify accuracy preservation
-        
-        Note: Quantization may require reloading the model with quantization config.
-        Consider applying quantization before other optimizations if model reload is needed.
-        """
-        # TODO: Implement your quantization here
-        # 
-        # Example workflow:
-        # 1. from transformers import BitsAndBytesConfig
-        # 2. quantization_config = BitsAndBytesConfig(load_in_8bit=True)
-        # 3. Note: May need to reload model with quantization config
-        # 4. Test: Verify accuracy and performance improvements
-        
-        if 'quantization' not in self._optimizations_applied:
-            self._optimizations_applied.append('quantization')
     
     # Required properties for benchmark
     @property
