@@ -66,26 +66,50 @@ class ModelWrapper:
         temperature = kwargs.get("temperature", 1.0)
         use_cache = kwargs.get("use_cache", True)
 
-        # Phase 3: Custom decode loop with StaticCache (DISABLED - under development)
-        # Issue: Performance regression compared to original generate
-        # TODO: Need proper cache_position handling and attention_mask update
-        # if use_cache and not do_sample and max_new_tokens <= self.MAX_TOKENS_THRESHOLD:
-        #     try:
-        #         return self._generate_with_static_cache(*args, **kwargs)
-        #     except Exception as e:
-        #         print(f"[ModelWrapper] Custom decode loop failed: {e}, falling back to original")
-        #         return self._model.generate(*args, **kwargs)
-        return self._model.generate(*args, **kwargs)
+        # Check if we should trace this call
+        if not self._enable_trace or not self._should_trace(kwargs):
+            # Phase 3: Custom decode loop (DISABLED - needs more debugging)
+            # Issue: Custom loop slower than original generate
+            # Root cause: Model internal forward still has sync points
+            # if use_cache and not do_sample and max_new_tokens <= self.MAX_TOKENS_THRESHOLD:
+            #     try:
+            #         return self._generate_optimized(*args, **kwargs)
+            #     except Exception as e:
+            #         print(f"[ModelWrapper] Optimized decode loop failed: {e}, falling back to original")
+            #         import traceback
+            #         traceback.print_exc()
+            #         return self._model.generate(*args, **kwargs)
+            return self._model.generate(*args, **kwargs)
 
-    def _generate_with_static_cache(self, *args, **kwargs):
-        """Custom generation with StaticCache to eliminate CPU overhead.
+        # Trace this generate call
+        self._trace_count += 1
+        from viztracer import VizTracer
+        trace_file = os.path.join(self._trace_dir, f"generate_{self._trace_count}.json")
+        tracer = VizTracer(
+            log_torch=True,
+            output_file=trace_file,
+            max_stack_depth=15,
+            verbose=0,
+        )
+        tracer.start()
+        try:
+            result = self._model.generate(*args, **kwargs)
+        finally:
+            tracer.stop()
+            tracer.save()
+            print(f"[ModelWrapper] Trace saved: {trace_file} (call #{self._call_count}, max_new_tokens={max_new_tokens})")
+        return result
 
-        Key optimizations:
-        1. Use StaticCache for pre-allocated KV cache (no dynamic allocation)
-        2. Manual decode loop without transformers generate overhead
-        3. Avoid .item() sync points by using tensor operations
+    def _generate_optimized(self, *args, **kwargs):
+        """Optimized generation with minimal CPU overhead.
+
+        Key optimizations based on trace analysis:
+        1. Avoid .item() calls that cause GPU->CPU sync
+        2. Avoid is_nonzero() calls
+        3. Use tensor operations for EOS detection (no sync)
+        4. Pre-allocate outputs to avoid dynamic allocation
         """
-        # Get inputs from args/kwargs
+        # Get inputs
         if args:
             input_ids = args[0]
         else:
@@ -98,8 +122,13 @@ class ModelWrapper:
 
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
+        dtype = self._model.dtype
 
-        # Prepare inputs dict for first forward (prefill)
+        # Get EOS token id from text config
+        text_config = self._model.config.get_text_config(decoder=True)
+        eos_token_id = getattr(text_config, 'eos_token_id', None)
+
+        # Prepare initial inputs
         model_inputs = {
             'input_ids': input_ids,
             'attention_mask': attention_mask,
@@ -110,39 +139,43 @@ class ModelWrapper:
         if image_grid_thw is not None:
             model_inputs['image_grid_thw'] = image_grid_thw
 
-        # Create StaticCache for pre-allocated KV storage
-        # Total length = input length + max_new_tokens
-        max_cache_len = seq_len + max_new_tokens
-        # Use get_text_config(decoder=True) as in transformers generate
-        text_config = self._model.config.get_text_config(decoder=True)
-        past_key_values = StaticCache(
-            config=text_config,
-            max_cache_len=max_cache_len,
-            batch_size=batch_size,
-            device=device,
-            dtype=self._model.dtype,
-        )
-        model_inputs['past_key_values'] = past_key_values
-
-        # Prefill phase: process full input
+        # Use DynamicCache for simplicity (StaticCache has compatibility issues)
+        # Let the model handle cache creation internally
         with torch.no_grad():
             outputs = self._model(**model_inputs)
 
-        # Get next token (greedy decoding)
+        # Get first token
         next_token_logits = outputs.logits[:, -1, :]
         next_tokens = torch.argmax(next_token_logits, dim=-1, keepdim=True)
 
-        # Collect generated tokens
-        generated_tokens = [next_tokens]
+        # Pre-allocate output tensor to avoid cat in loop
+        output_ids = torch.full(
+            (batch_size, seq_len + max_new_tokens),
+            eos_token_id,
+            dtype=torch.long,
+            device=device
+        )
+        output_ids[:, :seq_len] = input_ids
+        output_ids[:, seq_len:seq_len+1] = next_tokens
 
-        # Decode phase: iterative generation with StaticCache
-        for _ in range(max_new_tokens - 1):
-            # Prepare inputs for next token (only the new token)
+        # Track which sequences are done (tensor operation, no sync)
+        done_mask = (next_tokens == eos_token_id).squeeze(-1)
+        current_length = seq_len + 1
+
+        # Get past_key_values from first forward
+        past_key_values = outputs.past_key_values
+
+        # Decode loop - optimized to minimize CPU overhead
+        for step in range(1, max_new_tokens):
+            # Skip if all sequences are done
+            if done_mask.all():
+                break
+
+            # Prepare inputs for next token
             model_inputs = {
                 'input_ids': next_tokens,
                 'past_key_values': past_key_values,
                 'use_cache': True,
-                'cache_position': torch.tensor([past_key_values.get_seq_length() - 1], device=device),
             }
 
             with torch.no_grad():
@@ -152,18 +185,19 @@ class ModelWrapper:
             next_token_logits = outputs.logits[:, -1, :]
             next_tokens = torch.argmax(next_token_logits, dim=-1, keepdim=True)
 
-            # Check for EOS token
-            if hasattr(self._model.config, 'eos_token_id') and self._model.config.eos_token_id is not None:
-                if (next_tokens == self._model.config.eos_token_id).all():
-                    break
+            # Update output
+            output_ids[:, current_length:current_length+1] = next_tokens
+            current_length += 1
 
-            generated_tokens.append(next_tokens)
+            # Update past_key_values
+            past_key_values = outputs.past_key_values
 
-        # Concatenate all tokens: input + generated
-        all_generated = torch.cat(generated_tokens, dim=1)
-        output_ids = torch.cat([input_ids, all_generated], dim=1)
+            # Update done mask (tensor operation, no GPU->CPU sync)
+            if eos_token_id is not None:
+                done_mask = done_mask | (next_tokens.squeeze(-1) == eos_token_id)
 
-        return output_ids
+        # Return only the valid portion
+        return output_ids[:, :current_length]
 
     def __getattr__(self, name):
         return getattr(self._model, name)
@@ -209,10 +243,10 @@ class VLMModel:
         # Root cause: torch._dynamo hit recompile_limit (8) due to dynamic shapes
         # self._apply_torch_compile()
 
-        # Phase 3: Custom decode loop with StaticCache (DISABLED - under development)
-        # Code implemented in ModelWrapper._generate_with_static_cache() but not enabled
-        # due to performance regression. Needs further debugging.
-        # self._optimizations_applied.append("static_cache_decode")
+        # Phase 3: Optimized decode loop (DISABLED - under development)
+        # Code implemented but performance regression observed
+        # Needs investigation into model internal sync points
+        # self._optimizations_applied.append("optimized_decode")
 
         # Wrap model
         self._wrapped_model = ModelWrapper(self._model)
