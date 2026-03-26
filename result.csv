@@ -1,2 +1,5 @@
 step,optimization,ttft_ms,throughput_tok_s,num_samples,gpu,notes
 0,baseline (FP16 no optimization),133.13,37.22,30,A10,"原始 evaluation_wrapper.py, 仅 use_cache=True"
+1a,Phase1: flash_attn_2 + cuda_config + device_map,128.20,29.79,10,A10,"flash_attn throughput退化 -20%,可能A10 varlen效率低"
+1b,Phase1: flash_attn_2 + cuda_config + .to(device),125.99,29.21,10,A10,".to(device)替代device_map, throughput无改善"
+1c,Phase1: sdpa + cuda_config + device_map,121.35,37.57,10,A10,"sdpa在A10上最优: TTFT -9%, throughput持平"

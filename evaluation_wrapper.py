@@ -1,358 +1,113 @@
 """
 AICAS 2026 - Participant Core Modification File
 
-Participants should modify the VLMModel class to implement optimizations.
-
-Note:
-- Benchmark directly calls self.model.generate() for performance testing.
-- Your optimizations should modify self.model or its operators in __init__ via Monkey Patch.
-- The generate() method is optional and mainly for debugging.
+Optimized VLMModel for Qwen3-VL-2B-Instruct inference.
+Phase 1: flash_attn + CUDA config + no accelerate dispatch overhead.
 """
 from typing import Dict
 try:
     from PIL import Image
 except ImportError:
-    # For testing without PIL
     class Image:
         pass
-import os
 import torch
-from viztracer import VizTracer
 from transformers import AutoModelForImageTextToText, AutoProcessor
+
+try:
+    import flash_attn
+    HAS_FLASH_ATTN = True
+except ImportError:
+    HAS_FLASH_ATTN = False
 
 
 class ModelWrapper:
-    """Transparent wrapper around the HF model.
-    
-    - Proxies all attribute access to the underlying model via __getattr__
-    - Intercepts generate() for tracing and future optimizations
-    - Benchmark calls vlm.model.generate() which hits this wrapper
-    """
+    """Transparent wrapper around the HF model."""
 
     def __init__(self, model):
         self._model = model
-        self._enable_trace = os.environ.get("ENABLE_VIZTRACE", "0") == "1"
-        self._call_count = 0
-        if self._enable_trace:
-            self._trace_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "traces")
-            os.makedirs(self._trace_dir, exist_ok=True)
-            print(f"[ModelWrapper] Trace enabled, files will be saved to {self._trace_dir}")
 
     def generate(self, *args, **kwargs):
-        self._call_count += 1
-        if not self._enable_trace:
-            return self._model.generate(*args, **kwargs)
-
-        trace_file = os.path.join(self._trace_dir, f"generate_{self._call_count}.json")
-        tracer = VizTracer(
-            log_torch=True,
-            output_file=trace_file,
-            max_stack_depth=15,
-            verbose=0,
-        )
-        tracer.start()
-        try:
-            result = self._model.generate(*args, **kwargs)
-        finally:
-            tracer.stop()
-            tracer.save()
-            print(f"[ModelWrapper] Trace saved: {trace_file}")
-        return result
+        return self._model.generate(*args, **kwargs)
 
     def __getattr__(self, name):
         return getattr(self._model, name)
 
 
 class VLMModel:
-    """
-    Participant optimization class - modify this to implement optimizations.
-    
-    Optimization Architecture:
-    - Split optimizations into separate methods for isolation and testing
-    - Enable/disable each optimization independently in __init__
-    - Each optimization method can be tested individually
-    
-    Important Notes:
-    1. Benchmark directly calls self.model.generate() for performance testing.
-    2. Your optimizations should modify self.model or its operators via Monkey Patch.
-    3. All optimizations are applied in __init__ by calling optimization methods.
-    """
-    
     def __init__(self, model_path: str, device: str = "cuda:0"):
-        """
-        Initialize model and apply optimizations.
-        
-        Args:
-            model_path: Qwen3-VL-2B-Instruct model path
-            device: CUDA device, e.g., "cuda:0"
-        """
         self._device = device
         self.model_path = model_path
-        
+        self._optimizations_applied = []
+
+        import time as _time
+
+        # CUDA backend config: TF32, flash SDP, etc.
+        self._configure_cuda()
+
         # Load processor
-        print(f"[VLMModel] Loading processor from {model_path}...")
+        t0 = _time.perf_counter()
         self._processor = AutoProcessor.from_pretrained(model_path)
-        
-        # Load model
-        print(f"[VLMModel] Loading model with FP16...")
+        print(f"[VLMModel] Processor loaded in {_time.perf_counter()-t0:.2f}s")
+
+        # Load model with flash_attention_2 if available, fallback to sdpa
+        # flash_attention_2 on A800 (eval env), sdpa fallback on other GPUs
+        attn_impl = "flash_attention_2" if HAS_FLASH_ATTN else "sdpa"
+        print(f"[VLMModel] Loading model with attn_implementation={attn_impl}...")
+        t0 = _time.perf_counter()
         self._model = AutoModelForImageTextToText.from_pretrained(
             model_path,
             torch_dtype=torch.float16,
-            device_map=device
+            device_map=device,
+            attn_implementation=attn_impl,
         )
         self._model.eval()
-        
-        # Wrap model for tracing and future optimizations
-        self._wrapped_model = ModelWrapper(self._model)
-        
-        # Track applied optimizations
-        self._optimizations_applied = []
+        print(f"[VLMModel] Model loaded in {_time.perf_counter()-t0:.2f}s")
+        self._optimizations_applied.append(f"attn:{attn_impl}")
 
+        # KV cache config
         self._optimize_kv_cache()
-        
-        print(f"[VLMModel] Model loaded successfully on {device}")
-        if self._optimizations_applied:
-            print(f"[VLMModel] Applied optimizations: {', '.join(self._optimizations_applied)}")
-    
-    # ================================================================
-    # Optimization Methods - Implement your optimizations here
-    # ================================================================
-    
-    def _explore_model_structure(self):
-        """
-        Helper method to explore model structure.
-        
-        Use this to understand the model architecture before implementing optimizations.
-        This helps identify where to apply monkey patches.
-        """
-        print("=" * 60)
-        print("Model Structure Exploration")
-        print("=" * 60)
-        
-        # Explore vision model structure
-        if hasattr(self._model, 'vision_model'):
-            print(f"Vision Model: {type(self._model.vision_model)}")
-            if hasattr(self._model.vision_model, 'encoder'):
-                if hasattr(self._model.vision_model.encoder, 'layers'):
-                    print(f"  Vision Encoder Layers: {len(self._model.vision_model.encoder.layers)}")
-                    # Show first layer structure
-                    if len(self._model.vision_model.encoder.layers) > 0:
-                        print(f"  First Layer Type: {type(self._model.vision_model.encoder.layers[0])}")
-        else:
-            print("Vision Model: Not found (model structure may differ)")
-        
-        # Explore language model structure
-        if hasattr(self._model, 'model'):
-            print(f"Language Model: {type(self._model.model)}")
-            if hasattr(self._model.model, 'layers'):
-                print(f"  Language Model Layers: {len(self._model.model.layers)}")
-        else:
-            print("Language Model: Not found (model structure may differ)")
-        
-        # Explore cross-modal components
-        cross_modal_attrs = ['connector', 'cross_attn', 'cross_attention', 'proj', 'projector']
-        found_components = []
-        for attr in cross_modal_attrs:
-            if hasattr(self._model, attr):
-                found_components.append(attr)
-        if found_components:
-            print(f"Cross-modal Components: {', '.join(found_components)}")
-        else:
-            print("Cross-modal Components: Explore manually (structure may vary)")
-        
-        print("=" * 60)
-        print("Tip: Use print(self._model) to see full model structure")
-        print("=" * 60)
-    
-    def _optimize_vision_encoder(self):
-        """
-        Optimize Vision Encoder for high-resolution image inputs.
-        
-        Optimization Directions:
-        1. Patch embedding convolution optimization
-        2. Vision Transformer attention mechanism optimization
-        3. Layer normalization optimization
-        4. Memory-efficient image processing
-        
-        Implementation Steps:
-        1. Inspect model structure: call self._explore_model_structure()
-        2. Identify bottlenecks using profiling tools (PyTorch Profiler, nsys, etc.)
-        3. Implement optimized operators (Triton/CUDA kernels)
-        4. Replace original operators via monkey patch
-        
-        Target Components:
-        - self._model.vision_model (if exists)
-        - Vision encoder layers and attention mechanisms
-        - Convolution operations in patch embedding
-        """
-        # TODO: Implement your Vision Encoder optimization here
-        # 
-        # Example workflow:
-        # 1. from your_optimization import optimized_attention, optimized_conv
-        # 2. Inspect: print(self._model.vision_model) to find target layers
-        # 3. Replace: layer.self_attn.forward = optimized_attention
-        # 4. Test: Run benchmark to verify improvement
-        
-        if 'vision_encoder' not in self._optimizations_applied:
-            self._optimizations_applied.append('vision_encoder')
-    
+
+        # Wrap model
+        self._wrapped_model = ModelWrapper(self._model)
+
+        print(f"[VLMModel] Optimizations: {', '.join(self._optimizations_applied)}")
+
+    def _configure_cuda(self):
+        """CUDA backend configuration for max performance."""
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+        torch.set_float32_matmul_precision('high')
+        self._optimizations_applied.append("cuda_config")
+
     def _optimize_kv_cache(self):
-        """
-        Optimize KV Cache management to reduce memory fragmentation.
-        
-        Optimization Directions:
-        1. Memory layout optimization (contiguous memory allocation)
-        2. Fragmentation-free allocation strategies
-        3. Efficient cache reuse patterns
-        4. Dynamic cache sizing
-        
-        Implementation Steps:
-        1. Understand current KV cache implementation in model layers
-        2. Design memory-efficient cache allocation strategy
-        3. Implement custom KV cache allocator if needed
-        4. Apply optimizations via monkey patch or config modification
-        
-        Target Components:
-        - self._model.config (cache configuration)
-        - Attention layers (KV cache allocation)
-        - Generation loop (cache management)
-        """
-        # Enable KV Cache first
+        """KV Cache basic configuration."""
         self._model.config.use_cache = True
         if hasattr(self._model.config, 'pad_token_id'):
             if self._model.config.pad_token_id is None:
                 self._model.config.pad_token_id = self._model.config.eos_token_id
-        
-        # TODO: Implement advanced KV Cache optimizations here
-        # 
-        # Example workflow:
-        # 1. from your_optimization import FragmentationFreeKVCache
-        # 2. for layer in self._model.model.layers:
-        # 3.     layer.attention.custom_kv_cache = FragmentationFreeKVCache()
-        # 4. Test: Monitor memory usage and generation speed
-        
-        if 'kv_cache' not in self._optimizations_applied:
-            self._optimizations_applied.append('kv_cache')
-    
-    def _optimize_cross_modal_connector(self):
-        """
-        Optimize Cross-modal Connector computation efficiency.
-        
-        Optimization Directions:
-        1. Cross-attention mechanism optimization
-        2. Vision-to-language projection optimization
-        3. Multi-modal fusion layer efficiency
-        4. Feature alignment and transformation optimization
-        
-        Implementation Steps:
-        1. Identify cross-modal components using self._explore_model_structure()
-        2. Profile cross-modal operations to find bottlenecks
-        3. Implement optimized cross-attention or projection kernels
-        4. Replace original operations via monkey patch
-        
-        Note: Qwen3-VL's cross-modal structure may vary.
-        Use model exploration to identify actual component names and locations.
-        """
-        # TODO: Implement your Cross-modal Connector optimization here
-        # 
-        # Example workflow:
-        # 1. Explore: self._explore_model_structure() to find connector components
-        # 2. from your_optimization import optimized_cross_attention
-        # 3. Identify: Inspect model to find cross-attention layers
-        # 4. Replace: connector.cross_attention.forward = optimized_cross_attention
-        # 5. Test: Verify accuracy and performance improvements
-        
-        if 'cross_modal' not in self._optimizations_applied:
-            self._optimizations_applied.append('cross_modal')
-    
-    def _enable_flash_attention(self):
-        """
-        Enable or implement Flash Attention optimization.
-        
-        Implementation Approaches:
-        
-        Approach 1: Enable PyTorch's Built-in Flash Attention (Simple)
-            - Uses torch.backends.cuda.enable_flash_sdp(True)
-            - Easy to enable but limited customization
-            - May not work for all attention patterns in Qwen3-VL
-        
-        Approach 2: Implement Custom Flash Attention (Advanced, Recommended)
-            - Write custom Triton/CUDA kernels for attention computation
-            - Replace torch.nn.functional.scaled_dot_product_attention
-            - Full control over attention computation and memory layout
-            - Better performance potential but requires more implementation effort
-        
-        Recommended: Implement Approach 2 for better performance gains.
-        Use profiling to identify which attention operations benefit most from optimization.
-        """
-        # TODO: Choose and implement your Flash Attention approach
-        
-        # Approach 1: Simple (enable PyTorch built-in)
-        # torch.backends.cuda.enable_flash_sdp(True)
-        
-        # Approach 2: Advanced (custom implementation - recommended)
-        # from your_optimization import custom_flash_attention
-        # torch.nn.functional.scaled_dot_product_attention = custom_flash_attention
-        # 
-        # Or replace at layer level:
-        # for layer in self._model.model.layers:
-        #     layer.self_attn.forward = custom_attention_with_flash
-        
-        if 'flash_attention' not in self._optimizations_applied:
-            self._optimizations_applied.append('flash_attention')
-    
-    
-    # Required properties for benchmark
+        self._optimizations_applied.append("kv_cache")
+
     @property
     def processor(self):
-        """
-        Required by benchmark for input processing.
-        
-        Benchmark uses this to prepare inputs with unified tokenizer.
-        """
         return self._processor
-    
+
     @property
     def model(self):
-        """
-        Required by benchmark for direct model.generate() calls.
-        
-        Returns ModelWrapper which proxies to underlying model,
-        intercepting generate() for tracing and optimizations.
-        """
         return self._wrapped_model
-    
+
     @property
     def device(self):
-        """
-        Required by benchmark for device information.
-        """
         return self._device
-    
+
     def generate(
-        self, 
-        image: Image.Image, 
-        question: str, 
+        self,
+        image: Image.Image,
+        question: str,
         max_new_tokens: int = 128
     ) -> Dict:
-        """
-        Generate answer (optional method, mainly for debugging).
-        
-        Note: Benchmark uses self.model.generate() directly for performance testing.
-        This method is provided for convenience and debugging purposes.
-        
-        Args:
-            image: PIL Image object
-            question: Question text
-            max_new_tokens: Maximum tokens to generate
-        
-        Returns:
-            Dict: {
-                "text": str,        # Generated text answer
-                "token_count": int  # Generated token count
-            }
-        """
-        # Build Qwen3-VL message format
+        """Generate answer (for debugging, benchmark uses model.generate directly)."""
         messages = [{
             "role": "user",
             "content": [
@@ -360,8 +115,7 @@ class VLMModel:
                 {"type": "text", "text": question}
             ]
         }]
-        
-        # Process inputs
+
         inputs = self._processor.apply_chat_template(
             messages,
             tokenize=True,
@@ -369,29 +123,24 @@ class VLMModel:
             return_dict=True,
             return_tensors="pt"
         ).to(self._device)
-        
-        # Generate (goes through ModelWrapper, tracing included if enabled)
+
         with torch.no_grad():
             output_ids = self._wrapped_model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
-                temperature=0.0,
-                top_p=1.0,
                 use_cache=True
             )
-        
-        # Extract generated tokens (remove input part)
+
         input_len = inputs.input_ids.shape[1]
         generated_ids = output_ids[0][input_len:]
-        
-        # Decode
+
         text = self._processor.tokenizer.decode(
             generated_ids,
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False
         )
-        
+
         return {
             "text": text,
             "token_count": len(generated_ids)
