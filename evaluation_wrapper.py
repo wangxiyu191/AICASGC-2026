@@ -3,7 +3,8 @@ AICAS 2026 - Participant Core Modification File
 
 Optimized VLMModel for Qwen3-VL-2B-Instruct inference.
 Phase 1: flash_attn + CUDA config + no accelerate dispatch overhead.
-Phase 2: torch.compile on language_model for operator fusion.
+Phase 2: torch.compile on language_model (DISABLED - recompilation issues).
+Phase 3: Custom decode loop with StaticCache for throughput optimization.
 """
 from typing import Dict
 try:
@@ -14,6 +15,7 @@ except ImportError:
 import os
 import torch
 from transformers import AutoModelForImageTextToText, AutoProcessor
+from transformers.cache_utils import StaticCache
 
 try:
     import flash_attn
@@ -23,7 +25,7 @@ except ImportError:
 
 
 class ModelWrapper:
-    """Transparent wrapper around the HF model."""
+    """Transparent wrapper around the HF model with custom decode loop."""
 
     # Number of warmup calls to skip before tracing
     WARMUP_CALLS = 10
@@ -55,27 +57,113 @@ class ModelWrapper:
         return True
 
     def generate(self, *args, **kwargs):
+        """Generate with custom decode loop using StaticCache for throughput optimization."""
         self._call_count += 1
-        if not self._enable_trace or not self._should_trace(kwargs):
-            return self._model.generate(*args, **kwargs)
 
-        self._trace_count += 1
-        from viztracer import VizTracer
-        trace_file = os.path.join(self._trace_dir, f"generate_{self._trace_count}.json")
-        tracer = VizTracer(
-            log_torch=True,
-            output_file=trace_file,
-            max_stack_depth=15,
-            verbose=0,
+        # Extract generation parameters
+        max_new_tokens = kwargs.get("max_new_tokens", 128)
+        do_sample = kwargs.get("do_sample", False)
+        temperature = kwargs.get("temperature", 1.0)
+        use_cache = kwargs.get("use_cache", True)
+
+        # Phase 3: Custom decode loop with StaticCache (DISABLED - under development)
+        # Issue: Performance regression compared to original generate
+        # TODO: Need proper cache_position handling and attention_mask update
+        # if use_cache and not do_sample and max_new_tokens <= self.MAX_TOKENS_THRESHOLD:
+        #     try:
+        #         return self._generate_with_static_cache(*args, **kwargs)
+        #     except Exception as e:
+        #         print(f"[ModelWrapper] Custom decode loop failed: {e}, falling back to original")
+        #         return self._model.generate(*args, **kwargs)
+        return self._model.generate(*args, **kwargs)
+
+    def _generate_with_static_cache(self, *args, **kwargs):
+        """Custom generation with StaticCache to eliminate CPU overhead.
+
+        Key optimizations:
+        1. Use StaticCache for pre-allocated KV cache (no dynamic allocation)
+        2. Manual decode loop without transformers generate overhead
+        3. Avoid .item() sync points by using tensor operations
+        """
+        # Get inputs from args/kwargs
+        if args:
+            input_ids = args[0]
+        else:
+            input_ids = kwargs.get('input_ids')
+
+        attention_mask = kwargs.get('attention_mask')
+        pixel_values = kwargs.get('pixel_values')
+        image_grid_thw = kwargs.get('image_grid_thw')
+        max_new_tokens = kwargs.get('max_new_tokens', 128)
+
+        batch_size, seq_len = input_ids.shape
+        device = input_ids.device
+
+        # Prepare inputs dict for first forward (prefill)
+        model_inputs = {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'use_cache': True,
+        }
+        if pixel_values is not None:
+            model_inputs['pixel_values'] = pixel_values
+        if image_grid_thw is not None:
+            model_inputs['image_grid_thw'] = image_grid_thw
+
+        # Create StaticCache for pre-allocated KV storage
+        # Total length = input length + max_new_tokens
+        max_cache_len = seq_len + max_new_tokens
+        # Use get_text_config(decoder=True) as in transformers generate
+        text_config = self._model.config.get_text_config(decoder=True)
+        past_key_values = StaticCache(
+            config=text_config,
+            max_cache_len=max_cache_len,
+            batch_size=batch_size,
+            device=device,
+            dtype=self._model.dtype,
         )
-        tracer.start()
-        try:
-            result = self._model.generate(*args, **kwargs)
-        finally:
-            tracer.stop()
-            tracer.save()
-            print(f"[ModelWrapper] Trace saved: {trace_file} (call #{self._call_count}, max_new_tokens={kwargs.get('max_new_tokens', 'N/A')})")
-        return result
+        model_inputs['past_key_values'] = past_key_values
+
+        # Prefill phase: process full input
+        with torch.no_grad():
+            outputs = self._model(**model_inputs)
+
+        # Get next token (greedy decoding)
+        next_token_logits = outputs.logits[:, -1, :]
+        next_tokens = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+
+        # Collect generated tokens
+        generated_tokens = [next_tokens]
+
+        # Decode phase: iterative generation with StaticCache
+        for _ in range(max_new_tokens - 1):
+            # Prepare inputs for next token (only the new token)
+            model_inputs = {
+                'input_ids': next_tokens,
+                'past_key_values': past_key_values,
+                'use_cache': True,
+                'cache_position': torch.tensor([past_key_values.get_seq_length() - 1], device=device),
+            }
+
+            with torch.no_grad():
+                outputs = self._model(**model_inputs)
+
+            # Get next token
+            next_token_logits = outputs.logits[:, -1, :]
+            next_tokens = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+
+            # Check for EOS token
+            if hasattr(self._model.config, 'eos_token_id') and self._model.config.eos_token_id is not None:
+                if (next_tokens == self._model.config.eos_token_id).all():
+                    break
+
+            generated_tokens.append(next_tokens)
+
+        # Concatenate all tokens: input + generated
+        all_generated = torch.cat(generated_tokens, dim=1)
+        output_ids = torch.cat([input_ids, all_generated], dim=1)
+
+        return output_ids
 
     def __getattr__(self, name):
         return getattr(self._model, name)
@@ -119,8 +207,12 @@ class VLMModel:
         # Issue: KV Cache dynamic initialization causes frequent recompilations
         # Result: TTFT +0.5%, Throughput -34.8% (worse than Phase 1)
         # Root cause: torch._dynamo hit recompile_limit (8) due to dynamic shapes
-        # Solution: Need custom decode loop with StaticCache to eliminate recompilation
         # self._apply_torch_compile()
+
+        # Phase 3: Custom decode loop with StaticCache (DISABLED - under development)
+        # Code implemented in ModelWrapper._generate_with_static_cache() but not enabled
+        # due to performance regression. Needs further debugging.
+        # self._optimizations_applied.append("static_cache_decode")
 
         # Wrap model
         self._wrapped_model = ModelWrapper(self._model)
