@@ -4,3 +4,4 @@ step,optimization,ttft_ms,throughput_tok_s,num_samples,gpu,notes
 1b,Phase1: flash_attn_2 + cuda_config + .to(device),125.99,29.21,10,A10,".to(device)替代device_map, throughput无改善"
 1c,Phase1: sdpa + cuda_config + device_map,121.35,37.57,10,A10,"sdpa在A10上最优: TTFT -9%, throughput持平"
 2,官方A800环境评测(当前提交版本),68.32,33.07,5000,A800,"准确率0.7044, 官方评测成绩"
+3,Phase2: torch.compile language_model,121.99,24.51,10,A10,"频繁重编译导致性能下降,需自定义decode loop"

@@ -3,6 +3,7 @@ AICAS 2026 - Participant Core Modification File
 
 Optimized VLMModel for Qwen3-VL-2B-Instruct inference.
 Phase 1: flash_attn + CUDA config + no accelerate dispatch overhead.
+Phase 2: torch.compile on language_model for operator fusion.
 """
 from typing import Dict
 try:
@@ -114,6 +115,13 @@ class VLMModel:
         # KV cache config
         self._optimize_kv_cache()
 
+        # Phase 2: torch.compile for language model (DISABLED)
+        # Issue: KV Cache dynamic initialization causes frequent recompilations
+        # Result: TTFT +0.5%, Throughput -34.8% (worse than Phase 1)
+        # Root cause: torch._dynamo hit recompile_limit (8) due to dynamic shapes
+        # Solution: Need custom decode loop with StaticCache to eliminate recompilation
+        # self._apply_torch_compile()
+
         # Wrap model
         self._wrapped_model = ModelWrapper(self._model)
 
@@ -135,6 +143,40 @@ class VLMModel:
             if self._model.config.pad_token_id is None:
                 self._model.config.pad_token_id = self._model.config.eos_token_id
         self._optimizations_applied.append("kv_cache")
+
+    def _apply_torch_compile(self):
+        """Apply torch.compile to language model for operator fusion.
+
+        Note: Only compile language_model, NOT vision_model due to:
+        1. flash_attn_varlen_func incompatibility with torch.compile
+        2. Dynamic shapes in vision encoder cause frequent recompiles
+        """
+        try:
+            import time as _time
+            t0 = _time.perf_counter()
+
+            # Qwen3-VL structure: model.model.language_model is the LLM part
+            # model structure: Qwen3VLForConditionalGeneration
+            #   -> model: Qwen3VLModel
+            #      -> visual: Qwen3VLVisionModel (skip compile)
+            #      -> language_model: Qwen3VLTextModel (compile this)
+            if hasattr(self._model, 'model') and hasattr(self._model.model, 'language_model'):
+                print("[VLMModel] Applying torch.compile to language_model...")
+                # Use mode='default' with dynamic=True to handle variable sequence lengths
+                # Avoid 'reduce-overhead' due to CUDA Graph conflicts with DeepStack
+                self._model.model.language_model = torch.compile(
+                    self._model.model.language_model,
+                    mode="default",
+                    dynamic=True,  # Handle variable sequence lengths
+                    fullgraph=False,  # Allow graph breaks for complex control flow
+                )
+                self._optimizations_applied.append("torch_compile")
+                print(f"[VLMModel] torch.compile applied in {_time.perf_counter()-t0:.2f}s")
+            else:
+                print("[VLMModel] Warning: language_model not found, skipping torch.compile")
+        except Exception as e:
+            print(f"[VLMModel] Warning: torch.compile failed: {e}")
+            # Continue without torch.compile - don't break the model loading
 
     @property
     def processor(self):

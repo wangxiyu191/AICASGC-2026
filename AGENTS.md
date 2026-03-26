@@ -14,4 +14,4 @@
 1. 评测环境机器没有配置连接外网。安装受限。（但是本地已经安装了flash-attn2.8.3了）。
 工作建议：
 1. 在一项优化完成后，commit提交，方便后续查阅和回滚。
-2. 运行bench时使用TQDM_DISABLE=1，避免stdout阻塞导致benchmark卡住。
+2. 运行bench时必须使用TQDM_DISABLE=1，不然肯定stdout阻塞导致benchmark卡住。
