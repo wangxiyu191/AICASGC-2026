@@ -10,6 +10,7 @@ try:
 except ImportError:
     class Image:
         pass
+import os
 import torch
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
@@ -23,11 +24,57 @@ except ImportError:
 class ModelWrapper:
     """Transparent wrapper around the HF model."""
 
+    # Number of warmup calls to skip before tracing
+    WARMUP_CALLS = 10
+    # Only trace generate calls with max_new_tokens <= this threshold
+    # (skips accuracy verification calls which use max_new_tokens=1024)
+    MAX_TOKENS_THRESHOLD = 128
+
     def __init__(self, model):
         self._model = model
+        self._enable_trace = os.environ.get("ENABLE_VIZTRACE", "0") == "1"
+        self._call_count = 0
+        self._trace_count = 0
+        if self._enable_trace:
+            from viztracer import VizTracer  # noqa: F401
+            self._trace_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "traces")
+            os.makedirs(self._trace_dir, exist_ok=True)
+            print(f"[ModelWrapper] Trace enabled, files will be saved to {self._trace_dir}")
+            print(f"[ModelWrapper] Skipping first {self.WARMUP_CALLS} warmup calls and accuracy (max_new_tokens>{self.MAX_TOKENS_THRESHOLD}) calls")
+
+    def _should_trace(self, kwargs):
+        """Determine if this generate call should be traced."""
+        # Skip warmup phase
+        if self._call_count <= self.WARMUP_CALLS:
+            return False
+        # Skip accuracy verification (max_new_tokens > threshold)
+        max_new_tokens = kwargs.get("max_new_tokens", 0)
+        if max_new_tokens > self.MAX_TOKENS_THRESHOLD:
+            return False
+        return True
 
     def generate(self, *args, **kwargs):
-        return self._model.generate(*args, **kwargs)
+        self._call_count += 1
+        if not self._enable_trace or not self._should_trace(kwargs):
+            return self._model.generate(*args, **kwargs)
+
+        self._trace_count += 1
+        from viztracer import VizTracer
+        trace_file = os.path.join(self._trace_dir, f"generate_{self._trace_count}.json")
+        tracer = VizTracer(
+            log_torch=True,
+            output_file=trace_file,
+            max_stack_depth=15,
+            verbose=0,
+        )
+        tracer.start()
+        try:
+            result = self._model.generate(*args, **kwargs)
+        finally:
+            tracer.stop()
+            tracer.save()
+            print(f"[ModelWrapper] Trace saved: {trace_file} (call #{self._call_count}, max_new_tokens={kwargs.get('max_new_tokens', 'N/A')})")
+        return result
 
     def __getattr__(self, name):
         return getattr(self._model, name)
