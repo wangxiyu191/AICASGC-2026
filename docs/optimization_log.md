@@ -92,6 +92,60 @@ A800 官方评测发现 flash_attention_2 导致 throughput 仅 33.07 tok/s（�
 | Throughput | 39.58 tok/s | **+13.0%** |
 | 样本数 | 10 | A10 |
 
+## Triton Fused RMSNorm + RoPE
+
+在 OptimizedDecoderLayer 基础上，用 Triton 自定义 kernel 替换 PyTorch native 实现。
+
+### 优化内容
+
+1. **Triton RMSNorm**: 8 PyTorch ops → 1 Triton kernel per norm call
+2. **Triton RoPE**: 5 kernels (cat/neg/mul/mul/add) → 1 Triton kernel per call
+
+### A10 结果
+
+| Step | 优化 | TTFT | Throughput | vs Step 8 |
+|------|------|------|------------|-----------|
+| 10 | + Triton RMSNorm | 115.87ms | 48.11 tok/s | +21.5% |
+| 11 | + Triton RoPE | 117.89ms | 50.83 tok/s | +28.4% |
+
+## Step 12: Decode 阶段 Triton → Native Ops 分支
+
+### 问题发现
+
+通过 viztracer (max_stack_depth=40) 深度分析 decode 阶段，发现 **Triton Python dispatch 是最大瓶颈**：
+
+| 指标 | 数值 |
+|------|------|
+| 每步 wall time | 25.7ms (= 39 tok/s) |
+| 每步 GPU kernel 时间 | 4.3ms (= 231 tok/s 理论上限) |
+| GPU 利用率 | 仅 17% |
+| Triton Python dispatch / step | 11.2ms (占 44%) |
+
+Triton kernel 在 decode 阶段 tensor 极小 (batch=1, seq=1) 时：
+- `_rms_norm`: Python dispatch 69us/call vs GPU kernel 2.3us/call (**30x**)
+- `_rope_fwd`: Python dispatch 62us/call vs GPU kernel 1.7us/call (**36x**)
+
+每步 168 次 Triton launch (28层 × 6次)，Python 侧开销 11.2ms >> GPU 计算。
+
+### 优化方案
+
+在 `_rms_norm` 和 `_apply_rotary_emb` 中加入 tensor 大小分支 (`M <= 32`)：
+- decode (小 tensor): 使用 `F.rms_norm` / PyTorch native RoPE (dispatch ~5-10us)
+- prefill (大 tensor): 继续使用 Triton kernel (amortize dispatch over large data)
+
+### A10 结果
+
+| 指标 | Step 11 (all Triton) | Step 12 (native decode) | 变化 |
+|------|---------------------|------------------------|------|
+| TTFT | 117.89ms | 111.81ms | **-5.2%** |
+| Throughput | 50.83 tok/s | 54.90 tok/s | **+8.0%** |
+| 样本数 | 10 | 10 | A10 |
+
+### 启示
+
+Decode 阶段 CPU 开销远超 GPU 计算，native ops 分支只解决了 Triton dispatch 部分。
+剩余瓶颈 (HF generate Python loop、item() sync、cudaLaunchKernel) 需要 CUDA Graph + 自定义 decode loop 根本性解决。
+
 ## 踩坑记录
 
 ### torch.compile + flash_attn_varlen 不兼容

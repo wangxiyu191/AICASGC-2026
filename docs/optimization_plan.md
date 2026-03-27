@@ -15,8 +15,10 @@
 - [x] P0: 强制 SDPA (修复 flash_attn_2 吞吐量退化 ~40%)
 - [x] Phase 4: OptimizedDecoderLayer - fused QKV + fused gate_up (A10 throughput +13%)
 - [x] CUDA config: TF32, flash/mem_efficient SDP
+- [x] Triton fused RMSNorm + RoPE (A10 throughput +28.4% vs step 8)
+- [x] Step 12: decode 阶段 Triton→native ops 分支 (A10 throughput +8.0% vs step 11)
 
-**待 A800 验证:** fused QKV + gate_up (commit `[historical commit]`)
+**待 A800 验证:** Step 12 (Triton RMSNorm/RoPE + native decode 分支)
 
 ---
 
@@ -86,13 +88,13 @@
 
 ### Phase 3: Triton 自定义 Kernel (算子级优化)
 
-#### 3.1 Triton Fused RMSNorm — ❌ 无效
-- 结果: decode 小 tensor (batch=1, seq_len=1) 下 Triton launch 开销 159us > native 59us
-- Triton kernel launch 固定 ~100us，112 次/step = +11.2ms 额外开销
+#### 3.1 Triton Fused RMSNorm — ✅ 有效 (prefill), 需 native 分支 (decode)
+- 结果: prefill 大 tensor 有效 (+21.5%), decode 小 tensor Triton dispatch 65us >> GPU 2us
+- 解决: M<=32 时 fallback 到 F.rms_norm
 
-#### 3.2 Triton Fused Rotary Embedding (RoPE) — 待尝试
-- 方案: 融合 RoPE 计算到 attention kernel
-- 原理: 减少单独的 RoPE kernel 调用
+#### 3.2 Triton Fused Rotary Embedding (RoPE) — ✅ 有效 (prefill), 需 native 分支 (decode)
+- 结果: prefill 有效 (+5.7%), decode 同样有 dispatch 开销问题
+- 解决: seq_len<=32 时 fallback 到 PyTorch native RoPE
 
 #### 3.3 Triton Fused SwiGLU FFN — ❌ 无效
 - 结果: swiglu 14.1us vs native silu*up 12.0us，收益可忽略
@@ -104,19 +106,43 @@
 #### 3.5 Fused gate_up Projection — ✅ 已完成
 - 实现: 合并 gate_proj/up_proj 权重为 [12288, 2048]，使用 F.linear 1 次 GEMM
 
-### Phase 4: 系统级优化 (精调)
+### Phase 4: CUDA Graph + 自定义 Decode Loop (系统级优化)
 
-#### 4.1 内存预分配与池化
-- 方案: 预分配所有中间张量缓冲区
-- 原理: 避免运行时 cudaMalloc/cudaFree
+> **这是当前最大的优化杠杆。** Trace 分析显示 decode 阶段 GPU 利用率仅 17%（GPU 4.3ms/step vs wall 25.7ms/step），
+> CPU dispatch + Python overhead + sync 是绝对瓶颈。CUDA Graph 可一次性消除所有 kernel launch 和 Python dispatch 开销。
 
-#### 4.2 CUDA Stream 流水线
-- 方案: Vision Encoder 和 embedding 处理使用独立 stream
-- 原理: 计算与数据传输重叠
+#### 4.1 自定义 Greedy Decode Loop — 高优先级
+- **目标**: 跳过 HF `generate()` 的 Python 开销（500ms+ Other CPU ops）和同步点
+- **方案**: 自定义 greedy decode，直接调用 model forward + argmax
+- **消除**: `aten::item` (63ms sync) + `aten::is_nonzero` (31ms sync) + HF logits processing
+- **关键**: 不用 stopping criteria（固定生成 max_new_tokens），后处理时截断 EOS
+- **风险**: 需要正确处理 KV cache、attention mask、cache_position 的更新
 
-#### 4.3 生成配置调优
-- 方案: 调整 generate() 参数 (use_cache, pad_token_id 等)
-- 原理: 避免不必要的计算和内存操作
+#### 4.2 StaticCache 预分配 — 4.1 的前置依赖
+- **目标**: 固定 KV cache tensor 地址，满足 CUDA Graph 的 static memory 要求
+- **方案**: 预分配 `max_seq_len` 大小的 cache，用 index_copy 替代 cat
+- **注意**: 之前 StaticCache 尝试失败是因为 HF generate 兼容性问题，自定义 loop 可以绕过
+- **消除**: Cat/Concat 操作 (12.8ms GPU, 4056 calls)
+
+#### 4.3 CUDA Graph 捕获 Decode Step — 核心目标
+- **方案**: 捕获完整的单步 decode (28层 forward + argmax) 为 CUDA Graph，replay N 次
+- **前提**: 4.1 (自定义 loop) + 4.2 (StaticCache) 都完成后才能 capture
+- **预期收益**: 从 ~25.7ms/step → ~4.3ms/step (纯 GPU kernel 时间)
+  - 理论 throughput: 从 ~55 tok/s → ~200+ tok/s
+  - 消除: 25K cudaLaunchKernel (125ms) + 所有 Python dispatch
+- **注意事项**:
+  - Prefill 阶段形状动态，不能 capture，只 capture decode
+  - Triton kernel 与 graph capture 兼容性需验证（decode 阶段已用 native ops，风险降低）
+  - attention_mask 和 cache_position 每步需 in-place 更新（用 placeholder tensor）
+- **参考**: SGLang `CudaGraphRunner`, vLLM `CUDAGraphRunner`
+
+#### 4.4 Fused SiLU*up Kernel — 附加优化
+- **方案**: 合并 `F.silu(gate) * up` 为单个 Triton kernel（仅 prefill 走 Triton）
+- **预期**: 减少 1876 次 elementwise kernel（SiLU + Mul → 1 fused）
+
+#### 4.5 Fused Residual Add + RMSNorm — 附加优化
+- **方案**: 合并 `residual + hidden_states` 和 `_rms_norm()` 为单个 kernel
+- **预期**: 减少 1 次 memory read/write per layer per step
 
 ---
 
@@ -127,19 +153,19 @@
   ✅ Flash SDPA (P0)
   ✅ Fused QKV + gate_up (OptimizedDecoderLayer)
   ✅ CUDA config (TF32, SDP)
+  ✅ Triton RMSNorm + RoPE (prefill), native 分支 (decode)
 
 已验证无效:
   ❌ torch.compile (动态 shape recompile)
-  ❌ StaticCache (VLM 动态输入不兼容)
-  ❌ Triton RMSNorm/SwiGLU (decode 小 tensor launch 开销)
+  ❌ StaticCache via HF generate (VLM 动态输入不兼容, 但自定义 loop 可绕过)
   ❌ flash_attention_2 (decode CPU dispatch 开销)
-  ❌ 自定义 decode loop (模型内部 sync 瓶颈)
 
-下一步优先级:
-  [高] CUDA Graph 捕获 decode 阶段
-  [高] 消除 item()/is_nonzero 同步点 (TTFT)
-  [中] Vision Encoder 优化 (TTFT)
-  [低] dtype 转换优化
+下一步 (CUDA Graph 路径):
+  [1] 自定义 greedy decode loop (消除 HF generate overhead + sync)
+  [2] StaticCache 预分配 (固定 tensor 地址, 消除 cat)
+  [3] CUDA Graph capture decode step (消除所有 kernel launch overhead)
+  
+  预期: throughput 从 ~55 tok/s → 200+ tok/s (A10 理论上限 231 tok/s)
 ```
 
 ---

@@ -206,3 +206,56 @@ GPU 利用率极低. GPU kernel 总计 ~6s, 但 CPU 调度+同步总计 ~32s. �
 
 当前存在 Cat/Concat 操作 (每步 0.58ms GPU, 3.3ms CPU), 可能是动态拼接 KV cache.
 预分配固定大小 KV cache, 用 index_copy_ 替代 cat.
+
+---
+
+## 六、A10 最新 Trace 分析 (Step 12: Triton + Native Decode 分支)
+
+### 测试环境
+
+- GPU: NVIDIA A10 24GB (sm_86)
+- 代码: OptimizedDecoderLayer + Triton RMSNorm/RoPE (prefill) + F.rms_norm/native RoPE (decode)
+- Trace: max_stack_depth=40, sample_idx=0, input_ids shape=(1, 690)
+- Baseline (no trace): TTFT=104.5ms, Throughput=54.8 tok/s
+
+### Decode 阶段 Per-Step 分析
+
+| 指标 | 数值 |
+|------|------|
+| 总步骤 | 66 (1 prefill + 65 decode) |
+| 每步 wall time | 25.7ms (= 39 tok/s) |
+| 每步 GPU kernel 时间 | **4.3ms** (= 231 tok/s 理论上限) |
+| GPU 利用率 | **仅 17%** |
+
+### Triton Python Dispatch 开销 (优化前 vs 优化后)
+
+| Kernel | 优化前 Python dispatch | 优化后 (native) | GPU kernel |
+|--------|----------------------|-----------------|------------|
+| _rms_norm | 69us/call (30x GPU) | ~8us/call (F.rms_norm) | 2.3us |
+| _rope_fwd | 62us/call (36x GPU) | ~15us/call (native PyTorch) | 1.7us |
+| 每步总开销 | 11.2ms (168 Triton calls) | ~2ms (native dispatch) | ~0.7ms |
+
+### GPU Kernel 分布 (合并 prefill+decode)
+
+| 类别 | 时间(ms) | 占比 | 说明 |
+|------|---------|------|------|
+| GEMM prefill | 226.7 | 36.2% | prefill 阶段大矩阵乘 |
+| GEMM decode | 197.5 | 31.6% | decode 阶段 cutlass WMMA |
+| GEMV | 71.2 | 11.4% | vision encoder |
+| FlashAttn | 33.9 | 5.4% | SDPA flash kernel |
+| Elementwise | 23.1 | 3.7% | Mul/Add/Copy 等 |
+| Cat | 22.5 | 3.6% | KV cache concat |
+| RMSNorm (Triton) | 16.7 | 2.7% | prefill 阶段 |
+| Mul | 9.9 | 1.6% | |
+| RoPE (Triton) | 6.3 | 1.0% | prefill 阶段 |
+| SiLU | 6.2 | 1.0% | |
+
+### 剩余瓶颈 (需 CUDA Graph 解决)
+
+| 瓶颈 | 时间 | 解决方案 |
+|------|------|---------|
+| HF generate() Python loop | ~500ms | 自定义 decode loop |
+| aten::item sync | 63ms (217 calls) | 不使用 stopping criteria |
+| aten::is_nonzero sync | 31ms (207 calls) | 不使用 stopping criteria |
+| cudaLaunchKernel | 125ms (25K calls) | CUDA Graph replay |
+| Cat/Concat (KV cache) | 22.5ms GPU | StaticCache 预分配 |
