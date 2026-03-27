@@ -1,5 +1,10 @@
 # CUDA Graph 详细实施计划
 
+> [!WARNING]
+> 本文档是 `phase4c` 的历史实施计划，已部分过时。
+> 当前代码里 `custom decode + StaticCache + single-token CUDAGraph` 已经落地并完成小样本验证，因此本文档中的“将要实现”“建议顺序”等内容主要用于回顾实现思路，不再表示当前待办状态。
+> 最新结果请以 `docs/optimization_log.md`、`result.csv` 和代码实现在 `evaluation_wrapper.py` 中的实际状态为准。
+
 > 目标: 在不修改模型参数的前提下，为 Qwen3-VL-2B-Instruct 的 decode 阶段引入 `StaticCache + custom greedy decode + torch.cuda.CUDAGraph`
 > 范围: 仅优化 decode；prefill/vision encoder 保持现有路径
 > 约束:

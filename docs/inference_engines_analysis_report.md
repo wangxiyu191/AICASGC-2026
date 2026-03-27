@@ -1,5 +1,10 @@
 # Qwen3-VL-2B-Instruct 推理引擎深度分析报告
 
+> [!WARNING]
+> 本文档主要是外部引擎调研文档，不是当前代码状态的实时记录。
+> 架构拆解、源码索引和引擎设计思路仍可参考；但文中的落地建议需要和比赛规则、后续实验结果交叉核对。
+> 特别是第 8 节“对竞赛优化的启示与建议”已部分过时，且包含当前规则不允许的量化方向，不能直接照单执行。
+
 > 目标环境：NVIDIA A800 80GB PCIe, Python 3.12.3, PyTorch 2.8.0+cu128, CUDA 12.8
 > 分析对象：SGLang, vLLM, llama.cpp
 > 分析日期：2026-03-26
@@ -1086,6 +1091,14 @@ Batching     Continuous Batching      Continuous Batching       单请求串行
 ---
 
 ## 8. 对竞赛优化的启示与建议
+
+> [!WARNING]
+> 本节已部分过时，请勿直接作为当前行动清单使用。
+> 原因：
+> - 本节写于后续 `phase4c` 之前，未覆盖已经完成的 `StaticCache + custom decode + CUDAGraph` 主线
+> - 其中部分建议后来已被实验否定，例如当前模型路径下的 `torch.compile`
+> - 其中还包含量化、FP8、KV Cache 量化等方向，这些与当前比赛规则不符，不能继续做
+> 本节现在仅保留作“当时的外部方案调研备忘”，最新优先级请看 `docs/optimization_log.md`
 
 ### 8.1 竞赛约束回顾
 

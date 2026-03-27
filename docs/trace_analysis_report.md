@@ -1,5 +1,10 @@
 # Trace Profiling 分析报告
 
+> [!WARNING]
+> 本文档基于 `phase4c` 之前的 trace 数据，属于旧 trace 报告，已部分过时。
+> 其中前半部分对“为什么当时严重 CPU-bound”的现象分析仍有参考价值；但后半部分的“优化建议”并未覆盖后续已经完成或已被证伪的实验。
+> 读取时请结合 `docs/optimization_log.md` 与 `result.csv` 一起看，避免按本文档中的旧优先级继续推进。
+
 ## 测试环境
 
 - GPU: NVIDIA A800 80GB PCIe
@@ -176,6 +181,15 @@ GPU 利用率极低. GPU kernel 总计 ~6s, 但 CPU 调度+同步总计 ~32s. �
 ---
 
 ## 五、优化建议
+
+> [!WARNING]
+> 本节已过时。
+> 这里的建议是基于旧 trace 给出的第一轮推断，后续已有多项被实际实验更新：
+> - `CUDA Graph for Decode` 已在 `phase4c` 落地
+> - `KV Cache 预分配` 已随 `StaticCache` 接入落地
+> - `Fused RMSNorm` 已做过，并且 decode 小 tensor 场景已改为 native 分支
+> - `torch.compile` 在当前模型/路径上已验证不可作为主线方案
+> 因此本节仅保留作历史推断记录，不应作为当前行动清单。
 
 ### 1. torch.compile (预期收益: decode 吞吐 3-5x)
 

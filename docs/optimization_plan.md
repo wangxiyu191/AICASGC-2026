@@ -1,5 +1,10 @@
 # Qwen3-VL-2B-Instruct 推理优化计划
 
+> [!WARNING]
+> 本文档属于历史规划文档，已部分过时。
+> 其中“当前状态”“待验证”“下一步优先级”等表述停留在 `phase4c` 落地前后的计划视角，不再代表最新进展。
+> 最新实验结论请优先查看 `docs/optimization_log.md`、`result.csv` 和 `results/`。
+
 > 目标: 在不修改模型参数的前提下，优化 TTFT 和 Throughput
 > 评分: 0.4 * Accuracy + 0.3 * TTFT_Improvement + 0.3 * Throughput_Improvement
 > 硬件: NVIDIA A800 80GB PCIe (sm_80), CUDA 12.8, PyTorch 2.8.0+cu128
