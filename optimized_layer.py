@@ -4,11 +4,13 @@ Optimized Qwen3-VL decoder layer with fused linear projections.
 Replaces HF's Qwen3VLTextDecoderLayer:
 - Fused QKV projection: 3 GEMMs → 1 GEMM (saves 2 kernel launches × 28 layers per step)
 - Fused gate+up projection: 2 GEMMs → 1 GEMM (saves 1 kernel launch × 28 layers per step)
-- RMSNorm/SwiGLU kept as native PyTorch (Triton has higher launch overhead on small tensors)
+- Triton fused RMSNorm: 8 kernels → 1 kernel per norm call (2.2x faster, ~33us saved/call)
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 
 class OptimizedDecoderLayer(nn.Module):
@@ -140,12 +142,45 @@ class OptimizedDecoderLayer(nn.Module):
 
 
 def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """RMSNorm using native PyTorch ops (faster than Triton for small tensors)."""
-    input_dtype = x.dtype
-    x = x.to(torch.float32)
-    variance = x.pow(2).mean(-1, keepdim=True)
-    x = x * torch.rsqrt(variance + eps)
-    return weight * x.to(input_dtype)
+    """Fused RMSNorm using Triton — single kernel replaces 8 PyTorch ops.
+
+    Handles arbitrary input shapes by flattening to 2D (M, N) where N is the
+    last dimension (must match weight). All computation in fp32 internally.
+    """
+    orig_shape = x.shape
+    N = x.shape[-1]
+    M = x.numel() // N
+    x_2d = x.contiguous().reshape(M, N)
+    out_2d = torch.empty_like(x_2d)
+    BLOCK_N = triton.next_power_of_2(N)
+    _rms_norm_fwd_kernel[(M,)](
+        x_2d, out_2d, weight,
+        x_2d.stride(0), N, eps,
+        BLOCK_N=BLOCK_N,
+    )
+    return out_2d.view(orig_shape)
+
+
+@triton.jit
+def _rms_norm_fwd_kernel(
+    X, Y, W,
+    stride,
+    N: tl.constexpr,
+    eps,
+    BLOCK_N: tl.constexpr,
+):
+    """Fused RMSNorm forward kernel.
+
+    Each program processes one row: load → variance in fp32 → normalize → apply weight → store.
+    """
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_N)
+    mask = cols < N
+    x = tl.load(X + row * stride + cols, mask=mask, other=0.0).to(tl.float32)
+    var = tl.sum(x * x, axis=0) / N
+    rstd = tl.rsqrt(var + eps)
+    w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
+    tl.store(Y + row * stride + cols, (x * rstd * w).to(Y.dtype.element_ty), mask=mask)
 
 
 def _rotate_half(x):

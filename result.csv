@@ -11,3 +11,4 @@ step,optimization,ttft_ms,throughput_tok_s,num_samples,gpu,notes
 7,最新A800测试结果,62.42,41.93,5000,A800,"分数0.4470, 准确率0.6933, TTFT 62.42ms, 吞吐量41.93 tok/s"
 8,fused QKV+gate_up (OptimizedDecoderLayer),126.35,39.58,10,A10,"3 GEMM→1 QKV + 2 GEMM→1 gate_up, 省84次kernel launch/step, throughput +13%"
 9,最新A800评测结果,60.10,46.57,5000,A800,"分数0.0820, 准确率0.6867, TTFT 60.10ms, 吞吐量46.57 tok/s"
+10,Triton fused RMSNorm,115.87,48.11,10,A10,"8 PyTorch ops→1 Triton kernel per norm, TTFT -8.3%, throughput +21.5% vs step 8"
