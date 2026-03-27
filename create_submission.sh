@@ -38,6 +38,12 @@ if [ -d "$SCRIPT_DIR/my_kernel" ]; then
     echo "Including my_kernel/ directory"
 fi
 
+# Include optimized_layer.py if it exists
+if [ -f "$SCRIPT_DIR/optimized_layer.py" ]; then
+    cp "$SCRIPT_DIR/optimized_layer.py" "$TEMP_DIR/"
+    echo "Including optimized_layer.py"
+fi
+
 # Create the ZIP file
 cd "$TEMP_DIR"
 zip -r "$SCRIPT_DIR/$OUTPUT_NAME" ./*
