@@ -55,6 +55,43 @@
 
 发现: sdpa 在 A10 上是最优 attention backend。TTFT 改善主要来自 CUDA config（TF32 等）。
 
+## P0: 强制 SDPA (修复 A800 吞吐量退化)
+
+A800 官方评测发现 flash_attention_2 导致 throughput 仅 33.07 tok/s（基线 ~55），退化 ~40%。
+根因: flash_attn 在 decode 阶段 CPU dispatch 开销 8.2ms/step >> GPU 计算 0.56ms/step。
+
+### 修复
+
+强制使用 `attn_impl = "sdpa"`，移除 flash_attn 条件判断。SDPA 让 PyTorch 自动选择最优后端。
+
+| 指标 | 值 | vs Step 2 (A800 flash_attn) |
+|------|-----|-------------|
+| TTFT | 62.42 ms | -8.6% |
+| Throughput | 41.93 tok/s | **+26.8%** |
+| Accuracy | 0.6933 | -1.6% |
+| Score | 0.4470 | |
+| 样本数 | 5000 | A800 |
+
+## Phase 4: OptimizedDecoderLayer (融合线性投影)
+
+自定义 `OptimizedDecoderLayer` 替换 HF 的 `Qwen3VLTextDecoderLayer`，融合线性投影减少 kernel launch。
+
+### 优化内容
+
+1. **Fused QKV**: q_proj/k_proj/v_proj 权重拼接为 [4096, 2048]，3 次 GEMM → 1 次
+2. **Fused gate_up**: gate_proj/up_proj 权重拼接为 [12288, 2048]，2 次 GEMM → 1 次
+3. RMSNorm/SiLU 保持 native PyTorch（Triton 在 decode 小 tensor 下更慢）
+
+每 decode step 减少 84 次 kernel launch (28 层 × 3 次)。
+
+### A10 结果
+
+| 指标 | 值 | vs P0 baseline (sdpa) |
+|------|-----|-------------|
+| TTFT | 126.35 ms | +1.9% |
+| Throughput | 39.58 tok/s | **+13.0%** |
+| 样本数 | 10 | A10 |
+
 ## 踩坑记录
 
 ### torch.compile + flash_attn_varlen 不兼容

@@ -7,6 +7,19 @@
 
 ---
 
+## 当前状态
+
+**最新 A800 成绩 (P0 sdpa):** Score 0.4470, Accuracy 0.6933, TTFT 62.42ms, Throughput 41.93 tok/s
+
+**已完成优化:**
+- [x] P0: 强制 SDPA (修复 flash_attn_2 吞吐量退化 ~40%)
+- [x] Phase 4: OptimizedDecoderLayer - fused QKV + fused gate_up (A10 throughput +13%)
+- [x] CUDA config: TF32, flash/mem_efficient SDP
+
+**待 A800 验证:** fused QKV + gate_up (commit `[historical commit]`)
+
+---
+
 ## 环境信息
 
 | 项目 | 开发环境 | 评测环境 |
@@ -34,24 +47,19 @@
 
 ### Phase 1: 配置级优化 (低风险, 高收益)
 
-#### 1.1 torch.compile 模型编译
-- 方案: `torch.compile(model, mode="reduce-overhead")` 或分部件编译
-- 原理: 算子自动融合, 减少 Python 开销和 kernel launch 次数
-- 参考: vLLM `@support_torch_compile()` 对 Vision Transformer 的应用
-- 风险: VLM 动态 shape (不同图像分辨率) 可能导致频繁 recompile
-- 备选: 仅编译 Vision Encoder (`model.visual`) 规避动态 shape
+#### 1.1 torch.compile 模型编译 — ❌ 失败
+- 结果: 动态 KV Cache 导致 recompile，throughput -35%
+- 详见 optimization_attempts.md Phase 2 章节
 
-#### 1.2 Flash SDPA 确认与优化
-- 方案: 确认 `torch.backends.cuda.enable_flash_sdp(True)` 已启用
-- 原理: PyTorch 内置 Flash Attention 后端, 对 prefill 大序列有效
-- 参考: SGLang 6 种 Vision Attention 后端自动选择
+#### 1.2 Flash SDPA 确认与优化 — ✅ 已完成
+- 结果: SDPA 是最优 attention backend，flash_attention_2 在 decode 阶段反而有害
+- 强制 `attn_implementation="sdpa"`
 
-#### 1.3 StaticCache KV 缓存预分配
-- 方案: 使用 `cache_implementation="static"` 或手动预分配 KV 缓存
-- 原理: 避免 decode 阶段每步动态分配内存, 减少 cudaMalloc 开销
-- 参考: SGLang 静态内存分配策略
+#### 1.3 StaticCache KV 缓存预分配 — ❌ 失败
+- 结果: 与动态 VLM 输入不兼容，cache_position 处理复杂
+- 详见 optimization_attempts.md StaticCache 章节
 
-#### 1.4 Attention mask 优化
+#### 1.4 Attention mask 优化 — 待尝试
 - 方案: 使用 `is_causal=True` 替代显式 attention mask
 - 原理: 减少 mask 张量的内存分配和传输
 
@@ -78,23 +86,23 @@
 
 ### Phase 3: Triton 自定义 Kernel (算子级优化)
 
-#### 3.1 Triton Fused RMSNorm
-- 方案: Triton kernel 替换 torch RMSNorm
-- 原理: Qwen3 每层 2 个 RMSNorm + QK-Norm, 28 层共 ~112 次调用
-- 参考: SGLang/vLLM 的融合 RMSNorm 实现
+#### 3.1 Triton Fused RMSNorm — ❌ 无效
+- 结果: decode 小 tensor (batch=1, seq_len=1) 下 Triton launch 开销 159us > native 59us
+- Triton kernel launch 固定 ~100us，112 次/step = +11.2ms 额外开销
 
-#### 3.2 Triton Fused Rotary Embedding (RoPE)
+#### 3.2 Triton Fused Rotary Embedding (RoPE) — 待尝试
 - 方案: 融合 RoPE 计算到 attention kernel
 - 原理: 减少单独的 RoPE kernel 调用
 
-#### 3.3 Triton Fused SwiGLU FFN
-- 方案: 融合 gate_proj + up_proj + SiLU + element-wise multiply
-- 原理: 减少中间张量内存分配, 减少全局内存访问
+#### 3.3 Triton Fused SwiGLU FFN — ❌ 无效
+- 结果: swiglu 14.1us vs native silu*up 12.0us，收益可忽略
 
-#### 3.4 Fused QKV Projection
-- 方案: 合并 Q/K/V 三个 Linear 为一次 GEMM
-- 参考: vLLM `QKVParallelLinear`
-- 原理: 减少 3 次 GEMM 调用为 1 次
+#### 3.4 Fused QKV Projection — ✅ 已完成
+- 实现: 合并 Q/K/V 权重为 [4096, 2048]，使用 F.linear 1 次 GEMM
+- 结果: 配合 fused gate_up，A10 throughput +13%
+
+#### 3.5 Fused gate_up Projection — ✅ 已完成
+- 实现: 合并 gate_proj/up_proj 权重为 [12288, 2048]，使用 F.linear 1 次 GEMM
 
 ### Phase 4: 系统级优化 (精调)
 
@@ -112,18 +120,26 @@
 
 ---
 
-## 实施优先级矩阵
+## 实施优先级矩阵（更新后）
 
 ```
-                     收益高                 收益低
-实现容易   [P1] torch.compile        [P1] Flash SDPA 确认
-           [P1] StaticCache          [P1] Attention mask
-            
-实现中等   [P2] flash_attn 安装      [P2] Conv3D 优化
-           [P2] Vision compile       [P4] CUDA Stream
-            
-实现困难   [P2] CUDA Graph (ViT)     [P3] 完整 Triton Attention
-           [P3] Triton RMSNorm       [P3] Fused QKV/FFN
+已完成:
+  ✅ Flash SDPA (P0)
+  ✅ Fused QKV + gate_up (OptimizedDecoderLayer)
+  ✅ CUDA config (TF32, SDP)
+
+已验证无效:
+  ❌ torch.compile (动态 shape recompile)
+  ❌ StaticCache (VLM 动态输入不兼容)
+  ❌ Triton RMSNorm/SwiGLU (decode 小 tensor launch 开销)
+  ❌ flash_attention_2 (decode CPU dispatch 开销)
+  ❌ 自定义 decode loop (模型内部 sync 瓶颈)
+
+下一步优先级:
+  [高] CUDA Graph 捕获 decode 阶段
+  [高] 消除 item()/is_nonzero 同步点 (TTFT)
+  [中] Vision Encoder 优化 (TTFT)
+  [低] dtype 转换优化
 ```
 
 ---
