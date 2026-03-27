@@ -14,3 +14,6 @@ step,optimization,ttft_ms,throughput_tok_s,num_samples,gpu,notes
 10,Triton fused RMSNorm,115.87,48.11,10,A10,"8 PyTorch ops→1 Triton kernel per norm, TTFT -8.3%, throughput +21.5% vs step 8"
 11,Triton fused RoPE,117.89,50.83,10,A10,"5 kernels→1 Triton kernel per RoPE call, throughput +5.7% vs step 10, +28.4% vs step 8"
 12,Native ops for decode (Triton→F.rms_norm/PyTorch RoPE when M<=32),111.81,54.90,10,A10,"decode阶段Triton Python dispatch 65us/call >> GPU 2us, 改用native ops省dispatch开销, TTFT -5.2%, throughput +8.0%"
+13,Phase4b: custom decode + StaticCache,129.32,50.81,3,A10,"benchmark 走 ModelWrapper.generate 自定义 eager greedy decode；batch=1/do_sample=False/use_cache=True/max_new_tokens<=128 启用；与 HF generate 在 3 样本输出一致"
+14,Phase4c: custom decode + StaticCache + CUDAGraph,127.83,80.76,3,A10,"单 token decode step 使用 torch.cuda.CUDAGraph capture/replay；prefill 保持 eager；保留 fallback；与 HF/eager 在 3 样本输出一致，throughput vs HF 45.54 提升约 77.3%"
+15,Phase4c: custom decode + StaticCache + CUDAGraph (10 samples),113.65,82.00,10,A10,"10 样本稳定验证；HF 基线 112.80ms / 54.19 tok/s，自定义 eager 114.51ms / 52.78 tok/s，graph 10/10 输出与 HF 一致，throughput vs HF 提升约 51.3%"

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Focused viztracer profiling: one TTFT trace + one throughput trace.
+"""Focused trace runner aligned with the real ModelWrapper generate path.
 
-Produces two trace files:
+Produces two trace files via ModelWrapper's built-in VizTracer integration:
   traces/generate_1.json  - TTFT (max_new_tokens=1)
   traces/generate_2.json  - Throughput (max_new_tokens=128)
 
 Usage:
-    TQDM_DISABLE=1 python run_viztrace.py [--warmup N] [--sample-idx IDX]
+    TQDM_DISABLE=1 python run_viztrace.py [--warmup N] [--sample-idx IDX] [--mode cudagraph]
 """
 import argparse
 import os
@@ -14,11 +14,8 @@ import time
 
 import torch
 from datasets import load_from_disk
-from viztracer import VizTracer
 
 os.environ.setdefault("TQDM_DISABLE", "1")
-
-from evaluation_wrapper import VLMModel  # noqa: E402
 
 TRACE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "traces")
 
@@ -59,15 +56,47 @@ def main():
     parser.add_argument("--sample-idx", type=int, default=0, help="Dataset sample index to profile")
     parser.add_argument("--model-path", type=str, default="./Qwen3-VL-2B-Instruct")
     parser.add_argument("--dataset-path", type=str, default="./data")
-    parser.add_argument("--max-stack-depth", type=int, default=40)
+    parser.add_argument(
+        "--mode",
+        choices=("hf", "eager", "cudagraph"),
+        default="cudagraph",
+        help="Generate path to trace: raw HF generate, custom eager decode, or custom decode with CUDA Graph",
+    )
+    parser.add_argument(
+        "--keep-existing-traces",
+        action="store_true",
+        help="Keep existing traces/generate_*.json instead of deleting them before profiling",
+    )
     args = parser.parse_args()
 
-    os.makedirs(TRACE_DIR, exist_ok=True)
+    os.environ["ENABLE_VIZTRACE"] = "1"
+    os.environ["VIZTRACE_WARMUP_CALLS"] = str(10 ** 9)
+    if args.mode == "hf":
+        os.environ["ENABLE_CUSTOM_DECODE"] = "0"
+        os.environ["ENABLE_CUDAGRAPH"] = "0"
+        os.environ["ENABLE_CUDAGRAPH_WITH_VIZTRACE"] = "0"
+    elif args.mode == "eager":
+        os.environ["ENABLE_CUSTOM_DECODE"] = "1"
+        os.environ["ENABLE_CUDAGRAPH"] = "0"
+        os.environ["ENABLE_CUDAGRAPH_WITH_VIZTRACE"] = "0"
+    else:
+        os.environ["ENABLE_CUSTOM_DECODE"] = "1"
+        os.environ["ENABLE_CUDAGRAPH"] = "1"
+        os.environ["ENABLE_CUDAGRAPH_WITH_VIZTRACE"] = "1"
 
-    # Load model (uses the real _model, not the ModelWrapper)
+    from evaluation_wrapper import VLMModel  # noqa: E402
+
+    os.makedirs(TRACE_DIR, exist_ok=True)
+    if not args.keep_existing_traces:
+        for filename in os.listdir(TRACE_DIR):
+            if filename.startswith("generate_") and filename.endswith(".json"):
+                os.remove(os.path.join(TRACE_DIR, filename))
+
+    print(f"[Profile] Mode: {args.mode}")
     print("[Profile] Loading model...")
     vlm = VLMModel(args.model_path)
-    real_model = vlm._model  # bypass ModelWrapper to avoid double-tracing
+    real_model = vlm._model
+    traced_model = vlm.model
 
     # Load dataset sample
     dataset = load_from_disk(args.dataset_path)
@@ -94,20 +123,17 @@ def main():
     print(f"[Profile] Baseline (no trace): TTFT={t_ttft*1000:.1f}ms, "
           f"Throughput={n_tok/t_full:.1f} tok/s ({t_full*1000:.1f}ms for {n_tok} tokens)")
 
+    # Reset wrapper trace counters so the next two generate() calls become generate_1/2.json.
+    traced_model._call_count = 0
+    traced_model._trace_count = 0
+    traced_model._warmup_calls = 0
+
     # === Trace 1: TTFT (1 token) ===
     trace_ttft = os.path.join(TRACE_DIR, "generate_1.json")
     print(f"\n[Profile] Tracing TTFT → {trace_ttft}")
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
-
-    tracer = VizTracer(
-        log_torch=True, output_file=trace_ttft,
-        max_stack_depth=args.max_stack_depth, verbose=0,
-    )
-    tracer.start()
-    _, t = run_generate(real_model, inputs, max_new_tokens=1)
-    tracer.stop()
-    tracer.save()
+    _, t = run_generate(traced_model, inputs, max_new_tokens=1)
     print(f"  TTFT (traced): {t*1000:.1f} ms  [file: {os.path.getsize(trace_ttft)/1e6:.1f} MB]")
 
     # === Trace 2: Throughput (128 tokens) ===
@@ -115,15 +141,7 @@ def main():
     print(f"\n[Profile] Tracing throughput → {trace_tput}")
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
-
-    tracer = VizTracer(
-        log_torch=True, output_file=trace_tput,
-        max_stack_depth=args.max_stack_depth, verbose=0,
-    )
-    tracer.start()
-    out_tput, t = run_generate(real_model, inputs, max_new_tokens=128)
-    tracer.stop()
-    tracer.save()
+    out_tput, t = run_generate(traced_model, inputs, max_new_tokens=128)
     n_tok_tput = out_tput.shape[1] - inputs.input_ids.shape[1]
     print(f"  Throughput (traced): {n_tok_tput/t:.1f} tok/s ({t*1000:.1f} ms, {n_tok_tput} tokens)  "
           f"[file: {os.path.getsize(trace_tput)/1e6:.1f} MB]")

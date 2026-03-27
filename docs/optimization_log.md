@@ -146,6 +146,104 @@ Triton kernel 在 decode 阶段 tensor 极小 (batch=1, seq=1) 时：
 Decode 阶段 CPU 开销远超 GPU 计算，native ops 分支只解决了 Triton dispatch 部分。
 剩余瓶颈 (HF generate Python loop、item() sync、cudaLaunchKernel) 需要 CUDA Graph + 自定义 decode loop 根本性解决。
 
+## Phase 4: Custom Decode + StaticCache + CUDA Graph
+
+### 实现范围
+
+本阶段的真实 benchmark 入口是 `model.model.generate(...)`，因此改动全部落在 `evaluation_wrapper.py` 的 `ModelWrapper.generate()`。
+
+当前实现分两层：
+
+1. **Prefill 保持 eager**
+   - 完整输入继续走普通 `self._model(...)`
+   - 首轮 forward 传入 `StaticCache`
+   - 提取首 token logits、`rope_deltas`、prefill 后的 cache 状态
+
+2. **Decode 改为自定义 greedy loop**
+   - 默认先走 eager custom decode
+   - 在 CUDA 条件满足时，对单 token decode step 做 `torch.cuda.CUDAGraph` capture/replay
+   - trace 模式 (`ENABLE_VIZTRACE=1`) 自动关闭 cudagraph，只保留 eager custom decode
+
+### 关键实现点
+
+- 新增 `GreedyDecodeEngine`
+  - 只在 `batch_size == 1`
+  - `do_sample == False`
+  - `use_cache == True`
+  - `max_new_tokens <= 128`
+  - 且无额外复杂 generation kwargs 时启用
+- 新增 `DecodeCudaGraphRunner`
+  - 固定 placeholder:
+    - `input_ids_buf: (1, 1)`
+    - `cache_position_buf: (1,)`
+    - `position_ids_buf: (3, 1, 1)`
+    - `attention_mask_buf: (1, max_cache_len)`
+  - 只 capture 单步 decode
+  - capture 前做 warmup
+  - 通过 snapshot/restore `StaticCache`，避免 warmup/capture 破坏 prefill 后的真实起始状态
+- decode 热路径不再调用 `cache.get_seq_length()`
+- `position_ids` 显式按 `current_position + rope_deltas` 构造
+
+### A10 冒烟与对照结果
+
+测试环境：
+- GPU: NVIDIA A10 24GB
+- PyTorch: 2.10.0+cu128
+- transformers: 5.2.0
+- 命令均带 `TQDM_DISABLE=1`
+
+#### 1 样本 benchmark
+
+| 路径 | TTFT | Throughput | 结果文件 |
+|------|------|------------|----------|
+| HF generate | 107.00 ms | 56.82 tok/s | `results/result_hf_generate_smoke.json` |
+| Custom eager + StaticCache | 109.37 ms | 51.83 tok/s | `results/result_custom_decode_smoke.json` |
+| Custom + StaticCache + CUDAGraph | 108.54 ms | 83.96 tok/s | `results/result_cudagraph_smoke.json` |
+
+结论：
+- graph 路径成功进入并稳定运行
+- graph 吞吐明显高于 eager custom decode 与 HF generate
+- 三条路径生成文本完全一致
+
+#### 3 样本 benchmark
+
+| 路径 | TTFT | Throughput | 结果文件 |
+|------|------|------------|----------|
+| HF generate | 125.15 ms | 45.54 tok/s | `results/result_hf_generate_3.json` |
+| Custom eager + StaticCache | 129.32 ms | 50.81 tok/s | `results/result_custom_decode_3.json` |
+| Custom + StaticCache + CUDAGraph | 127.83 ms | 80.76 tok/s | `results/result_cudagraph_3.json` |
+
+对照结论：
+- `HF == eager == graph`，3/3 样本文本完全一致
+- eager custom decode 已经略高于 HF throughput (`50.81 vs 45.54 tok/s`)
+- 加入 cudagraph 后 throughput 进一步提升到 `80.76 tok/s`
+- 相对 HF 3 样本基线，throughput 提升约 `77.3%`
+- TTFT 小幅波动（约 +2.7ms），当前主要收益集中在 decode throughput
+
+#### 10 样本 benchmark
+
+| 路径 | TTFT | Throughput | 结果文件 |
+|------|------|------------|----------|
+| HF generate | 112.80 ms | 54.19 tok/s | `results/result_hf_generate_10.json` |
+| Custom eager + StaticCache | 114.51 ms | 52.78 tok/s | `results/result_custom_decode_10.json` |
+| Custom + StaticCache + CUDAGraph | 113.65 ms | 82.00 tok/s | `results/result_cudagraph_10.json` |
+
+对照结论：
+- `HF == eager == graph`，10/10 样本文本完全一致
+- custom eager 在 10 样本下未显著优于 HF，说明“只替换 loop + StaticCache”本身收益有限，capture 成本和 host 逻辑仍有影响
+- cudagraph 路径保持稳定收益，throughput 从 `54.19` 提升到 `82.00 tok/s`
+- 相对 HF 10 样本基线，throughput 提升约 `51.3%`
+- TTFT 与 HF 基本持平（`113.65ms vs 112.80ms`），说明收益主要集中在 decode 阶段，符合设计预期
+
+### 当前结论
+
+- `StaticCache + custom decode + single-token CUDAGraph` 已在真实 benchmark 路径上跑通
+- 现阶段已经满足“可以继续扩样本和做 trace/profile 验证”的条件
+- 下一步重点应放在：
+  - 更大样本数（10/更高）验证收益是否稳定
+  - graph 前后 trace 对比，确认 `cat/concat` 与 Python loop 开销下降
+  - 评估是否需要做 graph bucket 复用，降低每请求 capture 成本
+
 ## 踩坑记录
 
 ### torch.compile + flash_attn_varlen 不兼容

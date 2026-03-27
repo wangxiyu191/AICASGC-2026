@@ -166,6 +166,11 @@ def analyze_single_trace(filepath):
         'fa_count': 0,
         'fa_varlen_count': 0,
         'item_count': 0,
+        'graph_launch_count': 0,
+        'graph_launch_dur': 0.0,
+        'graph_replay_count': 0,
+        'graph_capture_count': 0,
+        'decode_source': 'unknown',
     }
 
     for ev in events:
@@ -212,6 +217,14 @@ def analyze_single_trace(filepath):
             stats['cuda_runtime'][name]['total_dur'] += dur
             stats['cuda_runtime'][name]['max_dur'] = max(
                 stats['cuda_runtime'][name]['max_dur'], dur)
+            if name == 'cudaGraphLaunch':
+                stats['graph_launch_count'] += 1
+                stats['graph_launch_dur'] += dur
+            elif name in ('cudaGraphInstantiateWithFlags', 'cudaGraphGetNodes'):
+                stats['graph_capture_count'] += 1
+        elif cat == 'FEE':
+            if 'replay (' in name and 'evaluation_wrapper.py' in name:
+                stats['graph_replay_count'] += 1
         elif cat == 'gpu_memcpy':
             stats['gpu_memcpy'][name]['count'] += 1
             stats['gpu_memcpy'][name]['total_dur'] += dur
@@ -223,8 +236,15 @@ def analyze_single_trace(filepath):
             stats['gpu_memset'][name]['max_dur'] = max(
                 stats['gpu_memset'][name]['max_dur'], dur)
 
-    stats['decode_steps'] = stats['fa_count'] // NUM_DECODER_LAYERS \
-        if stats['fa_count'] >= NUM_DECODER_LAYERS else 0
+    if stats['graph_launch_count'] > 0:
+        stats['decode_steps'] = stats['graph_launch_count']
+        stats['decode_source'] = 'cudaGraph'
+    elif stats['fa_count'] >= NUM_DECODER_LAYERS:
+        stats['decode_steps'] = stats['fa_count'] // NUM_DECODER_LAYERS
+        stats['decode_source'] = 'flash_attn'
+    else:
+        stats['decode_steps'] = 0
+        stats['decode_source'] = 'none'
 
     return stats
 
@@ -310,7 +330,7 @@ def print_per_file_summary(all_stats):
     print(f"  PER-FILE SUMMARY")
     print(f"{'='*110}")
     print(f"  {'File':<22} {'Size(MB)':<10} {'Events':<10} {'GPU(ms)':<10} "
-          f"{'CPU(ms)':<10} {'MemCpy(ms)':<11} {'FA/FAvar':>10} {'DecSteps':>10} {'Type':<8}")
+          f"{'CPU(ms)':<10} {'MemCpy(ms)':<11} {'FA/FAvar':>10} {'DecSteps':>10} {'Type':<10}")
     print(f"  {'-'*22} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*11} {'-'*10} {'-'*10} {'-'*8}")
 
     for stats in sorted(all_stats, key=lambda x: int(x['file'].split('_')[1].split('.')[0])):
@@ -318,16 +338,19 @@ def print_per_file_summary(all_stats):
         cpu_dur = sum(v['total_dur'] for v in stats['cpu_ops'].values()) / 1000
         mem_dur = sum(v['total_dur'] for v in stats['gpu_memcpy'].values()) / 1000
         fa_str = f"{stats['fa_count']}/{stats['fa_varlen_count']}"
-        phase = "TTFT" if stats['decode_steps'] <= 1 else "Throughput"
+        if stats['graph_launch_count'] > 0:
+            phase = "Throughput"
+        else:
+            phase = "TTFT" if stats['decode_steps'] <= 1 else "Throughput"
         print(f"  {stats['file']:<22} {stats['filesize_mb']:<10.1f} {stats['num_events']:<10} "
               f"{gpu_dur:<10.1f} {cpu_dur:<10.1f} {mem_dur:<11.2f} {fa_str:>10} "
-              f"{stats['decode_steps']:>10} {phase:<8}")
+              f"{stats['decode_steps']:>10} {phase:<10}")
 
 
 def analyze_phase_breakdown(all_stats):
     """Separate TTFT (prefill) and decode phase analysis."""
-    ttft_stats = [s for s in all_stats if s['decode_steps'] <= 1]
-    throughput_stats = [s for s in all_stats if s['decode_steps'] > 1]
+    ttft_stats = [s for s in all_stats if s['decode_steps'] <= 1 and s['graph_launch_count'] == 0]
+    throughput_stats = [s for s in all_stats if s['decode_steps'] > 1 or s['graph_launch_count'] > 0]
 
     # --- TTFT ---
     if ttft_stats:
@@ -380,6 +403,8 @@ def analyze_phase_breakdown(all_stats):
         dec_total_cpu = 0
         dec_launch_dur = 0
         dec_launch_count = 0
+        dec_graph_launch_dur = 0
+        dec_graph_launch_count = 0
         dec_sync_dur = 0
         dec_sync_count = 0
 
@@ -396,6 +421,9 @@ def analyze_phase_breakdown(all_stats):
                 if name == 'cudaLaunchKernel':
                     dec_launch_dur += info['total_dur']
                     dec_launch_count += info['count']
+                elif name == 'cudaGraphLaunch':
+                    dec_graph_launch_dur += info['total_dur']
+                    dec_graph_launch_count += info['count']
                 elif name == 'cudaStreamSynchronize':
                     dec_sync_dur += info['total_dur']
                     dec_sync_count += info['count']
@@ -410,6 +438,9 @@ def analyze_phase_breakdown(all_stats):
         print(f"  Actual estimated tok/s (CPU bound):  {1000/per_cpu:.0f}")
         print(f"  cudaLaunchKernel per step:           {dec_launch_count/d:.0f} calls, "
               f"{dec_launch_dur/d/1000:.2f} ms")
+        if dec_graph_launch_count > 0:
+            print(f"  cudaGraphLaunch per step:            {dec_graph_launch_count/d:.0f} calls, "
+                  f"{dec_graph_launch_dur/d/1000:.2f} ms")
         print(f"  cudaStreamSync per step:             {dec_sync_count/d:.0f} calls, "
               f"{dec_sync_dur/d/1000:.2f} ms")
 

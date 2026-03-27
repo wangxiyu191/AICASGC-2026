@@ -5,6 +5,7 @@ Optimized VLMModel for Qwen3-VL-2B-Instruct inference.
 Optimizations:
 - SDPA attention backend (auto-selects flash/mem_efficient/math per call)
 - Fused decoder layers: Add+RMSNorm, QKV proj, gate_up proj, SwiGLU
+- Step A decode path: custom greedy loop + StaticCache with safe fallback
 """
 from typing import Dict
 try:
@@ -15,8 +16,308 @@ except ImportError:
 import os
 import torch
 from transformers import AutoModelForImageTextToText, AutoProcessor
+from transformers.cache_utils import StaticCache
 
 from optimized_layer import replace_decoder_layers
+
+
+class GreedyDecodeEngine:
+    """Step A baseline: eager greedy decode on top of StaticCache."""
+
+    SUPPORTED_KWARGS = {
+        "input_ids",
+        "attention_mask",
+        "pixel_values",
+        "image_grid_thw",
+        "max_new_tokens",
+        "do_sample",
+        "temperature",
+        "use_cache",
+        "eos_token_id",
+        "pad_token_id",
+    }
+
+    def __init__(self, model, max_tokens_threshold: int):
+        self._model = model
+        self._max_tokens_threshold = max_tokens_threshold
+        self._enable_viztrace = os.environ.get("ENABLE_VIZTRACE", "0") == "1"
+        allow_cudagraph_with_trace = os.environ.get("ENABLE_CUDAGRAPH_WITH_VIZTRACE", "0") == "1"
+        self._enable_cudagraph = (
+            os.environ.get("ENABLE_CUDAGRAPH", "1") == "1"
+            and (not self._enable_viztrace or allow_cudagraph_with_trace)
+        )
+        self._graph_warmup_steps = int(os.environ.get("CUDAGRAPH_WARMUP_STEPS", "2"))
+
+    def is_supported(self, args, kwargs) -> bool:
+        if len(args) > 1:
+            return False
+
+        unsupported_keys = set(kwargs) - self.SUPPORTED_KWARGS
+        if unsupported_keys:
+            return False
+
+        input_ids = args[0] if args else kwargs.get("input_ids")
+        if input_ids is None or input_ids.ndim != 2:
+            return False
+        if input_ids.shape[0] != 1:
+            return False
+
+        attention_mask = kwargs.get("attention_mask")
+        if attention_mask is not None and attention_mask.ndim != 2:
+            return False
+
+        if kwargs.get("do_sample", False):
+            return False
+        if not kwargs.get("use_cache", True):
+            return False
+
+        max_new_tokens = kwargs.get("max_new_tokens", self._max_tokens_threshold)
+        if max_new_tokens is None or max_new_tokens < 1:
+            return False
+        if max_new_tokens > self._max_tokens_threshold:
+            return False
+
+        return True
+
+    def generate(self, *args, **kwargs):
+        input_ids = args[0] if args else kwargs["input_ids"]
+        attention_mask = kwargs.get("attention_mask")
+        pixel_values = kwargs.get("pixel_values")
+        image_grid_thw = kwargs.get("image_grid_thw")
+        max_new_tokens = int(kwargs.get("max_new_tokens", self._max_tokens_threshold))
+
+        batch_size, prompt_length = input_ids.shape
+        device = input_ids.device
+        max_cache_len = prompt_length + max_new_tokens
+
+        if attention_mask is None:
+            prompt_attention_mask = torch.ones((batch_size, prompt_length), dtype=torch.bool, device=device)
+        else:
+            prompt_attention_mask = attention_mask.to(device=device, dtype=torch.bool)
+
+        full_attention_mask = torch.zeros((batch_size, max_cache_len), dtype=torch.bool, device=device)
+        full_attention_mask[:, :prompt_length] = prompt_attention_mask
+
+        output_ids = torch.empty(
+            (batch_size, max_cache_len),
+            dtype=input_ids.dtype,
+            device=device,
+        )
+        output_ids[:, :prompt_length] = input_ids
+
+        static_cache = StaticCache(
+            config=self._model.config,
+            max_cache_len=max_cache_len,
+        )
+
+        with torch.no_grad():
+            outputs = self._model(
+                input_ids=input_ids,
+                attention_mask=prompt_attention_mask,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                past_key_values=static_cache,
+                use_cache=True,
+                logits_to_keep=1,
+            )
+
+            rope_deltas = outputs.rope_deltas
+            next_tokens = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+            output_ids[:, prompt_length:prompt_length + 1] = next_tokens
+
+            current_length = prompt_length + 1
+            current_position = prompt_length
+            eos_token_id = self._resolve_eos_token_id(kwargs)
+            graph_runner = None
+
+            if self._should_use_cudagraph(
+                device=device,
+                max_new_tokens=max_new_tokens,
+                current_length=current_length,
+            ):
+                try:
+                    graph_runner = DecodeCudaGraphRunner(
+                        model=self._model,
+                        static_cache=static_cache,
+                        attention_mask=full_attention_mask,
+                        rope_deltas=rope_deltas,
+                        start_position=current_position,
+                        start_input_ids=next_tokens,
+                        warmup_steps=self._graph_warmup_steps,
+                    )
+                except Exception as exc:
+                    print(f"[GreedyDecodeEngine] CUDA Graph setup failed, fallback to eager decode: {exc}")
+                    graph_runner = None
+
+            for _ in range(1, max_new_tokens):
+                if eos_token_id is not None and bool((next_tokens == eos_token_id).all()):
+                    break
+
+                if graph_runner is not None:
+                    next_tokens = graph_runner.replay(
+                        input_ids=next_tokens,
+                        current_position=current_position,
+                    )
+                else:
+                    next_tokens = self._decode_one_token_eager(
+                        next_tokens=next_tokens,
+                        full_attention_mask=full_attention_mask,
+                        rope_deltas=rope_deltas,
+                        static_cache=static_cache,
+                        current_position=current_position,
+                        device=device,
+                    )
+                output_ids[:, current_length:current_length + 1] = next_tokens
+                current_length += 1
+                current_position += 1
+
+        return output_ids[:, :current_length]
+
+    def _resolve_eos_token_id(self, kwargs):
+        eos_token_id = kwargs.get("eos_token_id")
+        if eos_token_id is None:
+            eos_token_id = getattr(self._model.config, "eos_token_id", None)
+        if isinstance(eos_token_id, (list, tuple)):
+            return eos_token_id[0] if eos_token_id else None
+        return eos_token_id
+
+    def _build_decode_position_ids(self, current_position: int, rope_deltas, device: torch.device):
+        text_position_ids = torch.full((1, 1), current_position, dtype=torch.long, device=device)
+        if rope_deltas is not None:
+            text_position_ids = text_position_ids + rope_deltas.to(device=device, dtype=torch.long).view(1, 1)
+        return text_position_ids.view(1, 1, 1).expand(3, 1, 1)
+
+    def _decode_one_token_eager(
+        self,
+        next_tokens: torch.Tensor,
+        full_attention_mask: torch.Tensor,
+        rope_deltas,
+        static_cache: StaticCache,
+        current_position: int,
+        device: torch.device,
+    ):
+        full_attention_mask[:, current_position] = True
+        position_ids = self._build_decode_position_ids(
+            current_position=current_position,
+            rope_deltas=rope_deltas,
+            device=device,
+        )
+        cache_position = torch.tensor([current_position], dtype=torch.long, device=device)
+
+        outputs = self._model(
+            input_ids=next_tokens,
+            attention_mask=full_attention_mask,
+            position_ids=position_ids,
+            past_key_values=static_cache,
+            use_cache=True,
+            cache_position=cache_position,
+            logits_to_keep=1,
+        )
+        return torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+
+    def _should_use_cudagraph(self, device: torch.device, max_new_tokens: int, current_length: int):
+        if not self._enable_cudagraph:
+            return False
+        if not torch.cuda.is_available():
+            return False
+        if device.type != "cuda":
+            return False
+        if max_new_tokens <= 1:
+            return False
+        if current_length < 1:
+            return False
+        return True
+
+
+class DecodeCudaGraphRunner:
+    """Capture and replay a single-token decode step with fixed buffers."""
+
+    def __init__(
+        self,
+        model,
+        static_cache: StaticCache,
+        attention_mask: torch.Tensor,
+        rope_deltas,
+        start_position: int,
+        start_input_ids: torch.Tensor,
+        warmup_steps: int = 2,
+    ):
+        self._model = model
+        self._static_cache = static_cache
+        self._device = attention_mask.device
+        self._attention_mask_buf = attention_mask
+        self._rope_deltas = rope_deltas
+        self._cache_position_buf = torch.empty((1,), dtype=torch.long, device=self._device)
+        self._input_ids_buf = torch.empty_like(start_input_ids)
+        self._position_ids_buf = torch.empty((3, 1, 1), dtype=torch.long, device=self._device)
+        vocab_size = model.config.get_text_config(decoder=True).vocab_size
+        self._logits_buf = torch.empty((1, vocab_size), dtype=model.dtype, device=self._device)
+        self._next_token_buf = torch.empty((1, 1), dtype=torch.long, device=self._device)
+        self._graph = torch.cuda.CUDAGraph()
+
+        cache_snapshot = self._snapshot_cache()
+        self._write_inputs(start_input_ids, start_position)
+
+        side_stream = torch.cuda.Stream(device=self._device)
+        with torch.cuda.stream(side_stream):
+            for _ in range(max(1, warmup_steps)):
+                self._run_step()
+                self._restore_cache(cache_snapshot)
+                self._write_inputs(start_input_ids, start_position)
+        torch.cuda.current_stream(device=self._device).wait_stream(side_stream)
+
+        self._restore_cache(cache_snapshot)
+        self._write_inputs(start_input_ids, start_position)
+        torch.cuda.synchronize(self._device)
+        with torch.cuda.graph(self._graph):
+            self._run_step()
+        torch.cuda.synchronize(self._device)
+        self._restore_cache(cache_snapshot)
+        self._write_inputs(start_input_ids, start_position)
+
+    def replay(self, input_ids: torch.Tensor, current_position: int):
+        self._write_inputs(input_ids, current_position)
+        self._graph.replay()
+        return self._next_token_buf.clone()
+
+    def _run_step(self):
+        outputs = self._model(
+            input_ids=self._input_ids_buf,
+            attention_mask=self._attention_mask_buf,
+            position_ids=self._position_ids_buf,
+            past_key_values=self._static_cache,
+            use_cache=True,
+            cache_position=self._cache_position_buf,
+            logits_to_keep=1,
+        )
+        self._logits_buf.copy_(outputs.logits[:, -1, :])
+        self._next_token_buf.copy_(torch.argmax(self._logits_buf, dim=-1, keepdim=True))
+
+    def _write_inputs(self, input_ids: torch.Tensor, current_position: int):
+        self._input_ids_buf.copy_(input_ids)
+        self._attention_mask_buf[:, current_position] = True
+        self._cache_position_buf[0] = current_position
+        self._position_ids_buf.copy_(self._build_position_ids(current_position))
+
+    def _build_position_ids(self, current_position: int):
+        text_position_ids = torch.full((1, 1), current_position, dtype=torch.long, device=self._device)
+        if self._rope_deltas is not None:
+            text_position_ids = text_position_ids + self._rope_deltas.to(
+                device=self._device,
+                dtype=torch.long,
+            ).view(1, 1)
+        return text_position_ids.view(1, 1, 1).expand(3, 1, 1)
+
+    def _snapshot_cache(self):
+        snapshot = []
+        for layer in self._static_cache.layers:
+            snapshot.append((layer.keys.clone(), layer.values.clone()))
+        return snapshot
+
+    def _restore_cache(self, snapshot):
+        for layer, (keys, values) in zip(self._static_cache.layers, snapshot):
+            layer.keys.copy_(keys)
+            layer.values.copy_(values)
 
 
 class ModelWrapper:
@@ -28,8 +329,11 @@ class ModelWrapper:
     def __init__(self, model):
         self._model = model
         self._enable_trace = os.environ.get("ENABLE_VIZTRACE", "0") == "1"
+        self._enable_custom_decode = os.environ.get("ENABLE_CUSTOM_DECODE", "1") == "1"
+        self._warmup_calls = int(os.environ.get("VIZTRACE_WARMUP_CALLS", str(self.WARMUP_CALLS)))
         self._call_count = 0
         self._trace_count = 0
+        self._custom_decode = GreedyDecodeEngine(model, self.MAX_TOKENS_THRESHOLD)
         if self._enable_trace:
             from viztracer import VizTracer  # noqa: F401
             self._trace_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "traces")
@@ -37,7 +341,7 @@ class ModelWrapper:
             print(f"[ModelWrapper] Trace enabled, output: {self._trace_dir}")
 
     def _should_trace(self, kwargs):
-        if self._call_count <= self.WARMUP_CALLS:
+        if self._call_count <= self._warmup_calls:
             return False
         if kwargs.get("max_new_tokens", 0) > self.MAX_TOKENS_THRESHOLD:
             return False
@@ -45,8 +349,21 @@ class ModelWrapper:
 
     def generate(self, *args, **kwargs):
         self._call_count += 1
+        use_custom_decode = False
+        generate_fn = lambda: self._model.generate(*args, **kwargs)
+
+        if self._enable_custom_decode and self._custom_decode.is_supported(args, kwargs):
+            use_custom_decode = True
+            generate_fn = lambda: self._custom_decode.generate(*args, **kwargs)
+
         if not self._enable_trace or not self._should_trace(kwargs):
-            return self._model.generate(*args, **kwargs)
+            try:
+                return generate_fn()
+            except Exception as exc:
+                if use_custom_decode:
+                    print(f"[ModelWrapper] Custom decode failed, fallback to HF generate: {exc}")
+                    return self._model.generate(*args, **kwargs)
+                raise
 
         self._trace_count += 1
         from viztracer import VizTracer
@@ -54,7 +371,14 @@ class ModelWrapper:
         tracer = VizTracer(log_torch=True, output_file=trace_file, max_stack_depth=15, verbose=0)
         tracer.start()
         try:
-            result = self._model.generate(*args, **kwargs)
+            try:
+                result = generate_fn()
+            except Exception as exc:
+                if use_custom_decode:
+                    print(f"[ModelWrapper] Custom decode failed under trace, fallback to HF generate: {exc}")
+                    result = self._model.generate(*args, **kwargs)
+                else:
+                    raise
         finally:
             tracer.stop()
             tracer.save()
