@@ -2,9 +2,9 @@
 AICAS 2026 - Participant Core Modification File
 
 Optimized VLMModel for Qwen3-VL-2B-Instruct inference.
-Phase 1: flash_attn + CUDA config + no accelerate dispatch overhead.
-Phase 2: torch.compile on language_model (DISABLED - recompilation issues).
-Phase 3: Custom decode loop with StaticCache for throughput optimization.
+Optimizations:
+- SDPA attention backend (auto-selects flash/mem_efficient/math per call)
+- Fused decoder layers: Add+RMSNorm, QKV proj, gate_up proj, SwiGLU
 """
 from typing import Dict
 try:
@@ -15,22 +15,14 @@ except ImportError:
 import os
 import torch
 from transformers import AutoModelForImageTextToText, AutoProcessor
-from transformers.cache_utils import StaticCache
 
-try:
-    import flash_attn
-    HAS_FLASH_ATTN = True
-except ImportError:
-    HAS_FLASH_ATTN = False
+from optimized_layer import replace_decoder_layers
 
 
 class ModelWrapper:
-    """Transparent wrapper around the HF model with custom decode loop."""
+    """Transparent wrapper around the HF model with optional tracing."""
 
-    # Number of warmup calls to skip before tracing
     WARMUP_CALLS = 10
-    # Only trace generate calls with max_new_tokens <= this threshold
-    # (skips accuracy verification calls which use max_new_tokens=1024)
     MAX_TOKENS_THRESHOLD = 128
 
     def __init__(self, model):
@@ -42,162 +34,32 @@ class ModelWrapper:
             from viztracer import VizTracer  # noqa: F401
             self._trace_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "traces")
             os.makedirs(self._trace_dir, exist_ok=True)
-            print(f"[ModelWrapper] Trace enabled, files will be saved to {self._trace_dir}")
-            print(f"[ModelWrapper] Skipping first {self.WARMUP_CALLS} warmup calls and accuracy (max_new_tokens>{self.MAX_TOKENS_THRESHOLD}) calls")
+            print(f"[ModelWrapper] Trace enabled, output: {self._trace_dir}")
 
     def _should_trace(self, kwargs):
-        """Determine if this generate call should be traced."""
-        # Skip warmup phase
         if self._call_count <= self.WARMUP_CALLS:
             return False
-        # Skip accuracy verification (max_new_tokens > threshold)
-        max_new_tokens = kwargs.get("max_new_tokens", 0)
-        if max_new_tokens > self.MAX_TOKENS_THRESHOLD:
+        if kwargs.get("max_new_tokens", 0) > self.MAX_TOKENS_THRESHOLD:
             return False
         return True
 
     def generate(self, *args, **kwargs):
-        """Generate with custom decode loop using StaticCache for throughput optimization."""
         self._call_count += 1
-
-        # Extract generation parameters
-        max_new_tokens = kwargs.get("max_new_tokens", 128)
-        do_sample = kwargs.get("do_sample", False)
-        temperature = kwargs.get("temperature", 1.0)
-        use_cache = kwargs.get("use_cache", True)
-
-        # Check if we should trace this call
         if not self._enable_trace or not self._should_trace(kwargs):
-            # Phase 3: Custom decode loop (DISABLED - needs more debugging)
-            # Issue: Custom loop slower than original generate
-            # Root cause: Model internal forward still has sync points
-            # if use_cache and not do_sample and max_new_tokens <= self.MAX_TOKENS_THRESHOLD:
-            #     try:
-            #         return self._generate_optimized(*args, **kwargs)
-            #     except Exception as e:
-            #         print(f"[ModelWrapper] Optimized decode loop failed: {e}, falling back to original")
-            #         import traceback
-            #         traceback.print_exc()
-            #         return self._model.generate(*args, **kwargs)
             return self._model.generate(*args, **kwargs)
 
-        # Trace this generate call
         self._trace_count += 1
         from viztracer import VizTracer
         trace_file = os.path.join(self._trace_dir, f"generate_{self._trace_count}.json")
-        tracer = VizTracer(
-            log_torch=True,
-            output_file=trace_file,
-            max_stack_depth=15,
-            verbose=0,
-        )
+        tracer = VizTracer(log_torch=True, output_file=trace_file, max_stack_depth=15, verbose=0)
         tracer.start()
         try:
             result = self._model.generate(*args, **kwargs)
         finally:
             tracer.stop()
             tracer.save()
-            print(f"[ModelWrapper] Trace saved: {trace_file} (call #{self._call_count}, max_new_tokens={max_new_tokens})")
+            print(f"[ModelWrapper] Trace saved: {trace_file}")
         return result
-
-    def _generate_optimized(self, *args, **kwargs):
-        """Optimized generation with minimal CPU overhead.
-
-        Key optimizations based on trace analysis:
-        1. Avoid .item() calls that cause GPU->CPU sync
-        2. Avoid is_nonzero() calls
-        3. Use tensor operations for EOS detection (no sync)
-        4. Pre-allocate outputs to avoid dynamic allocation
-        """
-        # Get inputs
-        if args:
-            input_ids = args[0]
-        else:
-            input_ids = kwargs.get('input_ids')
-
-        attention_mask = kwargs.get('attention_mask')
-        pixel_values = kwargs.get('pixel_values')
-        image_grid_thw = kwargs.get('image_grid_thw')
-        max_new_tokens = kwargs.get('max_new_tokens', 128)
-
-        batch_size, seq_len = input_ids.shape
-        device = input_ids.device
-        dtype = self._model.dtype
-
-        # Get EOS token id from text config
-        text_config = self._model.config.get_text_config(decoder=True)
-        eos_token_id = getattr(text_config, 'eos_token_id', None)
-
-        # Prepare initial inputs
-        model_inputs = {
-            'input_ids': input_ids,
-            'attention_mask': attention_mask,
-            'use_cache': True,
-        }
-        if pixel_values is not None:
-            model_inputs['pixel_values'] = pixel_values
-        if image_grid_thw is not None:
-            model_inputs['image_grid_thw'] = image_grid_thw
-
-        # Use DynamicCache for simplicity (StaticCache has compatibility issues)
-        # Let the model handle cache creation internally
-        with torch.no_grad():
-            outputs = self._model(**model_inputs)
-
-        # Get first token
-        next_token_logits = outputs.logits[:, -1, :]
-        next_tokens = torch.argmax(next_token_logits, dim=-1, keepdim=True)
-
-        # Pre-allocate output tensor to avoid cat in loop
-        output_ids = torch.full(
-            (batch_size, seq_len + max_new_tokens),
-            eos_token_id,
-            dtype=torch.long,
-            device=device
-        )
-        output_ids[:, :seq_len] = input_ids
-        output_ids[:, seq_len:seq_len+1] = next_tokens
-
-        # Track which sequences are done (tensor operation, no sync)
-        done_mask = (next_tokens == eos_token_id).squeeze(-1)
-        current_length = seq_len + 1
-
-        # Get past_key_values from first forward
-        past_key_values = outputs.past_key_values
-
-        # Decode loop - optimized to minimize CPU overhead
-        for step in range(1, max_new_tokens):
-            # Skip if all sequences are done
-            if done_mask.all():
-                break
-
-            # Prepare inputs for next token
-            model_inputs = {
-                'input_ids': next_tokens,
-                'past_key_values': past_key_values,
-                'use_cache': True,
-            }
-
-            with torch.no_grad():
-                outputs = self._model(**model_inputs)
-
-            # Get next token
-            next_token_logits = outputs.logits[:, -1, :]
-            next_tokens = torch.argmax(next_token_logits, dim=-1, keepdim=True)
-
-            # Update output
-            output_ids[:, current_length:current_length+1] = next_tokens
-            current_length += 1
-
-            # Update past_key_values
-            past_key_values = outputs.past_key_values
-
-            # Update done mask (tensor operation, no GPU->CPU sync)
-            if eos_token_id is not None:
-                done_mask = done_mask | (next_tokens.squeeze(-1) == eos_token_id)
-
-        # Return only the valid portion
-        return output_ids[:, :current_length]
 
     def __getattr__(self, name):
         return getattr(self._model, name)
@@ -211,7 +73,7 @@ class VLMModel:
 
         import time as _time
 
-        # CUDA backend config: TF32, flash SDP, etc.
+        # CUDA backend config
         self._configure_cuda()
 
         # Load processor
@@ -219,9 +81,7 @@ class VLMModel:
         self._processor = AutoProcessor.from_pretrained(model_path)
         print(f"[VLMModel] Processor loaded in {_time.perf_counter()-t0:.2f}s")
 
-        # Force sdpa: flash_attention_2 causes ~40% throughput regression in decode
-        # phase due to excessive CPU dispatch overhead per step (8.2ms CPU vs 0.56ms GPU).
-        # sdpa lets PyTorch select the best backend per call (flash/mem_efficient/math).
+        # Load model with SDPA (auto-selects flash/mem_efficient/math per call)
         attn_impl = "sdpa"
         print(f"[VLMModel] Loading model with attn_implementation={attn_impl}...")
         t0 = _time.perf_counter()
@@ -238,16 +98,8 @@ class VLMModel:
         # KV cache config
         self._optimize_kv_cache()
 
-        # Phase 2: torch.compile for language model (DISABLED)
-        # Issue: KV Cache dynamic initialization causes frequent recompilations
-        # Result: TTFT +0.5%, Throughput -34.8% (worse than Phase 1)
-        # Root cause: torch._dynamo hit recompile_limit (8) due to dynamic shapes
-        # self._apply_torch_compile()
-
-        # Phase 3: Optimized decode loop (DISABLED - under development)
-        # Code implemented but performance regression observed
-        # Needs investigation into model internal sync points
-        # self._optimizations_applied.append("optimized_decode")
+        # Replace decoder layers with fused versions
+        self._replace_decoder_layers()
 
         # Wrap model
         self._wrapped_model = ModelWrapper(self._model)
@@ -255,7 +107,6 @@ class VLMModel:
         print(f"[VLMModel] Optimizations: {', '.join(self._optimizations_applied)}")
 
     def _configure_cuda(self):
-        """CUDA backend configuration for max performance."""
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cuda.enable_flash_sdp(True)
@@ -264,46 +115,25 @@ class VLMModel:
         self._optimizations_applied.append("cuda_config")
 
     def _optimize_kv_cache(self):
-        """KV Cache basic configuration."""
         self._model.config.use_cache = True
         if hasattr(self._model.config, 'pad_token_id'):
             if self._model.config.pad_token_id is None:
                 self._model.config.pad_token_id = self._model.config.eos_token_id
         self._optimizations_applied.append("kv_cache")
 
-    def _apply_torch_compile(self):
-        """Apply torch.compile to language model for operator fusion.
-
-        Note: Only compile language_model, NOT vision_model due to:
-        1. flash_attn_varlen_func incompatibility with torch.compile
-        2. Dynamic shapes in vision encoder cause frequent recompiles
-        """
+    def _replace_decoder_layers(self):
+        """Replace HF decoder layers with fused OptimizedDecoderLayer."""
+        import time as _time
+        t0 = _time.perf_counter()
         try:
-            import time as _time
-            t0 = _time.perf_counter()
-
-            # Qwen3-VL structure: model.model.language_model is the LLM part
-            # model structure: Qwen3VLForConditionalGeneration
-            #   -> model: Qwen3VLModel
-            #      -> visual: Qwen3VLVisionModel (skip compile)
-            #      -> language_model: Qwen3VLTextModel (compile this)
-            if hasattr(self._model, 'model') and hasattr(self._model.model, 'language_model'):
-                print("[VLMModel] Applying torch.compile to language_model...")
-                # Use mode='default' with dynamic=True to handle variable sequence lengths
-                # Avoid 'reduce-overhead' due to CUDA Graph conflicts with DeepStack
-                self._model.model.language_model = torch.compile(
-                    self._model.model.language_model,
-                    mode="default",
-                    dynamic=True,  # Handle variable sequence lengths
-                    fullgraph=False,  # Allow graph breaks for complex control flow
-                )
-                self._optimizations_applied.append("torch_compile")
-                print(f"[VLMModel] torch.compile applied in {_time.perf_counter()-t0:.2f}s")
-            else:
-                print("[VLMModel] Warning: language_model not found, skipping torch.compile")
+            count = replace_decoder_layers(self._model)
+            elapsed = _time.perf_counter() - t0
+            print(f"[VLMModel] Replaced {count} decoder layers with fused versions in {elapsed:.2f}s")
+            self._optimizations_applied.append(f"fused_layers:{count}")
         except Exception as e:
-            print(f"[VLMModel] Warning: torch.compile failed: {e}")
-            # Continue without torch.compile - don't break the model loading
+            print(f"[VLMModel] Warning: Failed to replace decoder layers: {e}")
+            import traceback
+            traceback.print_exc()
 
     @property
     def processor(self):

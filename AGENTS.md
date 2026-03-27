@@ -14,6 +14,6 @@
 1. 评测环境机器没有配置连接外网。安装受限。（但是本地已经安装了flash-attn2.8.3了）。
 工作建议：
 1. 在一项优化完成后，commit提交，方便后续查阅和回滚。
-2. 运行bench时必须使用TQDM_DISABLE=1，不然肯定stdout阻塞导致benchmark卡住。
+2. 需要调用from_pretrained（如运行bench）时必须使用TQDM_DISABLE=1，不然肯定stdout阻塞导致benchmark卡住。
 3. benchmark的JSON测试结果统一存放在results/目录中，便于管理和追踪。
 优化文档：docs/README.md（包含优化计划、日志、踩坑记录、Trace分析、推理引擎分析等文档索引）
