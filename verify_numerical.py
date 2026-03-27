@@ -54,10 +54,14 @@ def verify_single_layer(model, layer_idx=0):
     hidden_states = torch.randn(batch, seq_len, config.hidden_size,
                                 dtype=torch.float16, device=model.device)
 
-    # Create position embeddings (cos, sin)
+    # Create position embeddings (cos, sin) — must have duplicated halves
+    # because Triton RoPE kernel only loads first half (D/2)
     head_dim = config.head_dim
-    cos = torch.randn(batch, seq_len, head_dim, dtype=torch.float16, device=model.device)
-    sin = torch.randn(batch, seq_len, head_dim, dtype=torch.float16, device=model.device)
+    half_dim = head_dim // 2
+    cos_half = torch.randn(batch, seq_len, half_dim, dtype=torch.float16, device=model.device)
+    sin_half = torch.randn(batch, seq_len, half_dim, dtype=torch.float16, device=model.device)
+    cos = torch.cat([cos_half, cos_half], dim=-1)
+    sin = torch.cat([sin_half, sin_half], dim=-1)
     position_embeddings = (cos, sin)
 
     # Create causal attention mask

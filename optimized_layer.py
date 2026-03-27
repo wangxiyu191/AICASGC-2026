@@ -5,6 +5,7 @@ Replaces HF's Qwen3VLTextDecoderLayer:
 - Fused QKV projection: 3 GEMMs → 1 GEMM (saves 2 kernel launches × 28 layers per step)
 - Fused gate+up projection: 2 GEMMs → 1 GEMM (saves 1 kernel launch × 28 layers per step)
 - Triton fused RMSNorm: 8 kernels → 1 kernel per norm call (2.2x faster, ~33us saved/call)
+- Triton fused RoPE: 5 kernels → 1 kernel per call (eliminates cat/neg/mul/add)
 """
 import torch
 import torch.nn as nn
@@ -100,24 +101,23 @@ class OptimizedDecoderLayer(nn.Module):
         qkv = F.linear(hidden_states, self.qkv_weight)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        # 3. QK-Norm (native RMSNorm on head dimension)
-        q = _rms_norm(q.view(hidden_shape_q), self.q_norm_weight, self.rms_norm_eps).transpose(1, 2)
-        k = _rms_norm(k.view(hidden_shape_kv), self.k_norm_weight, self.rms_norm_eps).transpose(1, 2)
+        # 3. QK-Norm + RoPE (before transpose — natural layout for cos/sin broadcast)
+        cos, sin = position_embeddings
+        q = _rms_norm(q.view(hidden_shape_q), self.q_norm_weight, self.rms_norm_eps)
+        k = _rms_norm(k.view(hidden_shape_kv), self.k_norm_weight, self.rms_norm_eps)
+        q = _apply_rotary_emb(q, cos, sin).transpose(1, 2)
+        k = _apply_rotary_emb(k, cos, sin).transpose(1, 2)
         v = v.view(hidden_shape_kv).transpose(1, 2)
 
-        # 4. RoPE
-        cos, sin = position_embeddings
-        cos = cos.unsqueeze(1)
-        sin = sin.unsqueeze(1)
-        q = (q * cos) + (_rotate_half(q) * sin)
-        k = (k * cos) + (_rotate_half(k) * sin)
-
-        # 5. KV Cache
+        # 4. KV Cache
         if past_key_values is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            cache_kwargs = {
+                "sin": sin.unsqueeze(1), "cos": cos.unsqueeze(1),
+                "cache_position": cache_position,
+            }
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
 
-        # 6. Attention (SDPA)
+        # 5. Attention (SDPA)
         attn_output, _ = self._attention_interface(
             self, q, k, v, attention_mask,
             dropout=0.0, scaling=self.scaling, **kwargs,
@@ -125,18 +125,18 @@ class OptimizedDecoderLayer(nn.Module):
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
 
-        # 7. Residual + Post-attention LayerNorm
+        # 6. Residual + Post-attention LayerNorm
         hidden_states = residual + attn_output
         residual = hidden_states
         hidden_states = _rms_norm(hidden_states, self.post_attn_layernorm_weight, self.rms_norm_eps)
 
-        # 8. Fused gate+up (1 GEMM instead of 2) + SiLU activation
+        # 7. Fused gate+up (1 GEMM instead of 2) + SiLU activation
         gate_up = F.linear(hidden_states, self.gate_up_weight)
         gate, up = gate_up.chunk(2, dim=-1)
         hidden_states = F.silu(gate) * up
         hidden_states = self.down_proj(hidden_states)
 
-        # 9. Residual
+        # 8. Residual
         hidden_states = residual + hidden_states
         return hidden_states
 
@@ -183,10 +183,76 @@ def _rms_norm_fwd_kernel(
     tl.store(Y + row * stride + cols, (x * rstd * w).to(Y.dtype.element_ty), mask=mask)
 
 
-def _rotate_half(x):
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
+def _apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Fused RoPE using Triton — single kernel replaces neg + cat + 2 mul + add.
+
+    Args:
+        x: (batch, seq_len, num_heads, head_dim) — before transpose
+        cos: (batch, seq_len, head_dim) — from position_embeddings
+        sin: (batch, seq_len, head_dim) — from position_embeddings
+
+    cos/sin have duplicated halves (cos[..., :D/2] == cos[..., D/2:]) so we
+    only load the first half (D/2 elements) to save memory bandwidth.
+    """
+    batch, seq_len, nheads, D = x.shape
+    HALF_D = D // 2
+    M = batch * seq_len  # number of (batch, seq) positions
+    total = M * nheads   # total programs
+
+    x_3d = x.reshape(M, nheads, D)
+    cos_2d = cos.reshape(M, D)
+    sin_2d = sin.reshape(M, D)
+    out_3d = torch.empty_like(x_3d)
+
+    BLOCK = triton.next_power_of_2(HALF_D)
+    _rope_fwd_kernel[(total,)](
+        x_3d, out_3d, cos_2d, sin_2d,
+        nheads, D, HALF_D,
+        x_3d.stride(0), x_3d.stride(1),
+        cos_2d.stride(0),
+        BLOCK=BLOCK,
+    )
+    return out_3d.view(batch, seq_len, nheads, D)
+
+
+@triton.jit
+def _rope_fwd_kernel(
+    X, OUT, COS, SIN,
+    nheads, D: tl.constexpr, HALF_D: tl.constexpr,
+    stride_x_m, stride_x_h,
+    stride_cos_m,
+    BLOCK: tl.constexpr,
+):
+    """Fused RoPE forward kernel.
+
+    Each program handles one (sample, head) pair.
+    Loads x first/second halves, cos/sin first half only (halves are identical),
+    computes: out0 = x0*cos - x1*sin, out1 = x1*cos + x0*sin.
+    """
+    pid = tl.program_id(0)
+    m = pid // nheads   # (batch * seq_len) index for cos/sin lookup
+    h = pid % nheads    # head index
+
+    rk = tl.arange(0, BLOCK)
+    mask = rk < HALF_D
+
+    x_base = m * stride_x_m + h * stride_x_h
+    cs_base = m * stride_cos_m
+
+    # Load first and second halves of x
+    x0 = tl.load(X + x_base + rk, mask=mask, other=0.0).to(tl.float32)
+    x1 = tl.load(X + x_base + rk + HALF_D, mask=mask, other=0.0).to(tl.float32)
+
+    # Load cos/sin (only first half — second half is identical)
+    c = tl.load(COS + cs_base + rk, mask=mask, other=1.0).to(tl.float32)
+    s = tl.load(SIN + cs_base + rk, mask=mask, other=0.0).to(tl.float32)
+
+    # RoPE rotation
+    out0 = x0 * c - x1 * s
+    out1 = x1 * c + x0 * s
+
+    tl.store(OUT + x_base + rk, out0.to(X.dtype.element_ty), mask=mask)
+    tl.store(OUT + x_base + rk + HALF_D, out1.to(X.dtype.element_ty), mask=mask)
 
 
 def replace_decoder_layers(model):
