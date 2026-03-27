@@ -7,3 +7,4 @@ step,optimization,ttft_ms,throughput_tok_s,num_samples,gpu,notes
 3,Phase2: torch.compile language_model,121.99,24.51,10,A10,"频繁重编译导致性能下降,需自定义decode loop"
 4,Phase3: custom decode loop with StaticCache,135.31,31.26,10,A10,"性能未达预期,需进一步调试cache_position和attention_mask"
 5,Phase3b: optimized decode loop (no sync),151.11,25.29,3,A10,"自定义loop性能反而下降,模型内部forward仍有同步点"
+6,P0: force sdpa (fix throughput regression),123.99,35.03,10,A10,"强制sdpa替代flash_attn_2,修复decode阶段CPU dispatch开销导致的吞吐量退化"

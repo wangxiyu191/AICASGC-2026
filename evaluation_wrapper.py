@@ -219,9 +219,10 @@ class VLMModel:
         self._processor = AutoProcessor.from_pretrained(model_path)
         print(f"[VLMModel] Processor loaded in {_time.perf_counter()-t0:.2f}s")
 
-        # Load model with flash_attention_2 if available, fallback to sdpa
-        # flash_attention_2 on A800 (eval env), sdpa fallback on other GPUs
-        attn_impl = "flash_attention_2" if HAS_FLASH_ATTN else "sdpa"
+        # Force sdpa: flash_attention_2 causes ~40% throughput regression in decode
+        # phase due to excessive CPU dispatch overhead per step (8.2ms CPU vs 0.56ms GPU).
+        # sdpa lets PyTorch select the best backend per call (flash/mem_efficient/math).
+        attn_impl = "sdpa"
         print(f"[VLMModel] Loading model with attn_implementation={attn_impl}...")
         t0 = _time.perf_counter()
         self._model = AutoModelForImageTextToText.from_pretrained(
