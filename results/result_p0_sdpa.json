@@ -8,7 +8,7 @@
     "gpu_compute_capability": "8.6"
   },
   "performance": {
-    "avg_ttft_ms": 128.13,
-    "avg_throughput_tokens_per_sec": 28.74
+    "avg_ttft_ms": 123.99,
+    "avg_throughput_tokens_per_sec": 35.03
   }
 }
