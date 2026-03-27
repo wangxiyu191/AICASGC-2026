@@ -157,8 +157,11 @@ def _rotate_half(x):
 def replace_decoder_layers(model):
     """Replace all Qwen3VLTextDecoderLayer with OptimizedDecoderLayer."""
     layers = model.model.language_model.layers
+    is_eval = not model.training
     count = 0
     for i in range(len(layers)):
         layers[i] = OptimizedDecoderLayer(layers[i])
+        if is_eval:
+            layers[i].eval()
         count += 1
     return count
