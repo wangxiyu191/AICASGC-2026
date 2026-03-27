@@ -141,15 +141,16 @@ class OptimizedDecoderLayer(nn.Module):
         return hidden_states
 
 
-def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """Fused RMSNorm using Triton — single kernel replaces 8 PyTorch ops.
+_TRITON_ROWS_THRESHOLD = 32
 
-    Handles arbitrary input shapes by flattening to 2D (M, N) where N is the
-    last dimension (must match weight). All computation in fp32 internally.
-    """
-    orig_shape = x.shape
+
+def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """RMSNorm: Triton for prefill (large M), F.rms_norm for decode (small M)."""
     N = x.shape[-1]
     M = x.numel() // N
+    if M <= _TRITON_ROWS_THRESHOLD:
+        return F.rms_norm(x, (N,), weight, eps)
+    orig_shape = x.shape
     x_2d = x.contiguous().reshape(M, N)
     out_2d = torch.empty_like(x_2d)
     BLOCK_N = triton.next_power_of_2(N)
@@ -184,20 +185,20 @@ def _rms_norm_fwd_kernel(
 
 
 def _apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """Fused RoPE using Triton — single kernel replaces neg + cat + 2 mul + add.
-
-    Args:
-        x: (batch, seq_len, num_heads, head_dim) — before transpose
-        cos: (batch, seq_len, head_dim) — from position_embeddings
-        sin: (batch, seq_len, head_dim) — from position_embeddings
-
-    cos/sin have duplicated halves (cos[..., :D/2] == cos[..., D/2:]) so we
-    only load the first half (D/2 elements) to save memory bandwidth.
-    """
+    """RoPE: Triton for prefill (large seq), native PyTorch for decode (seq=1)."""
     batch, seq_len, nheads, D = x.shape
     HALF_D = D // 2
-    M = batch * seq_len  # number of (batch, seq) positions
-    total = M * nheads   # total programs
+
+    if seq_len <= _TRITON_ROWS_THRESHOLD:
+        x1 = x[..., :HALF_D]
+        x2 = x[..., HALF_D:]
+        cos_half = cos[..., :HALF_D].unsqueeze(2)
+        sin_half = sin[..., :HALF_D].unsqueeze(2)
+        return torch.cat([x1 * cos_half - x2 * sin_half,
+                          x2 * cos_half + x1 * sin_half], dim=-1)
+
+    M = batch * seq_len
+    total = M * nheads
 
     x_3d = x.reshape(M, nheads, D)
     cos_2d = cos.reshape(M, D)

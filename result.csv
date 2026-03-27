@@ -13,3 +13,4 @@ step,optimization,ttft_ms,throughput_tok_s,num_samples,gpu,notes
 9,最新A800评测结果,60.10,46.57,5000,A800,"分数0.0820, 准确率0.6867, TTFT 60.10ms, 吞吐量46.57 tok/s"
 10,Triton fused RMSNorm,115.87,48.11,10,A10,"8 PyTorch ops→1 Triton kernel per norm, TTFT -8.3%, throughput +21.5% vs step 8"
 11,Triton fused RoPE,117.89,50.83,10,A10,"5 kernels→1 Triton kernel per RoPE call, throughput +5.7% vs step 10, +28.4% vs step 8"
+12,Native ops for decode (Triton→F.rms_norm/PyTorch RoPE when M<=32),111.81,54.90,10,A10,"decode阶段Triton Python dispatch 65us/call >> GPU 2us, 改用native ops省dispatch开销, TTFT -5.2%, throughput +8.0%"

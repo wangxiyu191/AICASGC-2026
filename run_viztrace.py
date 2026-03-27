@@ -59,7 +59,7 @@ def main():
     parser.add_argument("--sample-idx", type=int, default=0, help="Dataset sample index to profile")
     parser.add_argument("--model-path", type=str, default="./Qwen3-VL-2B-Instruct")
     parser.add_argument("--dataset-path", type=str, default="./data")
-    parser.add_argument("--max-stack-depth", type=int, default=15)
+    parser.add_argument("--max-stack-depth", type=int, default=40)
     args = parser.parse_args()
 
     os.makedirs(TRACE_DIR, exist_ok=True)
