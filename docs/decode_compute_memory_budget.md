@@ -149,18 +149,88 @@ FLOPs：
 
 即使按 `L=768`，纯带宽理论上限也还有 **~560 tok/s**。
 
-当前已经验证的默认主线（`small add+rmsnorm` 默认开）：
+如果换成时间尺度看，这个 token 级下限大致是：
 
-- `100` 样本 benchmark：`110.44 tok/s`
-- fresh trace 的 GPU-only decode step：`8.74 ms/步`，约对应 `114 tok/s` 的 GPU 极限
+```text
+1 / 564 tok/s ≈ 1.77 ms / token
+```
+
+这和“按权重读 + KV 读”直接估出来的 roofline 下限是一致的。
+
+### 4.1 按主算子分解的 A800 理想平均耗时
+
+下面把最新 steady-state decode trace 的主要 stage，和 A800 上按
+
+```text
+ideal_time = max(FLOPs / 312 TFLOP/s, bytes / 2039 GB/s)
+```
+
+算出的理想平均耗时并排放在一起。
+
+说明：
+
+- 线性层按权重读取主导估算
+- attention 按 `L=768`、只取 K/V 读取这个主项估算
+- 小算子（RMSNorm / RoPE / SiLU）按 activation bytes 粗估，它们的“倍率”很容易很夸张，但绝对值通常很小
+- 实测列来自最新 trace [traces/compare/triton_decode_attention](../traces/compare/triton_decode_attention) 的 steady-state decode 分解
+
+| 算子 | 理想带宽时间 | 理想算力时间 | A800 理想下限 | 最新实测 | 实测/理想 |
+|------|--------------|--------------|---------------|----------|-----------|
+| qkv_proj / layer | 8.23 us | 0.05 us | **8.23 us** | 15.1 us | 1.8x |
+| gate_up_proj / layer | 24.68 us | 0.16 us | **24.68 us** | 36.0 us | 1.5x |
+| o_proj / layer | 4.11 us | 0.03 us | **4.11 us** | 9.7 us | 2.4x |
+| down_proj / layer | 12.34 us | 0.08 us | **12.34 us** | 29.1 us | 2.4x |
+| attention(KV) / layer, `L=768` | 3.09 us | 0.02 us | **3.09 us** | 57.9 us | 18.8x |
+| input+qk_norm+rope / layer | 0.034 us | ~0 | **0.034 us** | 0.62 us | 18.2x |
+| post_attn_add_rmsnorm / layer | 0.010 us | ~0 | **0.010 us** | 2.6 us | 258.9x |
+| SiLU / layer | 0.012 us | ~0 | **0.012 us** | 2.5 us | 207.4x |
+| lm_head / token | 305.21 us | 2.00 us | **305.21 us** | 368.2 us | 1.2x |
+
+把这些主项加总后：
+
+- **A800 理想下限约 `1.78 ms / token`**
+- **最新 steady-state trace 实测约 `4.67 ms / token`**
+- 也就是相对这些主项的 roofline 下限，**还有约 `2.6x` 空间**
+
+这个 `1.78 ms` 和上面的 token 级总下限 `1.77 ms` 基本一致，说明这张分解表和整体预算是对齐的。
+
+### 4.2 这个差距主要卡在哪
+
+从上表看，最重要的不是“倍率最大”的那些小算子，而是**绝对时间差**最大的几项：
+
+| 算子 | 实测 - 理想 |
+|------|-------------|
+| attention / 28 layers | **~1.53 ms / token** |
+| down_proj / 28 layers | **~0.47 ms / token** |
+| gate_up_proj / 28 layers | **~0.32 ms / token** |
+| o_proj / 28 layers | **~0.16 ms / token** |
+| qkv_proj / 28 layers | **~0.19 ms / token** |
+| lm_head | **~0.06 ms / token** |
+
+可以直接得到两个判断：
+
+1. **attention 仍然是离理论下限最远的主力项**
+   - 即便已经去掉了 `repeat_kv` 物化 copy，当前 decode attention 仍比 “只按 KV 读” 的理想下限高近 `19x`
+   - 这说明 attention 这部分并不是“没优化到”，而是**离 roofline 还非常远**
+
+2. **大线性层已经相对接近带宽下限**
+   - `qkv / gate_up / o_proj / down_proj / lm_head` 大多只比理想下限高 `1.2x ~ 2.4x`
+   - 它们当然还有空间，但已经不像 attention 那样是一个数量级的差距
+
+所以如果只看“离极限还差多少”，**attention kernel 本体** 其实是最新默认路径里最值得继续压的一段。
+
+当前已经验证的最新本地实验（decode attention fast path 开启）：
+
+- `10` 样本 benchmark：`62.06 ms / 133.91 tok/s`
+- latest steady-state trace：`5.40 ms / step`，约对应 `185 tok/s` 的 GPU-only 上限
 
 因此当前有效带宽利用率大致为：
 
 ```text
-110 / 564 ≈ 19.5%
+134 / 564 ≈ 23.7%
 ```
 
-也就是说，当前和理论上限之间还有约 `5x` 空间。
+也就是说，当前和理论上限之间仍然还有约 `4.2x` 空间。
 
 ---
 
@@ -168,22 +238,21 @@ FLOPs：
 
 理论上限不是问题，现实问题在于 **HBM roundtrip 浪费**。
 
-fresh trace（当前默认主线）显示：
+latest trace（`triton_decode_attention`）显示：
 
 | 类别 | decode GPU/步 | 占比 |
 |------|---------------|------|
-| Elementwise | 3.59ms | 41.1% |
-| GEMM | 2.15ms | 24.7% |
-| FlashAttn | 1.43ms | 16.4% |
-| GEMV | 1.03ms | 11.8% |
-| Reduction | 0.28ms | 3.2% |
+| GEMM | 1.80ms | 33.3% |
+| Attention | 1.62ms | 30.1% |
+| GEMV | 1.09ms | 20.2% |
+| Elementwise | 0.58ms | 10.8% |
+| Norm | 0.28ms | 5.3% |
 
 主热点不是“大矩阵乘本身算不动”，而是：
 
-- `Copy`
-- `Mul`
-- generic elementwise
-- `Reduction`
+- attention
+- 仍然残留的 `Copy/Mul/generic elementwise`
+- 以及几段单 token GEMV / 小 GEMM
 
 这些小 kernel 把本来应该接近“读权重一次就做完”的过程，拆成了大量：
 
@@ -191,7 +260,7 @@ fresh trace（当前默认主线）显示：
 HBM 读 -> 小计算 -> HBM 写 -> 再读 -> 再算 -> 再写
 ```
 
-因此虽然理论上是带宽受限，但实际只吃到了约 `20%` 的有效带宽。
+因此虽然理论上是带宽受限，但实际只吃到了约 `24%` 的有效带宽。
 
 ---
 
