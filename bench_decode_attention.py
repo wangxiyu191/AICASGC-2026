@@ -70,6 +70,7 @@ class AttentionCapture:
         attention_mask: torch.Tensor | None,
         scaling: float,
         num_key_value_groups: int,
+        cache_position: torch.Tensor | None,
     ):
         if q.shape[2] != 1:
             return
@@ -81,6 +82,7 @@ class AttentionCapture:
                 "attention_mask": attention_mask.detach().clone() if attention_mask is not None else None,
                 "scaling": float(scaling),
                 "num_key_value_groups": int(num_key_value_groups),
+                "cache_position": cache_position.detach().clone() if cache_position is not None else None,
             }
         self.decode_call_index += 1
 
@@ -88,8 +90,17 @@ class AttentionCapture:
 def _install_attention_capture(capture: AttentionCapture):
     original = optimized_layer._small_decode_attention
 
-    def wrapped(q, k, v, attention_mask, scaling, num_key_value_groups, prefer_small_triton=False):
-        capture.maybe_capture(q, k, v, attention_mask, scaling, num_key_value_groups)
+    def wrapped(
+        q,
+        k,
+        v,
+        attention_mask,
+        scaling,
+        num_key_value_groups,
+        prefer_small_triton=False,
+        cache_position=None,
+    ):
+        capture.maybe_capture(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position)
         return original(
             q,
             k,
@@ -98,6 +109,7 @@ def _install_attention_capture(capture: AttentionCapture):
             scaling,
             num_key_value_groups,
             prefer_small_triton=prefer_small_triton,
+            cache_position=cache_position,
         )
 
     optimized_layer._small_decode_attention = wrapped
@@ -290,7 +302,22 @@ def _triton_grouped_gqa(q, k, v, attention_mask, scaling, num_key_value_groups):
     return out
 
 
-def _triton_current(q, k, v, attention_mask, scaling, num_key_value_groups):
+def _triton_grouped_cachepos_prefix(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position):
+    out = optimized_layer._small_decode_attention_grouped_prefix_cachepos(
+        q,
+        k,
+        v,
+        scaling,
+        num_key_value_groups,
+        cache_position,
+        prefer_small_triton=True,
+    )
+    if out is None:
+        raise RuntimeError("Grouped cache-position Triton decode attention returned None for captured tensors")
+    return out
+
+
+def _triton_current(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position):
     out = optimized_layer._small_decode_attention(
         q,
         k,
@@ -299,20 +326,32 @@ def _triton_current(q, k, v, attention_mask, scaling, num_key_value_groups):
         scaling,
         num_key_value_groups,
         prefer_small_triton=True,
+        cache_position=cache_position,
     )
     if out is None:
         raise RuntimeError("Default Triton decode attention returned None for captured tensors")
     return out
 
 
-def _bench_impl(fn, q, k, v, attention_mask, scaling, num_key_value_groups, warmup: int, iters: int):
+def _bench_impl(
+    fn,
+    q,
+    k,
+    v,
+    attention_mask,
+    scaling,
+    num_key_value_groups,
+    cache_position,
+    warmup: int,
+    iters: int,
+):
     for _ in range(warmup):
-        fn(q, k, v, attention_mask, scaling, num_key_value_groups)
+        fn(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     out = None
     for _ in range(iters):
-        out = fn(q, k, v, attention_mask, scaling, num_key_value_groups)
+        out = fn(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position)
     torch.cuda.synchronize()
     elapsed_ms = (time.perf_counter() - t0) * 1000.0 / iters
     return out, elapsed_ms
@@ -325,20 +364,22 @@ def _run_benchmarks(payload, warmup: int, iters: int):
     attention_mask = payload["attention_mask"]
     scaling = payload["scaling"]
     num_key_value_groups = payload["num_key_value_groups"]
+    cache_position = payload["cache_position"]
 
     variants = {
-        "hf_repeat_kv_sdpa": _hf_repeat_kv_attention,
-        "triton_per_q_head": _triton_per_q_head,
-        "triton_grouped_gqa": _triton_grouped_gqa,
+        "hf_repeat_kv_sdpa": lambda q, k, v, attention_mask, scaling, num_key_value_groups, _cache_position: _hf_repeat_kv_attention(q, k, v, attention_mask, scaling, num_key_value_groups),
+        "triton_per_q_head": lambda q, k, v, attention_mask, scaling, num_key_value_groups, _cache_position: _triton_per_q_head(q, k, v, attention_mask, scaling, num_key_value_groups),
+        "triton_grouped_gqa": lambda q, k, v, attention_mask, scaling, num_key_value_groups, _cache_position: _triton_grouped_gqa(q, k, v, attention_mask, scaling, num_key_value_groups),
+        "triton_grouped_cachepos_prefix": _triton_grouped_cachepos_prefix,
         "triton_current": _triton_current,
-        "sdpa_enable_gqa_mask": _sdpa_gqa_mask,
-        "sdpa_enable_gqa_valid_prefix": _sdpa_gqa_valid_only,
+        "sdpa_enable_gqa_mask": lambda q, k, v, attention_mask, scaling, num_key_value_groups, _cache_position: _sdpa_gqa_mask(q, k, v, attention_mask, scaling, num_key_value_groups),
+        "sdpa_enable_gqa_valid_prefix": lambda q, k, v, attention_mask, scaling, num_key_value_groups, _cache_position: _sdpa_gqa_valid_only(q, k, v, attention_mask, scaling, num_key_value_groups),
     }
 
     results = {}
     ref_out, ref_ms = _bench_impl(
         variants["hf_repeat_kv_sdpa"],
-        q, k, v, attention_mask, scaling, num_key_value_groups,
+        q, k, v, attention_mask, scaling, num_key_value_groups, cache_position,
         warmup=warmup,
         iters=iters,
     )
@@ -353,7 +394,7 @@ def _run_benchmarks(payload, warmup: int, iters: int):
         try:
             out, ms = _bench_impl(
                 fn,
-                q, k, v, attention_mask, scaling, num_key_value_groups,
+                q, k, v, attention_mask, scaling, num_key_value_groups, cache_position,
                 warmup=warmup,
                 iters=iters,
             )
@@ -436,6 +477,7 @@ def main():
         "prompt_length": capture_meta["prompt_length"],
         "max_cache_len": capture_meta["max_cache_len"],
         "captured_decode_step": capture_meta["captured_decode_step"],
+        "cache_position": int(payload["cache_position"].item()) if payload["cache_position"] is not None else None,
     }
 
     print(

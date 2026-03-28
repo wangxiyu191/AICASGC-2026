@@ -154,6 +154,7 @@ class OptimizedDecoderLayer(nn.Module):
                 self.scaling,
                 self.num_key_value_groups,
                 prefer_small_triton=prefer_small_decode_triton,
+                cache_position=cache_position,
             )
             if attn_output is None:
                 attn_output, _ = self._attention_interface(
@@ -395,6 +396,7 @@ def _small_decode_attention(
     scaling: float,
     num_key_value_groups: int,
     prefer_small_triton: bool = False,
+    cache_position: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """Single-token decode attention without repeat_kv copies."""
     if not _small_decode_attention_inputs_ok(
@@ -407,6 +409,17 @@ def _small_decode_attention(
     ):
         return None
 
+    out = _small_decode_attention_grouped_prefix_cachepos(
+        q,
+        k,
+        v,
+        scaling,
+        num_key_value_groups,
+        cache_position,
+        prefer_small_triton=prefer_small_triton,
+    )
+    if out is not None:
+        return out
     out = _small_decode_attention_grouped(
         q,
         k,
@@ -559,6 +572,65 @@ def _small_decode_attention_grouped(
         scaling,
         HEAD_DIM=head_dim,
         SEQ_LEN=seq_len,
+        BLOCK_N=block_n,
+    )
+    return out.unsqueeze(2).transpose(1, 2)
+
+
+def _small_decode_attention_grouped_prefix_cachepos(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scaling: float,
+    num_key_value_groups: int,
+    cache_position: torch.Tensor | None,
+    prefer_small_triton: bool = False,
+) -> torch.Tensor | None:
+    if (
+        not prefer_small_triton
+        or not _ENABLE_TRITON_SMALL_DECODE_ATTENTION
+        or cache_position is None
+        or cache_position.device.type != "cuda"
+        or cache_position.ndim != 1
+        or cache_position.numel() != 1
+        or num_key_value_groups != 2
+    ):
+        return None
+    if (
+        q.device.type != "cuda"
+        or k.device.type != "cuda"
+        or v.device.type != "cuda"
+        or q.shape[0] != 1
+        or q.shape[2] != 1
+        or q.stride(-1) != 1
+        or k.stride(-1) != 1
+        or v.stride(-1) != 1
+    ):
+        return None
+
+    seq_len = k.shape[2]
+    head_dim = q.shape[-1]
+    block_n = 64 if seq_len <= 1024 else 128
+    out = torch.empty((1, q.shape[1], head_dim), dtype=q.dtype, device=q.device)
+    _small_decode_attention_grouped_prefix_cachepos_fwd_kernel[(k.shape[1],)](
+        q,
+        k,
+        v,
+        cache_position,
+        out,
+        q.stride(0),
+        q.stride(1),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        out.stride(0),
+        out.stride(1),
+        scaling,
+        HEAD_DIM=head_dim,
+        MAX_SEQ_LEN=seq_len,
         BLOCK_N=block_n,
     )
     return out.unsqueeze(2).transpose(1, 2)
@@ -807,6 +879,79 @@ def _small_decode_attention_grouped_fwd_kernel(
         l1 = l1 * alpha1 + tl.sum(p1, axis=0)
         m0 = m0_new
         m1 = m1_new
+
+    acc0 = acc0 / l0
+    acc1 = acc1 / l1
+    tl.store(OUT + q_head_idx0 * stride_out_h + offs_d, acc0.to(OUT.dtype.element_ty), mask=offs_d < HEAD_DIM)
+    tl.store(OUT + q_head_idx1 * stride_out_h + offs_d, acc1.to(OUT.dtype.element_ty), mask=offs_d < HEAD_DIM)
+
+
+@triton.jit
+def _small_decode_attention_grouped_prefix_cachepos_fwd_kernel(
+    Q,
+    K,
+    V,
+    CACHE_POSITION,
+    OUT,
+    stride_q_b,
+    stride_q_h,
+    stride_k_b,
+    stride_k_h,
+    stride_k_s,
+    stride_v_b,
+    stride_v_h,
+    stride_v_s,
+    stride_out_b,
+    stride_out_h,
+    scale,
+    HEAD_DIM: tl.constexpr,
+    MAX_SEQ_LEN: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Grouped decode attention with valid prefix length derived from cache_position."""
+    kv_head_idx = tl.program_id(0)
+    offs_d = tl.arange(0, HEAD_DIM)
+    valid_len = tl.load(CACHE_POSITION).to(tl.int32) + 1
+    valid_len = tl.minimum(valid_len, MAX_SEQ_LEN)
+    q_head_idx0 = kv_head_idx * 2
+    q_head_idx1 = q_head_idx0 + 1
+
+    q0 = tl.load(Q + q_head_idx0 * stride_q_h + offs_d, mask=offs_d < HEAD_DIM, other=0.0).to(tl.float32)
+    q1 = tl.load(Q + q_head_idx1 * stride_q_h + offs_d, mask=offs_d < HEAD_DIM, other=0.0).to(tl.float32)
+
+    m0 = -float("inf")
+    m1 = -float("inf")
+    l0 = 0.0
+    l1 = 0.0
+    acc0 = tl.zeros((HEAD_DIM,), dtype=tl.float32)
+    acc1 = tl.zeros((HEAD_DIM,), dtype=tl.float32)
+
+    start_n = 0
+    while start_n < valid_len:
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        token_mask = offs_n < valid_len
+
+        k_ptrs = K + kv_head_idx * stride_k_h + offs_n[:, None] * stride_k_s + offs_d[None, :]
+        k = tl.load(k_ptrs, mask=token_mask[:, None], other=0.0).to(tl.float32)
+        qk0 = tl.sum(k * q0[None, :], axis=1) * scale
+        qk1 = tl.sum(k * q1[None, :], axis=1) * scale
+
+        m0_new = tl.maximum(m0, tl.max(qk0, axis=0))
+        m1_new = tl.maximum(m1, tl.max(qk1, axis=0))
+        p0 = tl.exp(qk0 - m0_new)
+        p1 = tl.exp(qk1 - m1_new)
+        alpha0 = tl.exp(m0 - m0_new)
+        alpha1 = tl.exp(m1 - m1_new)
+
+        v_ptrs = V + kv_head_idx * stride_v_h + offs_n[:, None] * stride_v_s + offs_d[None, :]
+        v = tl.load(v_ptrs, mask=token_mask[:, None], other=0.0).to(tl.float32)
+        acc0 = acc0 * alpha0 + tl.sum(p0[:, None] * v, axis=0)
+        acc1 = acc1 * alpha1 + tl.sum(p1[:, None] * v, axis=0)
+        l0 = l0 * alpha0 + tl.sum(p0, axis=0)
+        l1 = l1 * alpha1 + tl.sum(p1, axis=0)
+        m0 = m0_new
+        m1 = m1_new
+        start_n += BLOCK_N
 
     acc0 = acc0 / l0
     acc1 = acc1 / l1
