@@ -160,6 +160,67 @@ CUDAGraph capture (如 bucket 未预建)
 - 但它换来了更少的物化 copy，净效果仍是 decode GPU/步下降约 `0.64 ms`
 - 目前整机 benchmark 提升只有 `~0.9%`，说明**新的主限制已经更多落到 host event sync 和剩余 GEMM/GEMV 上**，而不是 attention copy
 
+### 3.4 新增实验：按 GQA group 复用 K/V 读取
+
+Qwen3-VL-2B 的文本 attention 是 `16 q heads / 8 kv heads`，也就是每个 `kv_head` 会服务 `2` 个 `q_head`。
+
+前一版 Triton decode attention 虽然已经去掉了 `repeat_kv` 物化，但 kernel 仍然是“按单个 `q_head`”处理，因此同一组里的两条 query 还是会各自把同一份 `K/V` 读一遍。
+
+这一轮做法是：
+
+- 保持 decode-only、`batch=1`、`q_len=1` 的快路径前提不变
+- 改成一个 program 处理 `1 kv_head + 2 q_head`
+- 在 kernel 内只加载一次该组的 `K/V` block，然后分别对两条 query 做 streaming softmax
+
+先看真实路径 microbenchmark（sample0 / layer0 / decode_step0）：
+
+| 实现 | 时间 |
+|------|------|
+| HF `repeat_kv + SDPA` | `0.0971 ms` |
+| Triton per-q-head | `0.0720 ms` |
+| Triton grouped-GQA | `0.0693 ms` |
+
+也就是：
+
+- 相对 HF 基线：`1.35x -> 1.40x`
+- 相对上一版 per-q-head Triton：再快约 `3.8%`
+- 数值误差仍很小：`max_abs_diff = 4.88e-4`
+
+再看真实 benchmark 路径：
+
+| 对比项 | step31 Triton attention | grouped-GQA Triton | grouped-GQA rerun |
+|--------|-------------------------|--------------------|-------------------|
+| 10 样本 benchmark | `62.06 ms / 133.91 tok/s` | `62.95 ms / 152.13 tok/s` | `63.46 ms / 151.99 tok/s` |
+| 与 step31 答案一致性 | - | `10/10 exact match` | `10/10 exact match` |
+
+对应结果文件：
+
+- microbench: [results/attention_microbench_grouped_smoke.json](../results/attention_microbench_grouped_smoke.json)
+- benchmark: [results/result_step33_decode_attn_grouped_gqa_10.json](../results/result_step33_decode_attn_grouped_gqa_10.json)
+- benchmark rerun: [results/result_step33_decode_attn_grouped_gqa_10_rerun.json](../results/result_step33_decode_attn_grouped_gqa_10_rerun.json)
+
+另外也抓了一版 trace：
+
+- trace: [traces/compare/triton_decode_attention_grouped](../traces/compare/triton_decode_attention_grouped)
+
+这里要特别注明一个现象：
+
+- single-sample (`sample_idx=0`) 的 traced steady-state decode，并**没有**出现和 benchmark 同量级的 attention 降时
+- `analyze_traces.py` 给出的 sample0 steady-state 反而是 `5.40 -> 5.44 ms/步`、attention `1.62 -> 1.76 ms/步`
+- 但真实 benchmark 两次 `10` 样本都稳定在 `~152 tok/s`，并且答案与 step31 `10/10 exact match`
+
+目前更合理的解释是：
+
+- `viztracer + CUPTI + 单个 sample` 对这种几十微秒级 kernel 的扰动和波动都不小
+- grouped kernel 的收益更像是“多样本平均收益”，而不是 sample0 上一定能在 trace 里清楚看到的稳定降幅
+- 因此这一步**以真实 benchmark 结果为主结论**，trace 只保留为局部观测
+
+当前结论：
+
+- 这条 grouped-GQA Triton attention 路径值得保留默认开启
+- attention 方向仍然有效，而且还没到头
+- 但下一步如果要继续靠 trace 精确拆 attention 内部收益，最好不要只盯 `sample0 + generate_2 - generate_1`，而是补多 step / 多 layer 的 attention microbenchmark 作为主观测工具
+
 ## 4. 带宽利用率估算
 
 - A800 HBM 带宽: ~2039 GB/s

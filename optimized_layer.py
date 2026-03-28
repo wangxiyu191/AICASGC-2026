@@ -397,7 +397,47 @@ def _small_decode_attention(
     prefer_small_triton: bool = False,
 ) -> torch.Tensor | None:
     """Single-token decode attention without repeat_kv copies."""
-    if (
+    if not _small_decode_attention_inputs_ok(
+        q,
+        k,
+        v,
+        attention_mask,
+        num_key_value_groups,
+        prefer_small_triton=prefer_small_triton,
+    ):
+        return None
+
+    out = _small_decode_attention_grouped(
+        q,
+        k,
+        v,
+        attention_mask,
+        scaling,
+        num_key_value_groups,
+        prefer_small_triton=prefer_small_triton,
+    )
+    if out is not None:
+        return out
+    return _small_decode_attention_per_head(
+        q,
+        k,
+        v,
+        attention_mask,
+        scaling,
+        num_key_value_groups,
+        prefer_small_triton=prefer_small_triton,
+    )
+
+
+def _small_decode_attention_inputs_ok(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    num_key_value_groups: int,
+    prefer_small_triton: bool = False,
+) -> bool:
+    return not (
         (not prefer_small_triton)
         or (not _ENABLE_TRITON_SMALL_DECODE_ATTENTION)
         or attention_mask is None
@@ -421,6 +461,25 @@ def _small_decode_attention(
         or q.stride(-1) != 1
         or k.stride(-1) != 1
         or v.stride(-1) != 1
+    )
+
+
+def _small_decode_attention_per_head(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    scaling: float,
+    num_key_value_groups: int,
+    prefer_small_triton: bool = False,
+) -> torch.Tensor | None:
+    if not _small_decode_attention_inputs_ok(
+        q,
+        k,
+        v,
+        attention_mask,
+        num_key_value_groups,
+        prefer_small_triton=prefer_small_triton,
     ):
         return None
 
@@ -447,6 +506,56 @@ def _small_decode_attention(
         out.stride(1),
         q.shape[1],
         num_key_value_groups,
+        scaling,
+        HEAD_DIM=head_dim,
+        SEQ_LEN=seq_len,
+        BLOCK_N=block_n,
+    )
+    return out.unsqueeze(2).transpose(1, 2)
+
+
+def _small_decode_attention_grouped(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    scaling: float,
+    num_key_value_groups: int,
+    prefer_small_triton: bool = False,
+) -> torch.Tensor | None:
+    if not _small_decode_attention_inputs_ok(
+        q,
+        k,
+        v,
+        attention_mask,
+        num_key_value_groups,
+        prefer_small_triton=prefer_small_triton,
+    ):
+        return None
+    if num_key_value_groups != 2:
+        return None
+
+    seq_len = k.shape[2]
+    head_dim = q.shape[-1]
+    block_n = 64 if seq_len <= 1024 else 128
+    out = torch.empty((1, q.shape[1], head_dim), dtype=q.dtype, device=q.device)
+    mask_1d = attention_mask[0, 0, 0]
+    _small_decode_attention_grouped_fwd_kernel[(k.shape[1],)](
+        q,
+        k,
+        v,
+        mask_1d,
+        out,
+        q.stride(0),
+        q.stride(1),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        out.stride(0),
+        out.stride(1),
         scaling,
         HEAD_DIM=head_dim,
         SEQ_LEN=seq_len,
@@ -631,6 +740,78 @@ def _small_decode_attention_fwd_kernel(
 
     acc = acc / l_i
     tl.store(OUT + head_idx * stride_out_h + offs_d, acc.to(OUT.dtype.element_ty), mask=offs_d < HEAD_DIM)
+
+
+@triton.jit
+def _small_decode_attention_grouped_fwd_kernel(
+    Q,
+    K,
+    V,
+    MASK,
+    OUT,
+    stride_q_b,
+    stride_q_h,
+    stride_k_b,
+    stride_k_h,
+    stride_k_s,
+    stride_v_b,
+    stride_v_h,
+    stride_v_s,
+    stride_out_b,
+    stride_out_h,
+    scale,
+    HEAD_DIM: tl.constexpr,
+    SEQ_LEN: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Streaming decode attention that reuses one kv-head's K/V across its q-head group."""
+    kv_head_idx = tl.program_id(0)
+    offs_d = tl.arange(0, HEAD_DIM)
+    q_head_idx0 = kv_head_idx * 2
+    q_head_idx1 = q_head_idx0 + 1
+
+    q0 = tl.load(Q + q_head_idx0 * stride_q_h + offs_d, mask=offs_d < HEAD_DIM, other=0.0).to(tl.float32)
+    q1 = tl.load(Q + q_head_idx1 * stride_q_h + offs_d, mask=offs_d < HEAD_DIM, other=0.0).to(tl.float32)
+
+    m0 = -float("inf")
+    m1 = -float("inf")
+    l0 = 0.0
+    l1 = 0.0
+    acc0 = tl.zeros((HEAD_DIM,), dtype=tl.float32)
+    acc1 = tl.zeros((HEAD_DIM,), dtype=tl.float32)
+
+    for start_n in range(0, SEQ_LEN, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        token_mask = offs_n < SEQ_LEN
+        valid_mask = tl.load(MASK + offs_n, mask=token_mask, other=0) != 0
+
+        k_ptrs = K + kv_head_idx * stride_k_h + offs_n[:, None] * stride_k_s + offs_d[None, :]
+        k = tl.load(k_ptrs, mask=token_mask[:, None], other=0.0).to(tl.float32)
+        qk0 = tl.sum(k * q0[None, :], axis=1) * scale
+        qk1 = tl.sum(k * q1[None, :], axis=1) * scale
+        qk0 = tl.where(valid_mask, qk0, -float("inf"))
+        qk1 = tl.where(valid_mask, qk1, -float("inf"))
+
+        m0_new = tl.maximum(m0, tl.max(qk0, axis=0))
+        m1_new = tl.maximum(m1, tl.max(qk1, axis=0))
+        p0 = tl.exp(qk0 - m0_new)
+        p1 = tl.exp(qk1 - m1_new)
+        alpha0 = tl.exp(m0 - m0_new)
+        alpha1 = tl.exp(m1 - m1_new)
+
+        v_ptrs = V + kv_head_idx * stride_v_h + offs_n[:, None] * stride_v_s + offs_d[None, :]
+        v = tl.load(v_ptrs, mask=token_mask[:, None], other=0.0).to(tl.float32)
+        acc0 = acc0 * alpha0 + tl.sum(p0[:, None] * v, axis=0)
+        acc1 = acc1 * alpha1 + tl.sum(p1[:, None] * v, axis=0)
+        l0 = l0 * alpha0 + tl.sum(p0, axis=0)
+        l1 = l1 * alpha1 + tl.sum(p1, axis=0)
+        m0 = m0_new
+        m1 = m1_new
+
+    acc0 = acc0 / l0
+    acc1 = acc1 / l1
+    tl.store(OUT + q_head_idx0 * stride_out_h + offs_d, acc0.to(OUT.dtype.element_ty), mask=offs_d < HEAD_DIM)
+    tl.store(OUT + q_head_idx1 * stride_out_h + offs_d, acc1.to(OUT.dtype.element_ty), mask=offs_d < HEAD_DIM)
 
 
 def _apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:

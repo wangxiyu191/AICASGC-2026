@@ -260,6 +260,36 @@ def _sdpa_gqa_valid_only(q, k, v, attention_mask, scaling, _num_key_value_groups
     ).transpose(1, 2).contiguous()
 
 
+def _triton_per_q_head(q, k, v, attention_mask, scaling, num_key_value_groups):
+    out = optimized_layer._small_decode_attention_per_head(
+        q,
+        k,
+        v,
+        attention_mask,
+        scaling,
+        num_key_value_groups,
+        prefer_small_triton=True,
+    )
+    if out is None:
+        raise RuntimeError("Per-head Triton decode attention returned None for captured tensors")
+    return out
+
+
+def _triton_grouped_gqa(q, k, v, attention_mask, scaling, num_key_value_groups):
+    out = optimized_layer._small_decode_attention_grouped(
+        q,
+        k,
+        v,
+        attention_mask,
+        scaling,
+        num_key_value_groups,
+        prefer_small_triton=True,
+    )
+    if out is None:
+        raise RuntimeError("Grouped-GQA Triton decode attention returned None for captured tensors")
+    return out
+
+
 def _triton_current(q, k, v, attention_mask, scaling, num_key_value_groups):
     out = optimized_layer._small_decode_attention(
         q,
@@ -271,7 +301,7 @@ def _triton_current(q, k, v, attention_mask, scaling, num_key_value_groups):
         prefer_small_triton=True,
     )
     if out is None:
-        raise RuntimeError("Current Triton decode attention returned None for captured tensors")
+        raise RuntimeError("Default Triton decode attention returned None for captured tensors")
     return out
 
 
@@ -298,6 +328,8 @@ def _run_benchmarks(payload, warmup: int, iters: int):
 
     variants = {
         "hf_repeat_kv_sdpa": _hf_repeat_kv_attention,
+        "triton_per_q_head": _triton_per_q_head,
+        "triton_grouped_gqa": _triton_grouped_gqa,
         "triton_current": _triton_current,
         "sdpa_enable_gqa_mask": _sdpa_gqa_mask,
         "sdpa_enable_gqa_valid_prefix": _sdpa_gqa_valid_only,
