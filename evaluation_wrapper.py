@@ -40,12 +40,7 @@ class GreedyDecodeEngine:
     def __init__(self, model, max_tokens_threshold: int):
         self._model = model
         self._max_tokens_threshold = max_tokens_threshold
-        self._enable_viztrace = os.environ.get("ENABLE_VIZTRACE", "0") == "1"
-        allow_cudagraph_with_trace = os.environ.get("ENABLE_CUDAGRAPH_WITH_VIZTRACE", "0") == "1"
-        self._enable_cudagraph = (
-            os.environ.get("ENABLE_CUDAGRAPH", "1") == "1"
-            and (not self._enable_viztrace or allow_cudagraph_with_trace)
-        )
+        self._enable_cudagraph = os.environ.get("ENABLE_CUDAGRAPH", "1") == "1"
         self._graph_warmup_steps = int(os.environ.get("CUDAGRAPH_WARMUP_STEPS", "2"))
 
     def is_supported(self, args, kwargs) -> bool:
