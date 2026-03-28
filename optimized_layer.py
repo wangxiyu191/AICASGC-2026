@@ -610,7 +610,7 @@ def _small_decode_attention_grouped_prefix_cachepos(
 
     seq_len = k.shape[2]
     head_dim = q.shape[-1]
-    block_n = 64 if seq_len <= 1024 else 128
+    block_n, num_warps, num_stages = _small_decode_attention_grouped_prefix_cachepos_launch_config(seq_len)
     out = torch.empty((1, q.shape[1], head_dim), dtype=q.dtype, device=q.device)
     _small_decode_attention_grouped_prefix_cachepos_fwd_kernel[(k.shape[1],)](
         q,
@@ -632,8 +632,19 @@ def _small_decode_attention_grouped_prefix_cachepos(
         HEAD_DIM=head_dim,
         MAX_SEQ_LEN=seq_len,
         BLOCK_N=block_n,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return out.unsqueeze(2).transpose(1, 2)
+
+
+def _small_decode_attention_grouped_prefix_cachepos_launch_config(seq_len: int) -> tuple[int, int, int]:
+    """Launch config tuned for decode buckets seen in benchmark traces."""
+    if seq_len <= 512:
+        return 64, 2, 2
+    if seq_len <= 2048:
+        return 128, 4, 4
+    return 128, 8, 2
 
 
 @triton.jit
