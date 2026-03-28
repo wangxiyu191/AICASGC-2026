@@ -918,18 +918,41 @@ class DecodeCudaGraphRunner:
     def _snapshot_cache(self):
         snapshot = []
         for layer in self._static_cache.layers:
-            snapshot.append((
-                layer.keys.clone(),
-                layer.values.clone(),
-                layer.cumulative_length.clone(),
-            ))
+            layer_snapshot = {
+                "keys": None if layer.keys is None else layer.keys.clone(),
+                "values": None if layer.values is None else layer.values.clone(),
+            }
+            if hasattr(layer, "cumulative_length"):
+                cumulative_length = layer.cumulative_length
+                if torch.is_tensor(cumulative_length):
+                    layer_snapshot["cumulative_length"] = cumulative_length.clone()
+                else:
+                    layer_snapshot["cumulative_length"] = cumulative_length
+            snapshot.append(layer_snapshot)
         return snapshot
 
     def _restore_cache(self, snapshot):
-        for layer, (keys, values, cum_len) in zip(self._static_cache.layers, snapshot):
-            layer.keys.copy_(keys)
-            layer.values.copy_(values)
-            layer.cumulative_length.copy_(cum_len)
+        for layer, layer_snapshot in zip(self._static_cache.layers, snapshot):
+            keys = layer_snapshot["keys"]
+            values = layer_snapshot["values"]
+            if keys is not None:
+                layer.keys.copy_(keys)
+            if values is not None:
+                layer.values.copy_(values)
+
+            if "cumulative_length" not in layer_snapshot or not hasattr(layer, "cumulative_length"):
+                continue
+
+            cumulative_length = layer_snapshot["cumulative_length"]
+            if torch.is_tensor(layer.cumulative_length):
+                if torch.is_tensor(cumulative_length):
+                    layer.cumulative_length.copy_(cumulative_length)
+                else:
+                    layer.cumulative_length.fill_(cumulative_length)
+            elif torch.is_tensor(cumulative_length):
+                layer.cumulative_length = int(cumulative_length.item())
+            else:
+                layer.cumulative_length = cumulative_length
 
 
 class ModelWrapper:

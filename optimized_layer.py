@@ -434,6 +434,9 @@ def _static_cache_single_token_update(
     layer = past_key_values.layers[layer_idx]
     if not isinstance(layer, StaticLayer):
         return None
+    cumulative_length = getattr(layer, "cumulative_length", None)
+    if not isinstance(cumulative_length, torch.Tensor) or cumulative_length.device.type != "cuda":
+        return None
 
     if not layer.is_initialized:
         layer.lazy_initialization(key_states, value_states)
@@ -449,7 +452,7 @@ def _static_cache_single_token_update(
         layer.keys,
         layer.values,
         cache_position,
-        layer.cumulative_length,
+        cumulative_length,
         key_states.stride(1),
         key_states.stride(2),
         key_states.stride(3),
