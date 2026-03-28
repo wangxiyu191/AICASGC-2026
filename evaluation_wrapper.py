@@ -5,9 +5,12 @@ Optimized VLMModel for Qwen3-VL-2B-Instruct inference.
 Optimizations:
 - SDPA attention backend (auto-selects flash/mem_efficient/math per call)
 - Fused decoder layers: Add+RMSNorm, QKV proj, gate_up proj, SwiGLU
-- Step A decode path: custom greedy loop + StaticCache with safe fallback
+- Step A decode path: custom greedy loop + StaticCache
 """
 from collections import deque
+from importlib import metadata as importlib_metadata
+import platform
+import sys
 from typing import Dict
 try:
     from PIL import Image
@@ -20,6 +23,10 @@ from transformers import AutoModelForImageTextToText, AutoProcessor
 from transformers.cache_utils import StaticCache
 
 from optimized_layer import replace_decoder_layers
+
+
+class CudaGraphExecutionError(RuntimeError):
+    """Raised when CUDA Graph is enabled for a supported request but execution fails."""
 
 
 class GreedyDecodeEngine:
@@ -54,35 +61,57 @@ class GreedyDecodeEngine:
         self._prebuild_graph_runners()
 
     def is_supported(self, args, kwargs) -> bool:
+        return self._get_support_failure_reason(args, kwargs) is None
+
+    def _get_support_failure_reason(self, args, kwargs) -> str | None:
         if len(args) > 1:
-            return False
+            return f"len(args)={len(args)} > 1"
 
         unsupported_keys = set(kwargs) - self.SUPPORTED_KWARGS
         if unsupported_keys:
-            return False
+            return f"unsupported kwargs: {sorted(unsupported_keys)}"
 
         input_ids = args[0] if args else kwargs.get("input_ids")
         if input_ids is None or input_ids.ndim != 2:
-            return False
+            return f"input_ids must be rank-2, got {None if input_ids is None else tuple(input_ids.shape)}"
         if input_ids.shape[0] != 1:
-            return False
+            return f"batch_size must be 1, got {input_ids.shape[0]}"
 
         attention_mask = kwargs.get("attention_mask")
         if attention_mask is not None and attention_mask.ndim != 2:
-            return False
+            return f"attention_mask must be rank-2, got shape={tuple(attention_mask.shape)}"
 
         if kwargs.get("do_sample", False):
-            return False
+            return "do_sample=True is unsupported"
         if not kwargs.get("use_cache", True):
-            return False
+            return "use_cache=False is unsupported"
 
         max_new_tokens = kwargs.get("max_new_tokens", self._max_tokens_threshold)
         if max_new_tokens is None or max_new_tokens < 1:
-            return False
+            return f"max_new_tokens must be >=1, got {max_new_tokens}"
         if max_new_tokens > self._max_tokens_threshold:
+            return f"max_new_tokens={max_new_tokens} exceeds threshold={self._max_tokens_threshold}"
+
+        return None
+
+    def is_cudagraph_enabled(self) -> bool:
+        return self._enable_cudagraph
+
+    def should_use_cudagraph_for_request(self, args, kwargs) -> bool:
+        if not self._enable_cudagraph:
             return False
 
-        return True
+        support_failure_reason = self._get_support_failure_reason(args, kwargs)
+        if support_failure_reason is not None:
+            return False
+
+        input_ids = args[0] if args else kwargs["input_ids"]
+        max_new_tokens = int(kwargs.get("max_new_tokens", self._max_tokens_threshold))
+        return self._should_use_cudagraph(
+            device=input_ids.device,
+            max_new_tokens=max_new_tokens,
+            current_length=input_ids.shape[1] + 1,
+        )
 
     def generate(self, *args, **kwargs):
         input_ids = args[0] if args else kwargs["input_ids"]
@@ -95,6 +124,7 @@ class GreedyDecodeEngine:
         batch_size, prompt_length = input_ids.shape
         device = input_ids.device
         max_cache_len = prompt_length + max_new_tokens
+        require_cudagraph = self.is_cudagraph_required_for_request(args, kwargs)
 
         if attention_mask is None:
             prompt_attention_mask = torch.ones((batch_size, prompt_length), dtype=torch.bool, device=device)
@@ -121,9 +151,19 @@ class GreedyDecodeEngine:
                 full_attention_mask = graph_runner.attention_mask
                 static_cache = graph_runner.static_cache
             except Exception as exc:
-                print(f"[GreedyDecodeEngine] CUDA Graph runner setup failed, fallback to eager decode: {exc}")
                 if graph_bucket_len is not None:
                     self._graph_runners.pop(self._graph_runner_key(device, graph_bucket_len), None)
+                if require_cudagraph:
+                    self._raise_cudagraph_failure(
+                        stage="runner_setup",
+                        exc=exc,
+                        device=device,
+                        prompt_length=prompt_length,
+                        current_length=prompt_length + 1,
+                        max_new_tokens=max_new_tokens,
+                        graph_bucket_len=graph_bucket_len,
+                    )
+                print(f"[GreedyDecodeEngine] CUDA Graph runner setup failed, fallback to eager decode: {exc}")
                 graph_runner = None
                 graph_bucket_len = None
 
@@ -171,9 +211,19 @@ class GreedyDecodeEngine:
                         start_input_ids=next_tokens,
                     )
                 except Exception as exc:
-                    print(f"[GreedyDecodeEngine] CUDA Graph capture failed, fallback to eager decode: {exc}")
                     if graph_bucket_len is not None:
                         self._graph_runners.pop(self._graph_runner_key(device, graph_bucket_len), None)
+                    if require_cudagraph:
+                        self._raise_cudagraph_failure(
+                            stage="capture",
+                            exc=exc,
+                            device=device,
+                            prompt_length=prompt_length,
+                            current_length=current_length,
+                            max_new_tokens=max_new_tokens,
+                            graph_bucket_len=graph_bucket_len,
+                        )
+                    print(f"[GreedyDecodeEngine] CUDA Graph capture failed, fallback to eager decode: {exc}")
                     graph_runner = None
 
             if graph_runner is not None and eos_token_values and self._async_eos_window > 1:
@@ -185,6 +235,10 @@ class GreedyDecodeEngine:
                     max_new_tokens=max_new_tokens,
                     graph_runner=graph_runner,
                     eos_token_values=eos_token_values,
+                    device=device,
+                    prompt_length=prompt_length,
+                    graph_bucket_len=graph_bucket_len,
+                    require_cudagraph=require_cudagraph,
                 )
 
             for _ in range(1, max_new_tokens):
@@ -192,10 +246,25 @@ class GreedyDecodeEngine:
                     break
 
                 if graph_runner is not None:
-                    next_tokens = graph_runner.replay(
-                        input_ids=next_tokens,
-                        current_position=current_position,
-                    )
+                    try:
+                        next_tokens = graph_runner.replay(
+                            input_ids=next_tokens,
+                            current_position=current_position,
+                        )
+                    except Exception as exc:
+                        if graph_bucket_len is not None:
+                            self._graph_runners.pop(self._graph_runner_key(device, graph_bucket_len), None)
+                        if require_cudagraph:
+                            self._raise_cudagraph_failure(
+                                stage="replay",
+                                exc=exc,
+                                device=device,
+                                prompt_length=prompt_length,
+                                current_length=current_length,
+                                max_new_tokens=max_new_tokens,
+                                graph_bucket_len=graph_bucket_len,
+                            )
+                        raise
                 else:
                     next_tokens = self._decode_one_token_eager(
                         next_tokens=next_tokens,
@@ -220,50 +289,147 @@ class GreedyDecodeEngine:
         max_new_tokens: int,
         graph_runner,
         eos_token_values,
+        device: torch.device,
+        prompt_length: int,
+        graph_bucket_len: int | None,
+        require_cudagraph: bool,
     ):
         pending = deque()
-        pending.append(graph_runner.stage_host_token(next_tokens, output_length=current_length))
+        try:
+            pending.append(graph_runner.stage_host_token(next_tokens, output_length=current_length))
+        except Exception as exc:
+            if graph_bucket_len is not None:
+                self._graph_runners.pop(self._graph_runner_key(device, graph_bucket_len), None)
+            if require_cudagraph:
+                self._raise_cudagraph_failure(
+                    stage="async_stage_host_token",
+                    exc=exc,
+                    device=device,
+                    prompt_length=prompt_length,
+                    current_length=current_length,
+                    max_new_tokens=max_new_tokens,
+                    graph_bucket_len=graph_bucket_len,
+                )
+            raise
 
         for _ in range(1, max_new_tokens):
-            eos_length = graph_runner.poll_staged_tokens(
-                pending=pending,
-                eos_token_values=eos_token_values,
-                block=False,
-            )
+            try:
+                eos_length = graph_runner.poll_staged_tokens(
+                    pending=pending,
+                    eos_token_values=eos_token_values,
+                    block=False,
+                )
+            except Exception as exc:
+                if graph_bucket_len is not None:
+                    self._graph_runners.pop(self._graph_runner_key(device, graph_bucket_len), None)
+                if require_cudagraph:
+                    self._raise_cudagraph_failure(
+                        stage="async_poll",
+                        exc=exc,
+                        device=device,
+                        prompt_length=prompt_length,
+                        current_length=current_length,
+                        max_new_tokens=max_new_tokens,
+                        graph_bucket_len=graph_bucket_len,
+                    )
+                raise
             if eos_length is not None:
                 current_length = eos_length
                 break
 
             if len(pending) >= graph_runner.async_eos_window:
-                eos_length = graph_runner.poll_staged_tokens(
-                    pending=pending,
-                    eos_token_values=eos_token_values,
-                    block=True,
-                )
+                try:
+                    eos_length = graph_runner.poll_staged_tokens(
+                        pending=pending,
+                        eos_token_values=eos_token_values,
+                        block=True,
+                    )
+                except Exception as exc:
+                    if graph_bucket_len is not None:
+                        self._graph_runners.pop(self._graph_runner_key(device, graph_bucket_len), None)
+                    if require_cudagraph:
+                        self._raise_cudagraph_failure(
+                            stage="async_poll_blocking",
+                            exc=exc,
+                            device=device,
+                            prompt_length=prompt_length,
+                            current_length=current_length,
+                            max_new_tokens=max_new_tokens,
+                            graph_bucket_len=graph_bucket_len,
+                        )
+                    raise
                 if eos_length is not None:
                     current_length = eos_length
                     break
 
-            next_tokens = graph_runner.replay(
-                input_ids=next_tokens,
-                current_position=current_position,
-            )
+            try:
+                next_tokens = graph_runner.replay(
+                    input_ids=next_tokens,
+                    current_position=current_position,
+                )
+            except Exception as exc:
+                if graph_bucket_len is not None:
+                    self._graph_runners.pop(self._graph_runner_key(device, graph_bucket_len), None)
+                if require_cudagraph:
+                    self._raise_cudagraph_failure(
+                        stage="async_replay",
+                        exc=exc,
+                        device=device,
+                        prompt_length=prompt_length,
+                        current_length=current_length,
+                        max_new_tokens=max_new_tokens,
+                        graph_bucket_len=graph_bucket_len,
+                    )
+                raise
             output_ids[:, current_length:current_length + 1] = next_tokens
             current_length += 1
             current_position += 1
-            pending.append(graph_runner.stage_host_token(next_tokens, output_length=current_length))
+            try:
+                pending.append(graph_runner.stage_host_token(next_tokens, output_length=current_length))
+            except Exception as exc:
+                if graph_bucket_len is not None:
+                    self._graph_runners.pop(self._graph_runner_key(device, graph_bucket_len), None)
+                if require_cudagraph:
+                    self._raise_cudagraph_failure(
+                        stage="async_stage_host_token",
+                        exc=exc,
+                        device=device,
+                        prompt_length=prompt_length,
+                        current_length=current_length,
+                        max_new_tokens=max_new_tokens,
+                        graph_bucket_len=graph_bucket_len,
+                    )
+                raise
 
         if pending:
-            eos_length = graph_runner.poll_staged_tokens(
-                pending=pending,
-                eos_token_values=eos_token_values,
-                block=True,
-                drain_all=True,
-            )
+            try:
+                eos_length = graph_runner.poll_staged_tokens(
+                    pending=pending,
+                    eos_token_values=eos_token_values,
+                    block=True,
+                    drain_all=True,
+                )
+            except Exception as exc:
+                if graph_bucket_len is not None:
+                    self._graph_runners.pop(self._graph_runner_key(device, graph_bucket_len), None)
+                if require_cudagraph:
+                    self._raise_cudagraph_failure(
+                        stage="async_drain",
+                        exc=exc,
+                        device=device,
+                        prompt_length=prompt_length,
+                        current_length=current_length,
+                        max_new_tokens=max_new_tokens,
+                        graph_bucket_len=graph_bucket_len,
+                    )
+                raise
             if eos_length is not None:
                 current_length = eos_length
 
         return output_ids[:, :current_length]
+
+    def is_cudagraph_required_for_request(self, args, kwargs) -> bool:
+        return self.should_use_cudagraph_for_request(args, kwargs)
 
     def _resolve_eos_token_id(self, kwargs):
         eos_token_id = kwargs.get("eos_token_id")
@@ -338,18 +504,61 @@ class GreedyDecodeEngine:
         )
         return torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
 
-    def _should_use_cudagraph(self, device: torch.device, max_new_tokens: int, current_length: int):
+    def _extract_request_input_ids(self, args, kwargs):
+        input_ids = args[0] if args else kwargs.get("input_ids")
+        if input_ids is None or getattr(input_ids, "ndim", None) != 2:
+            return None
+        return input_ids
+
+    def _extract_request_device(self, args, kwargs):
+        input_ids = self._extract_request_input_ids(args, kwargs)
+        if input_ids is not None:
+            return input_ids.device
+        try:
+            return next(self._model.parameters()).device
+        except Exception:
+            return torch.device("cpu")
+
+    def _build_request_context(self, args, kwargs):
+        input_ids = args[0] if args else kwargs.get("input_ids")
+        attention_mask = kwargs.get("attention_mask")
+        return "\n".join(
+            [
+                f"args_len={len(args)}",
+                f"kwargs_keys={sorted(kwargs.keys())}",
+                f"input_ids_shape={None if input_ids is None else tuple(input_ids.shape)}",
+                f"input_ids_device={None if input_ids is None else input_ids.device}",
+                f"attention_mask_shape={None if attention_mask is None else tuple(attention_mask.shape)}",
+                f"max_new_tokens={kwargs.get('max_new_tokens', self._max_tokens_threshold)}",
+                f"use_cache={kwargs.get('use_cache', True)}",
+                f"do_sample={kwargs.get('do_sample', False)}",
+            ]
+        )
+
+    def _get_cudagraph_unavailable_reason(
+        self,
+        device: torch.device,
+        max_new_tokens: int,
+        current_length: int,
+    ) -> str | None:
         if not self._enable_cudagraph:
-            return False
+            return "ENABLE_CUDAGRAPH=0"
         if not torch.cuda.is_available():
-            return False
+            return "torch.cuda.is_available()=False"
         if device.type != "cuda":
-            return False
+            return f"device.type={device.type}, expected cuda"
         if max_new_tokens <= 1:
-            return False
+            return f"max_new_tokens={max_new_tokens} <= 1"
         if current_length < 1:
-            return False
-        return True
+            return f"current_length={current_length} < 1"
+        return None
+
+    def _should_use_cudagraph(self, device: torch.device, max_new_tokens: int, current_length: int):
+        return self._get_cudagraph_unavailable_reason(
+            device=device,
+            max_new_tokens=max_new_tokens,
+            current_length=current_length,
+        ) is None
 
     def _get_graph_bucket_len(self, max_cache_len: int):
         bucket_size = self._graph_bucket_size
@@ -371,6 +580,91 @@ class GreedyDecodeEngine:
             )
             self._graph_runners[key] = runner
         return runner
+
+    def _raise_cudagraph_failure(
+        self,
+        stage: str,
+        exc: Exception,
+        device: torch.device,
+        prompt_length: int,
+        current_length: int,
+        max_new_tokens: int,
+        graph_bucket_len: int | None,
+    ):
+        context = [
+            "CUDA Graph execution failed while ENABLE_CUDAGRAPH=1 and request passed _should_use_cudagraph().",
+            f"stage={stage}",
+            f"device={device}",
+            f"prompt_length={prompt_length}",
+            f"current_length={current_length}",
+            f"max_new_tokens={max_new_tokens}",
+            f"graph_bucket_len={graph_bucket_len}",
+            f"original_exception={type(exc).__name__}: {exc}",
+        ]
+        raise CudaGraphExecutionError(
+            "\n".join(context + ["", self._build_runtime_environment_report(device=device)])
+        ) from exc
+
+    def _build_runtime_environment_report(self, device: torch.device):
+        env_names = (
+            "ENABLE_CUDAGRAPH",
+            "CUDAGRAPH_WARMUP_STEPS",
+            "CUDAGRAPH_ASYNC_EOS_WINDOW",
+            "CUDAGRAPH_BUCKET_SIZE",
+            "CUDAGRAPH_PREBUILD_MAX_CACHE_LEN",
+            "ENABLE_CUSTOM_DECODE",
+            "ENABLE_VIZTRACE",
+            "CUDA_VISIBLE_DEVICES",
+            "PYTORCH_CUDA_ALLOC_CONF",
+        )
+        package_names = (
+            "torch",
+            "transformers",
+            "tokenizers",
+            "safetensors",
+            "accelerate",
+            "flash_attn",
+            "triton",
+            "numpy",
+            "Pillow",
+        )
+
+        lines = ["Runtime environment check:"]
+        lines.append(f"python={platform.python_version()} ({sys.executable})")
+        lines.append(f"platform={platform.platform()}")
+        lines.append(f"torch.__version__={torch.__version__}")
+        lines.append(f"torch.version.cuda={torch.version.cuda}")
+        lines.append(f"torch.backends.cudnn.version={torch.backends.cudnn.version()}")
+        lines.append(f"torch.cuda.is_available={torch.cuda.is_available()}")
+        lines.append(f"torch.cuda.device_count={torch.cuda.device_count()}")
+        lines.append(f"requested_device={device}")
+        lines.append(f"model_dtype={getattr(self._model, 'dtype', 'unknown')}")
+        lines.append(f"model_type={getattr(self._model.config, 'model_type', 'unknown')}")
+
+        if torch.cuda.is_available():
+            try:
+                device_index = device.index if device.type == "cuda" and device.index is not None else torch.cuda.current_device()
+                props = torch.cuda.get_device_properties(device_index)
+                lines.append(
+                    "cuda_device="
+                    f"{props.name}, capability={props.major}.{props.minor}, total_memory_gb={props.total_memory / (1024 ** 3):.2f}"
+                )
+            except Exception as cuda_exc:
+                lines.append(f"cuda_device=<unavailable: {type(cuda_exc).__name__}: {cuda_exc}>")
+
+        for package_name in package_names:
+            try:
+                version = importlib_metadata.version(package_name)
+            except importlib_metadata.PackageNotFoundError:
+                version = "not_installed"
+            except Exception as package_exc:
+                version = f"error:{type(package_exc).__name__}:{package_exc}"
+            lines.append(f"{package_name}={version}")
+
+        for env_name in env_names:
+            lines.append(f"{env_name}={os.environ.get(env_name, '<unset>')}")
+
+        return "\n".join(lines)
 
     def _prebuild_graph_runners(self):
         if not self._enable_cudagraph:
@@ -655,6 +949,22 @@ class ModelWrapper:
         self._call_count += 1
         use_custom_decode = False
         generate_fn = lambda: self._model.generate(*args, **kwargs)
+        cudagraph_required = self._custom_decode.should_use_cudagraph_for_request(args, kwargs)
+
+        if cudagraph_required and not self._enable_custom_decode:
+            raise CudaGraphExecutionError(
+                "\n".join(
+                    [
+                        "ENABLE_CUDAGRAPH=1 and this request should use CUDA Graph, but ENABLE_CUSTOM_DECODE=0.",
+                        "",
+                        self._custom_decode._build_request_context(args, kwargs),
+                        "",
+                        self._custom_decode._build_runtime_environment_report(
+                            device=self._custom_decode._extract_request_device(args, kwargs)
+                        ),
+                    ]
+                )
+            )
 
         if self._enable_custom_decode and self._custom_decode.is_supported(args, kwargs):
             use_custom_decode = True
@@ -663,10 +973,7 @@ class ModelWrapper:
         if not self._enable_trace or not self._should_trace(kwargs):
             try:
                 return generate_fn()
-            except Exception as exc:
-                if use_custom_decode:
-                    print(f"[ModelWrapper] Custom decode failed, fallback to HF generate: {exc}")
-                    return self._model.generate(*args, **kwargs)
+            except Exception:
                 raise
 
         self._trace_count += 1
@@ -677,12 +984,8 @@ class ModelWrapper:
         try:
             try:
                 result = generate_fn()
-            except Exception as exc:
-                if use_custom_decode:
-                    print(f"[ModelWrapper] Custom decode failed under trace, fallback to HF generate: {exc}")
-                    result = self._model.generate(*args, **kwargs)
-                else:
-                    raise
+            except Exception:
+                raise
         finally:
             tracer.stop()
             tracer.save()
