@@ -348,6 +348,31 @@ HBM 读 -> 小计算 -> HBM 写 -> 再读 -> 再算 -> 再写
 5. **attention decode kernel 专项优化**
    但目标应从“再抠单 CTA 内部细节”切到“提高并行度”；否则很容易已经接近当前 shape 的局部上限
 
+### 2026-03-28 补充：single-token StaticCache KV write 后
+
+最新 trace：
+
+- [`traces/compare/triton_decode_step39_static_kv_write`](../traces/compare/triton_decode_step39_static_kv_write)
+
+相对上一版 step38，steady-state decode GPU/步已经从 `4.33ms` 进一步降到 `4.05ms`。
+
+这一步主要不是改变 GEMM / Attention 本体，而是把 decode 单 token 的 `StaticCache.update()` 通用写回路径压成了单个 Triton kernel，因此：
+
+- `Elementwise` 从 `0.57ms/步` 降到 `0.24ms/步`
+- `fragmented Copy/Mul/misc` 从 `0.719ms/步` 降到 `0.440ms/步`
+
+所以当前 decode 的主排序更清楚了：
+
+1. `o_proj + down_proj` 的 GEMV 仍然最大，约 `1.04ms/步`
+2. Attention 约 `0.67ms/步`
+3. 剩余碎 elementwise 已经被压到 `0.44ms/步` 量级，但还没完全清空
+
+这意味着后续优化优先级可以更偏向：
+
+- Attention 并行度
+- 更深的 GEMV 邻域融合
+- 以及是否把 `k` cache write 继续并进 `_fused_rms_norm_rope`
+
 ---
 
 ## 7. 当前判断

@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+from transformers.cache_utils import StaticCache, StaticLayer
 
 
 class OptimizedDecoderLayer(nn.Module):
@@ -142,7 +143,17 @@ class OptimizedDecoderLayer(nn.Module):
                 "cache_position": cache_position,
             }
             with _nvtx_range("decode.kv_cache_update", enable_decode_nvtx):
-                k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
+                updated_kv = _static_cache_single_token_update(
+                    past_key_values,
+                    self.layer_idx,
+                    k,
+                    v,
+                    cache_position,
+                )
+                if updated_kv is None:
+                    k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
+                else:
+                    k, v = updated_kv
 
         # 5. Attention (SDPA)
         with _nvtx_range("decode.attention", enable_decode_nvtx):
@@ -202,6 +213,7 @@ _ENABLE_TRITON_SMALL_SILU_MUL = os.environ.get("ENABLE_TRITON_SMALL_SILU_MUL", "
 _ENABLE_TRITON_SMALL_QK_NORM_ROPE = os.environ.get("ENABLE_TRITON_SMALL_QK_NORM_ROPE", "1") == "1"
 _ENABLE_TRITON_SMALL_DECODE_ATTENTION = os.environ.get("ENABLE_TRITON_SMALL_DECODE_ATTENTION", "1") == "1"
 _ENABLE_TRITON_SMALL_DECODE_ATTENTION_DOT = os.environ.get("ENABLE_TRITON_SMALL_DECODE_ATTENTION_DOT", "1") == "1"
+_ENABLE_TRITON_SMALL_DECODE_STATIC_KV = os.environ.get("ENABLE_TRITON_SMALL_DECODE_STATIC_KV", "1") == "1"
 _ENABLE_DECODE_NVTX = os.environ.get("ENABLE_DECODE_NVTX", "0") == "1"
 
 
@@ -391,6 +403,73 @@ def _fused_silu_mul(
     return out_flat.view_as(gate)
 
 
+def _static_cache_single_token_update(
+    past_key_values,
+    layer_idx: int,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    cache_position: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Single-token StaticCache update specialized for CUDA decode."""
+    if (
+        not _ENABLE_TRITON_SMALL_DECODE_STATIC_KV
+        or not isinstance(past_key_values, StaticCache)
+        or cache_position is None
+        or cache_position.device.type != "cuda"
+        or cache_position.ndim != 1
+        or cache_position.numel() != 1
+        or key_states.device.type != "cuda"
+        or value_states.device.type != "cuda"
+        or key_states.ndim != 4
+        or value_states.ndim != 4
+        or key_states.shape[0] != 1
+        or value_states.shape[0] != 1
+        or key_states.shape[2] != 1
+        or value_states.shape[2] != 1
+        or key_states.shape[:3] != value_states.shape[:3]
+        or key_states.shape[-1] != value_states.shape[-1]
+    ):
+        return None
+
+    layer = past_key_values.layers[layer_idx]
+    if not isinstance(layer, StaticLayer):
+        return None
+
+    if not layer.is_initialized:
+        layer.lazy_initialization(key_states, value_states)
+
+    head_dim = key_states.shape[-1]
+    block_d = triton.next_power_of_2(head_dim)
+    if block_d > 256:
+        return None
+
+    _static_cache_single_token_update_fwd_kernel[(key_states.shape[1],)](
+        key_states,
+        value_states,
+        layer.keys,
+        layer.values,
+        cache_position,
+        layer.cumulative_length,
+        key_states.stride(1),
+        key_states.stride(2),
+        key_states.stride(3),
+        value_states.stride(1),
+        value_states.stride(2),
+        value_states.stride(3),
+        layer.keys.stride(1),
+        layer.keys.stride(2),
+        layer.keys.stride(3),
+        layer.values.stride(1),
+        layer.values.stride(2),
+        layer.values.stride(3),
+        HEAD_DIM=head_dim,
+        BLOCK_D=block_d,
+        num_warps=1,
+        num_stages=1,
+    )
+    return layer.keys, layer.values
+
+
 def _small_decode_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -540,6 +619,46 @@ def _small_decode_attention_per_head(
         BLOCK_N=block_n,
     )
     return out.unsqueeze(2).transpose(1, 2)
+
+
+@triton.jit
+def _static_cache_single_token_update_fwd_kernel(
+    key_ptr,
+    value_ptr,
+    keys_cache_ptr,
+    values_cache_ptr,
+    cache_position_ptr,
+    cumulative_length_ptr,
+    key_stride_h,
+    key_stride_s,
+    key_stride_d,
+    value_stride_h,
+    value_stride_s,
+    value_stride_d,
+    keys_cache_stride_h,
+    keys_cache_stride_s,
+    keys_cache_stride_d,
+    values_cache_stride_h,
+    values_cache_stride_s,
+    values_cache_stride_d,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    kv_head = tl.program_id(0)
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_d = offs_d < HEAD_DIM
+    pos = tl.load(cache_position_ptr).to(tl.int64)
+
+    key_ptrs = key_ptr + kv_head * key_stride_h + offs_d * key_stride_d
+    value_ptrs = value_ptr + kv_head * value_stride_h + offs_d * value_stride_d
+    keys_cache_ptrs = keys_cache_ptr + kv_head * keys_cache_stride_h + pos * keys_cache_stride_s + offs_d * keys_cache_stride_d
+    values_cache_ptrs = values_cache_ptr + kv_head * values_cache_stride_h + pos * values_cache_stride_s + offs_d * values_cache_stride_d
+
+    tl.store(keys_cache_ptrs, tl.load(key_ptrs, mask=mask_d), mask=mask_d)
+    tl.store(values_cache_ptrs, tl.load(value_ptrs, mask=mask_d), mask=mask_d)
+
+    if kv_head == 0:
+        tl.store(cumulative_length_ptr, pos + 1)
 
 
 def _small_decode_attention_grouped(

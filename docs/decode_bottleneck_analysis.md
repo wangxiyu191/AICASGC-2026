@@ -691,3 +691,104 @@ steady-state 结构估算里：
 - `10` 样本输出稳定
 
 因此也可以先作为默认配置保留，后面如果更大样本出现回退，再单独回滚。
+
+## 15. 继续补：decode 单 token StaticCache KV 写回
+
+看最新 trace 时，一个很显眼的小热点是每层 `KV cache` 更新附近都会出现这样一串小 kernel：
+
+- `elementwise_kernel_with_index(arange_cuda_out)`
+- `vectorized_elementwise_kernel(add)`
+- `vectorized_elementwise_kernel(OnSelf_add)`
+- `index_elementwise_kernel(index_copy_kernel_impl)` for `K`
+- `index_elementwise_kernel(index_copy_kernel_impl)` for `V`
+
+把代码对回去后，这 5 个 kernel 基本就是 HF `StaticCache.update()` 的通用实现：
+
+- [`cache_utils.py:327`](../venv/lib/python3.12/site-packages/transformers/cache_utils.py#L327)
+  `torch.arange(kv_length) + self.cumulative_length`
+- [`cache_utils.py:329`](../venv/lib/python3.12/site-packages/transformers/cache_utils.py#L329)
+  `self.cumulative_length.add_(kv_length)`
+- [`cache_utils.py:333`](../venv/lib/python3.12/site-packages/transformers/cache_utils.py#L333)
+  `self.keys.index_copy_(...)`
+- [`cache_utils.py:334`](../venv/lib/python3.12/site-packages/transformers/cache_utils.py#L334)
+  `self.values.index_copy_(...)`
+
+对于我们当前 decode 主路径，`batch=1`、`q_len=1`、`kv_len=1`，这条通用实现明显过重。
+
+### 实现
+
+在 [`optimized_layer.py`](../optimized_layer.py) 里补了一个专用快路径：
+
+- 入口：
+  [`_static_cache_single_token_update()`](../optimized_layer.py)
+- kernel：
+  [`_static_cache_single_token_update_fwd_kernel()`](../optimized_layer.py)
+
+触发条件：
+
+- `StaticCache`
+- CUDA
+- 单 token decode (`[1, kv_heads, 1, head_dim]`)
+- 有 device-side `cache_position`
+
+做法：
+
+- 不再生成 `torch.arange(...)`
+- 不再单独跑 `cumulative_length.add_(1)`
+- 不再对 `K/V` 各走一次 `index_copy_`
+- 改成单个 Triton kernel：
+  - 直接读 `cache_position`
+  - 直接把 `K` / `V` 写到 cache 对应位置
+  - 顺手把 `cumulative_length` 更新成 `cache_position + 1`
+
+也就是说，这一段从“每层每步 5 个通用碎 kernel”变成了“每层每步 1 个定制写回 kernel”。
+
+### 10 样本 benchmark
+
+| 配置 | TTFT | Throughput |
+|------|------|------------|
+| step38 small copy cleanup | `63.02ms` | `183.65 tok/s` |
+| + single-token StaticCache KV Triton | `63.11ms` | `194.24 tok/s` |
+
+- throughput 约 **`+5.8%`**
+- 与 step38 的 `10/10 exact match`
+
+结果文件：
+
+- [`results/result_step39_static_kv_write_10.json`](../results/result_step39_static_kv_write_10.json)
+
+### Trace 结论
+
+trace 在：
+
+- [`traces/compare/triton_decode_step39_static_kv_write`](../traces/compare/triton_decode_step39_static_kv_write)
+
+相对 step38：
+
+| 指标 | step38 | static KV write | 变化 |
+|------|--------|-----------------|------|
+| steady-state decode GPU/步 | `4.33ms` | `4.05ms` | **`-6.5%`** |
+| Elementwise | `0.57ms` | `0.24ms` | **`-57.9%`** |
+| fragmented Copy/Mul/misc | `0.719ms` | `0.440ms` | **`-38.8%`** |
+| cudaGraphLaunch | `0.57ms/步` | `0.42ms/步` | **`-26%`** |
+
+steady-state kernel 变化最关键的是：
+
+- 原来的 `[Elementwise] Copy` 从 `0.2118ms/步` 掉到 `0.0192ms/步`
+- 新增 `_static_cache_single_token_update_fwd_kernel` 约 `0.0543ms/步`
+
+这说明收益并不只是“换个名字”，而是真的把 `StaticCache.update()` 这一串通用碎 kernel 压扁了。
+
+### 当前判断
+
+这一步的价值很明确：
+
+1. 它精准命中了 decode 里最碎的一段 `KV cache` 更新
+2. trace 收益和 benchmark 收益是一致的
+3. 数值上没有引入可见偏差
+
+从下一步方向看，这也说明：
+
+- `KV cache` 通用写回这条线已经被先吃掉一块
+- 如果还想继续往“1 kernel”甚至更深层走，最自然的下一步就是考虑把 **`k` 的写回进一步并进 `_fused_rms_norm_rope` 的输出路径**
+- 但那会把 kernel 语义和输出布局绑得更紧，复杂度明显更高，所以这一步先停在“独立的 KV write kernel”是合理的
