@@ -2,7 +2,8 @@
 
 ## 环境
 
-- 本地开发: NVIDIA A10 24GB (sm_86), Python 3.10.9, PyTorch 2.10.0+cu128, transformers 5.2.0
+- 本地开发 (旧): NVIDIA A10 24GB (sm_86), Python 3.10.9, PyTorch 2.10.0+cu128, transformers 5.2.0
+- 本地开发 (当前): NVIDIA A800 80GB PCIe (sm_80), Python 3.12.3, PyTorch 2.8.0+cu128, transformers 5.4.0, triton 3.4.0
 - 评测环境: NVIDIA A800 80GB (sm_80), Python 3.12.3, PyTorch 2.8.0+cu128, flash_attn 2.8.3 预装
 
 ## Baseline
@@ -243,6 +244,29 @@ Decode 阶段 CPU 开销远超 GPU 计算，native ops 分支只解决了 Triton
   - 更大样本数（10/更高）验证收益是否稳定
   - graph 前后 trace 对比，确认 `cat/concat` 与 Python loop 开销下降
   - 评估是否需要做 graph bucket 复用，降低每请求 capture 成本
+
+## Step 16: 修复 transformers 5.4.0 兼容性 + A800 CUDAGraph 验证
+
+### 环境变化
+
+本地开发环境升级为 A800 80GB PCIe + Python 3.12.3 + PyTorch 2.8.0+cu128 + transformers 5.4.0。
+
+### 发现并修复的 3 个兼容性问题
+
+1. **`mm_token_type_ids` 缺失**: 5.4.0 `apply_chat_template` 新增 `mm_token_type_ids` 返回值，不在 `SUPPORTED_KWARGS` 中，导致 CUDAGraph 静默 fallback。
+2. **EOS token 解析失败**: `Qwen3VLConfig` 不再有 `eos_token_id` 属性，拿到 None，EOS 永不检测。
+3. **StaticCache `cumulative_length` 未恢复**: 5.4.0 `StaticLayer` 用内部 `cumulative_length` 替代外部 `cache_position`，warmup 推进越界。
+
+### Step 9 分数暴跌根因
+
+Step 9 (score 0.0820) 的根因是 EOS 检测失败——custom decode 不停止，throughput 测试结果异常。
+
+### A800 结果
+
+| 指标 | Step 7 A800 | Step 16 A800 | 变化 |
+|------|-------------|--------------|------|
+| TTFT | 62.42ms | 62.27ms | -0.2% |
+| Throughput | 41.93 tok/s | **75.53 tok/s** | **+80.1%** |
 
 ## 踩坑记录
 

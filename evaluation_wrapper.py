@@ -29,6 +29,7 @@ class GreedyDecodeEngine:
         "attention_mask",
         "pixel_values",
         "image_grid_thw",
+        "mm_token_type_ids",
         "max_new_tokens",
         "do_sample",
         "temperature",
@@ -79,6 +80,7 @@ class GreedyDecodeEngine:
         attention_mask = kwargs.get("attention_mask")
         pixel_values = kwargs.get("pixel_values")
         image_grid_thw = kwargs.get("image_grid_thw")
+        mm_token_type_ids = kwargs.get("mm_token_type_ids")
         max_new_tokens = int(kwargs.get("max_new_tokens", self._max_tokens_threshold))
 
         batch_size, prompt_length = input_ids.shape
@@ -111,6 +113,7 @@ class GreedyDecodeEngine:
                 attention_mask=prompt_attention_mask,
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
+                mm_token_type_ids=mm_token_type_ids,
                 past_key_values=static_cache,
                 use_cache=True,
                 logits_to_keep=1,
@@ -145,7 +148,7 @@ class GreedyDecodeEngine:
                     graph_runner = None
 
             for _ in range(1, max_new_tokens):
-                if eos_token_id is not None and bool((next_tokens == eos_token_id).all()):
+                if eos_token_id is not None and bool((next_tokens.squeeze() == eos_token_id).any()):
                     break
 
                 if graph_runner is not None:
@@ -171,10 +174,19 @@ class GreedyDecodeEngine:
     def _resolve_eos_token_id(self, kwargs):
         eos_token_id = kwargs.get("eos_token_id")
         if eos_token_id is None:
-            eos_token_id = getattr(self._model.config, "eos_token_id", None)
+            gen_cfg = getattr(self._model, "generation_config", None)
+            if gen_cfg is not None:
+                eos_token_id = getattr(gen_cfg, "eos_token_id", None)
+        if eos_token_id is None:
+            text_config = self._model.config.get_text_config(decoder=True)
+            eos_token_id = getattr(text_config, "eos_token_id", None)
         if isinstance(eos_token_id, (list, tuple)):
-            return eos_token_id[0] if eos_token_id else None
-        return eos_token_id
+            if not eos_token_id:
+                return None
+            return torch.tensor(eos_token_id, dtype=torch.long, device=next(self._model.parameters()).device)
+        if eos_token_id is not None:
+            return torch.tensor([eos_token_id], dtype=torch.long, device=next(self._model.parameters()).device)
+        return None
 
     def _build_decode_position_ids(self, current_position: int, rope_deltas, device: torch.device):
         text_position_ids = torch.full((1, 1), current_position, dtype=torch.long, device=device)
@@ -306,13 +318,18 @@ class DecodeCudaGraphRunner:
     def _snapshot_cache(self):
         snapshot = []
         for layer in self._static_cache.layers:
-            snapshot.append((layer.keys.clone(), layer.values.clone()))
+            snapshot.append((
+                layer.keys.clone(),
+                layer.values.clone(),
+                layer.cumulative_length.clone(),
+            ))
         return snapshot
 
     def _restore_cache(self, snapshot):
-        for layer, (keys, values) in zip(self._static_cache.layers, snapshot):
+        for layer, (keys, values, cum_len) in zip(self._static_cache.layers, snapshot):
             layer.keys.copy_(keys)
             layer.values.copy_(values)
+            layer.cumulative_length.copy_(cum_len)
 
 
 class ModelWrapper:

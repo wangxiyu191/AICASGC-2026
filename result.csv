@@ -17,3 +17,4 @@ step,optimization,ttft_ms,throughput_tok_s,num_samples,gpu,notes
 13,Phase4b: custom decode + StaticCache,129.32,50.81,3,A10,"benchmark 走 ModelWrapper.generate 自定义 eager greedy decode；batch=1/do_sample=False/use_cache=True/max_new_tokens<=128 启用；与 HF generate 在 3 样本输出一致"
 14,Phase4c: custom decode + StaticCache + CUDAGraph,127.83,80.76,3,A10,"单 token decode step 使用 torch.cuda.CUDAGraph capture/replay；prefill 保持 eager；保留 fallback；与 HF/eager 在 3 样本输出一致，throughput vs HF 45.54 提升约 77.3%"
 15,Phase4c: custom decode + StaticCache + CUDAGraph (10 samples),113.65,82.00,10,A10,"10 样本稳定验证；HF 基线 112.80ms / 54.19 tok/s，自定义 eager 114.51ms / 52.78 tok/s，graph 10/10 输出与 HF 一致，throughput vs HF 提升约 51.3%"
+16,Fix transformers 5.4.0 compat + CUDAGraph A800,62.27,75.53,10,A800,"修复3个5.4.0兼容性问题: mm_token_type_ids缺失/EOS token解析失败/StaticCache cumulative_length未恢复; CUDAGraph在A800上首次成功运行; 5/5输出与HF完全一致; vs之前A800 HF fallback (45.98) throughput +64%"

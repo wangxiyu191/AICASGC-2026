@@ -4,7 +4,8 @@
 
 ## 环境信息
 
-- 开发环境: NVIDIA A10 24GB (sm_86), Python 3.10.9, PyTorch 2.10.0+cu128
+- 开发环境 (旧): NVIDIA A10 24GB (sm_86), Python 3.10.9, PyTorch 2.10.0+cu128, transformers 5.2.0
+- 开发环境 (当前): NVIDIA A800 80GB PCIe (sm_80), Python 3.12.3, PyTorch 2.8.0+cu128, transformers 5.4.0, triton 3.4.0
 - 评测环境: NVIDIA A800 80GB (sm_80), Python 3.12.3, PyTorch 2.8.0+cu128
 - 模型: Qwen3-VL-2B-Instruct
 
