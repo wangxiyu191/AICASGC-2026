@@ -45,6 +45,13 @@ class GreedyDecodeEngine:
         self._enable_cudagraph = os.environ.get("ENABLE_CUDAGRAPH", "1") == "1"
         self._graph_warmup_steps = int(os.environ.get("CUDAGRAPH_WARMUP_STEPS", "2"))
         self._async_eos_window = max(1, int(os.environ.get("CUDAGRAPH_ASYNC_EOS_WINDOW", "2")))
+        self._graph_bucket_size = max(1, int(os.environ.get("CUDAGRAPH_BUCKET_SIZE", "64")))
+        self._prebuild_max_cache_len = max(
+            0,
+            int(os.environ.get("CUDAGRAPH_PREBUILD_MAX_CACHE_LEN", "2048")),
+        )
+        self._graph_runners: Dict[tuple[str, int], "DecodeCudaGraphRunner"] = {}
+        self._prebuild_graph_runners()
 
     def is_supported(self, args, kwargs) -> bool:
         if len(args) > 1:
@@ -94,8 +101,39 @@ class GreedyDecodeEngine:
         else:
             prompt_attention_mask = attention_mask.to(device=device, dtype=torch.bool)
 
-        full_attention_mask = torch.zeros((batch_size, max_cache_len), dtype=torch.bool, device=device)
-        full_attention_mask[:, :prompt_length] = prompt_attention_mask
+        graph_runner = None
+        graph_bucket_len = None
+        full_attention_mask = None
+        static_cache = None
+
+        if self._should_use_cudagraph(
+            device=device,
+            max_new_tokens=max_new_tokens,
+            current_length=prompt_length + 1,
+        ):
+            graph_bucket_len = self._get_graph_bucket_len(max_cache_len)
+            try:
+                graph_runner = self._get_or_create_graph_runner(
+                    device=device,
+                    bucket_max_cache_len=graph_bucket_len,
+                )
+                graph_runner.prepare_for_request(prompt_attention_mask)
+                full_attention_mask = graph_runner.attention_mask
+                static_cache = graph_runner.static_cache
+            except Exception as exc:
+                print(f"[GreedyDecodeEngine] CUDA Graph runner setup failed, fallback to eager decode: {exc}")
+                if graph_bucket_len is not None:
+                    self._graph_runners.pop(self._graph_runner_key(device, graph_bucket_len), None)
+                graph_runner = None
+                graph_bucket_len = None
+
+        if graph_runner is None:
+            full_attention_mask = torch.zeros((batch_size, max_cache_len), dtype=torch.bool, device=device)
+            full_attention_mask[:, :prompt_length] = prompt_attention_mask
+            static_cache = StaticCache(
+                config=self._model.config,
+                max_cache_len=max_cache_len,
+            )
 
         output_ids = torch.empty(
             (batch_size, max_cache_len),
@@ -103,11 +141,6 @@ class GreedyDecodeEngine:
             device=device,
         )
         output_ids[:, :prompt_length] = input_ids
-
-        static_cache = StaticCache(
-            config=self._model.config,
-            max_cache_len=max_cache_len,
-        )
 
         with torch.no_grad():
             outputs = self._model(
@@ -129,25 +162,18 @@ class GreedyDecodeEngine:
             current_position = prompt_length
             eos_token_id = self._resolve_eos_token_id(kwargs)
             eos_token_values = self._resolve_eos_token_values(kwargs)
-            graph_runner = None
 
-            if self._should_use_cudagraph(
-                device=device,
-                max_new_tokens=max_new_tokens,
-                current_length=current_length,
-            ):
+            if graph_runner is not None:
                 try:
-                    graph_runner = DecodeCudaGraphRunner(
-                        model=self._model,
-                        static_cache=static_cache,
-                        attention_mask=full_attention_mask,
+                    graph_runner.capture_if_needed(
                         rope_deltas=rope_deltas,
                         start_position=current_position,
                         start_input_ids=next_tokens,
-                        warmup_steps=self._graph_warmup_steps,
                     )
                 except Exception as exc:
-                    print(f"[GreedyDecodeEngine] CUDA Graph setup failed, fallback to eager decode: {exc}")
+                    print(f"[GreedyDecodeEngine] CUDA Graph capture failed, fallback to eager decode: {exc}")
+                    if graph_bucket_len is not None:
+                        self._graph_runners.pop(self._graph_runner_key(device, graph_bucket_len), None)
                     graph_runner = None
 
             if graph_runner is not None and eos_token_values and self._async_eos_window > 1:
@@ -325,6 +351,64 @@ class GreedyDecodeEngine:
             return False
         return True
 
+    def _get_graph_bucket_len(self, max_cache_len: int):
+        bucket_size = self._graph_bucket_size
+        return ((max_cache_len + bucket_size - 1) // bucket_size) * bucket_size
+
+    def _graph_runner_key(self, device: torch.device, bucket_max_cache_len: int):
+        return str(device), bucket_max_cache_len
+
+    def _get_or_create_graph_runner(self, device: torch.device, bucket_max_cache_len: int):
+        key = self._graph_runner_key(device, bucket_max_cache_len)
+        runner = self._graph_runners.get(key)
+        if runner is None:
+            runner = DecodeCudaGraphRunner(
+                model=self._model,
+                device=device,
+                max_cache_len=bucket_max_cache_len,
+                warmup_steps=self._graph_warmup_steps,
+                async_eos_window=self._async_eos_window,
+            )
+            self._graph_runners[key] = runner
+        return runner
+
+    def _prebuild_graph_runners(self):
+        if not self._enable_cudagraph:
+            return
+        if self._prebuild_max_cache_len < self._graph_bucket_size:
+            return
+        if not torch.cuda.is_available():
+            return
+
+        device = next(self._model.parameters()).device
+        if device.type != "cuda":
+            return
+
+        buckets = range(
+            self._graph_bucket_size,
+            self._prebuild_max_cache_len + 1,
+            self._graph_bucket_size,
+        )
+        print(
+            "[GreedyDecodeEngine] Prebuilding CUDA graph buckets "
+            f"{self._graph_bucket_size}..{self._prebuild_max_cache_len} "
+            f"(step={self._graph_bucket_size})"
+        )
+        with torch.no_grad():
+            for bucket_max_cache_len in buckets:
+                try:
+                    runner = self._get_or_create_graph_runner(
+                        device=device,
+                        bucket_max_cache_len=bucket_max_cache_len,
+                    )
+                    runner.prebuild_graph()
+                except Exception as exc:
+                    self._graph_runners.pop(self._graph_runner_key(device, bucket_max_cache_len), None)
+                    print(
+                        "[GreedyDecodeEngine] Prebuild failed for bucket "
+                        f"{bucket_max_cache_len}, fallback to lazy capture: {exc}"
+                    )
+
 
 class DecodeCudaGraphRunner:
     """Capture and replay a single-token decode step with fixed buffers."""
@@ -332,32 +416,32 @@ class DecodeCudaGraphRunner:
     def __init__(
         self,
         model,
-        static_cache: StaticCache,
-        attention_mask: torch.Tensor,
-        rope_deltas,
-        start_position: int,
-        start_input_ids: torch.Tensor,
+        device: torch.device,
+        max_cache_len: int,
         warmup_steps: int = 2,
+        async_eos_window: int = 2,
     ):
         self._model = model
-        self._static_cache = static_cache
-        self._device = attention_mask.device
-        self._async_eos_window = max(1, int(os.environ.get("CUDAGRAPH_ASYNC_EOS_WINDOW", "2")))
-        self._attention_mask_buf = attention_mask
-        self._rope_deltas = rope_deltas
-        self._cache_position_buf = torch.empty((1,), dtype=torch.long, device=self._device)
-        self._cache_position_table = torch.arange(
-            attention_mask.shape[1],
-            dtype=torch.long,
-            device=self._device,
+        self._device = device
+        self._max_cache_len = max_cache_len
+        self._warmup_steps = max(1, warmup_steps)
+        self._async_eos_window = max(1, async_eos_window)
+        self._static_cache = StaticCache(
+            config=model.config,
+            max_cache_len=max_cache_len,
         )
-        self._input_ids_buf = torch.empty_like(start_input_ids)
+        self._attention_mask_buf = torch.zeros((1, max_cache_len), dtype=torch.bool, device=self._device)
+        self._cache_position_buf = torch.empty((1,), dtype=torch.long, device=self._device)
+        self._cache_position_table = torch.arange(max_cache_len, dtype=torch.long, device=self._device)
+        self._rope_delta_buf = torch.zeros((1, 1), dtype=torch.long, device=self._device)
+        self._input_ids_buf = torch.empty((1, 1), dtype=torch.long, device=self._device)
         self._position_ids_buf = torch.empty((3, 1, 1), dtype=torch.long, device=self._device)
         vocab_size = model.config.get_text_config(decoder=True).vocab_size
         self._logits_buf = torch.empty((1, vocab_size), dtype=model.dtype, device=self._device)
         self._next_token_buf = torch.empty((1, 1), dtype=torch.long, device=self._device)
         self._token_stage_bufs = [
-            torch.empty_like(start_input_ids) for _ in range(self._async_eos_window)
+            torch.empty((1, 1), dtype=torch.long, device=self._device)
+            for _ in range(self._async_eos_window)
         ]
         self._host_token_bufs = [
             torch.empty((1, 1), dtype=torch.long, device="cpu", pin_memory=True)
@@ -365,14 +449,50 @@ class DecodeCudaGraphRunner:
         ]
         self._host_token_events = [torch.cuda.Event() for _ in range(self._async_eos_window)]
         self._next_stage_slot = 0
-        self._graph = torch.cuda.CUDAGraph()
+        self._graph = None
 
+    def replay(self, input_ids: torch.Tensor, current_position: int):
+        self._write_inputs(input_ids, current_position)
+        self._graph.replay()
+        return self._next_token_buf.clone()
+
+    @property
+    def async_eos_window(self):
+        return self._async_eos_window
+
+    @property
+    def static_cache(self):
+        return self._static_cache
+
+    @property
+    def attention_mask(self):
+        return self._attention_mask_buf
+
+    def prepare_for_request(self, prompt_attention_mask: torch.Tensor):
+        prompt_length = prompt_attention_mask.shape[1]
+        if prompt_length > self._max_cache_len:
+            raise ValueError(
+                f"prompt_length={prompt_length} exceeds graph bucket max_cache_len={self._max_cache_len}"
+            )
+
+        self._static_cache.reset()
+        self._attention_mask_buf.zero_()
+        self._attention_mask_buf[:, :prompt_length].copy_(prompt_attention_mask)
+        self._rope_delta_buf.zero_()
+        self._next_stage_slot = 0
+
+    def capture_if_needed(self, rope_deltas, start_position: int, start_input_ids: torch.Tensor):
+        self._set_rope_deltas(rope_deltas)
+        if self._graph is not None:
+            return
+
+        self._graph = torch.cuda.CUDAGraph()
         cache_snapshot = self._snapshot_cache()
         self._write_inputs(start_input_ids, start_position)
 
         side_stream = torch.cuda.Stream(device=self._device)
         with torch.cuda.stream(side_stream):
-            for _ in range(max(1, warmup_steps)):
+            for _ in range(self._warmup_steps):
                 self._run_step()
                 self._restore_cache(cache_snapshot)
                 self._write_inputs(start_input_ids, start_position)
@@ -387,14 +507,43 @@ class DecodeCudaGraphRunner:
         self._restore_cache(cache_snapshot)
         self._write_inputs(start_input_ids, start_position)
 
-    def replay(self, input_ids: torch.Tensor, current_position: int):
-        self._write_inputs(input_ids, current_position)
-        self._graph.replay()
-        return self._next_token_buf.clone()
+    def prebuild_graph(self):
+        if self._graph is not None:
+            return
 
-    @property
-    def async_eos_window(self):
-        return self._async_eos_window
+        text_config = self._model.config.get_text_config(decoder=True)
+        self._static_cache.early_initialization(
+            batch_size=1,
+            num_heads=text_config.num_key_value_heads,
+            head_dim=text_config.head_dim,
+            dtype=self._model.dtype,
+            device=self._device,
+        )
+        self._static_cache.reset()
+        self._attention_mask_buf.zero_()
+        self._rope_delta_buf.zero_()
+        self._write_inputs(self._input_ids_buf.zero_(), current_position=0)
+
+        self._graph = torch.cuda.CUDAGraph()
+        side_stream = torch.cuda.Stream(device=self._device)
+        with torch.cuda.stream(side_stream):
+            for _ in range(self._warmup_steps):
+                self._run_step()
+                self._static_cache.reset()
+                self._attention_mask_buf.zero_()
+                self._write_inputs(self._input_ids_buf.zero_(), current_position=0)
+        torch.cuda.current_stream(device=self._device).wait_stream(side_stream)
+
+        self._static_cache.reset()
+        self._attention_mask_buf.zero_()
+        self._write_inputs(self._input_ids_buf.zero_(), current_position=0)
+        torch.cuda.synchronize(self._device)
+        with torch.cuda.graph(self._graph):
+            self._run_step()
+        torch.cuda.synchronize(self._device)
+        self._static_cache.reset()
+        self._attention_mask_buf.zero_()
+        self._write_inputs(self._input_ids_buf.zero_(), current_position=0)
 
     def stage_host_token(self, device_token: torch.Tensor, output_length: int):
         slot = self._next_stage_slot
@@ -448,16 +597,15 @@ class DecodeCudaGraphRunner:
         self._input_ids_buf.copy_(input_ids)
         self._attention_mask_buf[:, current_position] = True
         self._cache_position_buf.copy_(self._cache_position_table.narrow(0, current_position, 1))
-        self._position_ids_buf.copy_(self._build_position_ids(current_position))
+        position_id = self._cache_position_table.narrow(0, current_position, 1).view(1, 1, 1)
+        self._position_ids_buf.copy_(position_id.expand(3, 1, 1))
+        self._position_ids_buf.add_(self._rope_delta_buf.view(1, 1, 1))
 
-    def _build_position_ids(self, current_position: int):
-        text_position_ids = torch.full((1, 1), current_position, dtype=torch.long, device=self._device)
-        if self._rope_deltas is not None:
-            text_position_ids = text_position_ids + self._rope_deltas.to(
-                device=self._device,
-                dtype=torch.long,
-            ).view(1, 1)
-        return text_position_ids.view(1, 1, 1).expand(3, 1, 1)
+    def _set_rope_deltas(self, rope_deltas):
+        if rope_deltas is None:
+            self._rope_delta_buf.zero_()
+            return
+        self._rope_delta_buf.copy_(rope_deltas.to(device=self._device, dtype=torch.long).view(1, 1))
 
     def _snapshot_cache(self):
         snapshot = []

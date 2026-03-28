@@ -268,6 +268,102 @@ Step 9 (score 0.0820) 的根因是 EOS 检测失败——custom decode 不停止
 | TTFT | 62.42ms | 62.27ms | -0.2% |
 | Throughput | 41.93 tok/s | **75.53 tok/s** | **+80.1%** |
 
+## Step 19: CUDAGraph runner 池化 + `max_cache_len` bucket 复用
+
+### 问题
+
+此前的 `DecodeCudaGraphRunner` 生命周期绑定单次 `generate()`：
+
+- 每个请求都会新建 `StaticCache`
+- 每个请求都会重新分配 `attention_mask` / placeholder buffer
+- 每个请求都会重新 warmup + `torch.cuda.graph(...)` capture
+
+虽然单次 decode replay 很快，但跨请求时 capture 成本无法摊薄，吞吐被额外吃掉。
+
+### 实现
+
+在 `GreedyDecodeEngine` 中引入按 `(device, bucket_max_cache_len)` 索引的 runner pool：
+
+- 默认 `bucket_size=64`，按 `max_cache_len` 向上取整
+- 每个 bucket 固定持有：
+  - `StaticCache`
+  - `attention_mask_buf`
+  - `cache_position_buf` / `position_ids_buf`
+  - staged token / host pinned buffer
+  - 已 capture 的 `torch.cuda.CUDAGraph`
+- 新请求流程改为：
+  1. 先按 bucket 取/建 runner
+  2. `reset()` 该 runner 的 `StaticCache` 和 `attention_mask`
+  3. 用 runner 自带的 `StaticCache` 做 prefill
+  4. bucket 首次命中时执行 warmup + capture
+  5. 后续同 bucket 请求直接 `reset + prefill + replay`
+
+### 复用验证
+
+手工脚本连续跑 2 次真实 `model.model.generate(...)`：
+
+- 两次都命中同一个 pool key: `('cuda:0', 768)`
+- `runner_id` 保持不变
+- `graph_ready == True`
+
+说明 graph 不再按请求重建，而是已经进入跨请求复用状态。
+
+### A800 结果
+
+与 `step18` (`60.21 ms / 77.84 tok/s`) 对比：
+
+| 路径 | TTFT | Throughput | 结果文件 |
+|------|------|------------|----------|
+| Step18: device cache_position + async EOS window=2 | 60.21 ms | 77.84 tok/s | `results/result_async_eos_default2_cachepos_device_10.json` |
+| Step19: graph pool + bucket=64 | 61.33 ms | 95.68 tok/s | `results/result_cudagraph_pool_bucket64_10.json` |
+| Step19 rerun | 62.60 ms | 95.87 tok/s | `results/result_cudagraph_pool_bucket64_10_rerun.json` |
+
+结论：
+
+- 吞吐从 `77.84` 提升到 `95.68~95.87 tok/s`
+- 提升约 `22.9%~23.2%`
+- TTFT 小幅上升约 `1.1~2.4 ms`
+- 两轮 benchmark 的 `10/10` 输出与 `step18` 完全一致
+
+## Step 20: 启动时预建 `64..2048` 的 32 个 CUDAGraph bucket
+
+### 目标
+
+在 `step19` 的 runner pool 基础上，把常用 bucket 的 graph 从“首次命中时 lazy capture”改成“模型初始化时一次性预建”，避免运行期首次请求承担 bucket capture 成本。
+
+### 实现
+
+- 新增 `CUDAGRAPH_PREBUILD_MAX_CACHE_LEN`，默认 `2048`
+- 在 `GreedyDecodeEngine.__init__()` 中直接预建：
+  - `64, 128, ..., 2048`
+  - 共 `32` 个 bucket
+- 每个 bucket 在预建阶段完成：
+  - `StaticCache.early_initialization(...)`
+  - dummy 单步 warmup
+  - dummy 单步 graph capture
+- 真实请求仍沿用 `step19` 的 `reset + prefill + replay`
+
+实测初始化后：
+
+- `runner_count = 32`
+- `min_bucket = 64`
+- `max_bucket = 2048`
+- `all_graph_ready = True`
+
+### A800 结果
+
+| 路径 | TTFT | Throughput | 结果文件 |
+|------|------|------------|----------|
+| Step19: reusable graph pool, lazy first-capture | 61.33 ms | 95.68 tok/s | `results/result_cudagraph_pool_bucket64_10.json` |
+| Step20: prebuild 32 buckets at init | 60.74 ms | 102.51 tok/s | `results/result_cudagraph_prebuild_64_to_2048_10.json` |
+
+结论：
+
+- 预建 bucket 后，10 样本 throughput 进一步提升到 `102.51 tok/s`
+- 相对 `step19` 再提升约 `7.1%`
+- TTFT 也小幅改善到 `60.74 ms`
+- `10/10` 输出与 `step18` 完全一致
+
 ## 踩坑记录
 
 ### torch.compile + flash_attn_varlen 不兼容
