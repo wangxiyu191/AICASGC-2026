@@ -22,7 +22,7 @@ import torch
 from transformers import AutoModelForImageTextToText, AutoProcessor
 from transformers.cache_utils import StaticCache
 
-from optimized_layer import replace_decoder_layers
+from optimized_layer import replace_decoder_layers, set_small_decode_triton_enabled
 
 
 class CudaGraphExecutionError(RuntimeError):
@@ -780,64 +780,72 @@ class DecodeCudaGraphRunner:
         if self._graph is not None:
             return
 
-        self._graph = torch.cuda.CUDAGraph()
-        cache_snapshot = self._snapshot_cache()
-        self._write_inputs(start_input_ids, start_position)
+        previous_small_decode_triton = set_small_decode_triton_enabled(self._model, True)
+        try:
+            self._graph = torch.cuda.CUDAGraph()
+            cache_snapshot = self._snapshot_cache()
+            self._write_inputs(start_input_ids, start_position)
 
-        side_stream = torch.cuda.Stream(device=self._device)
-        with torch.cuda.stream(side_stream):
-            for _ in range(self._warmup_steps):
+            side_stream = torch.cuda.Stream(device=self._device)
+            with torch.cuda.stream(side_stream):
+                for _ in range(self._warmup_steps):
+                    self._run_step()
+                    self._restore_cache(cache_snapshot)
+                    self._write_inputs(start_input_ids, start_position)
+            torch.cuda.current_stream(device=self._device).wait_stream(side_stream)
+
+            self._restore_cache(cache_snapshot)
+            self._write_inputs(start_input_ids, start_position)
+            torch.cuda.synchronize(self._device)
+            with torch.cuda.graph(self._graph):
                 self._run_step()
-                self._restore_cache(cache_snapshot)
-                self._write_inputs(start_input_ids, start_position)
-        torch.cuda.current_stream(device=self._device).wait_stream(side_stream)
-
-        self._restore_cache(cache_snapshot)
-        self._write_inputs(start_input_ids, start_position)
-        torch.cuda.synchronize(self._device)
-        with torch.cuda.graph(self._graph):
-            self._run_step()
-        torch.cuda.synchronize(self._device)
-        self._restore_cache(cache_snapshot)
-        self._write_inputs(start_input_ids, start_position)
+            torch.cuda.synchronize(self._device)
+            self._restore_cache(cache_snapshot)
+            self._write_inputs(start_input_ids, start_position)
+        finally:
+            set_small_decode_triton_enabled(self._model, previous_small_decode_triton)
 
     def prebuild_graph(self):
         if self._graph is not None:
             return
 
-        text_config = self._model.config.get_text_config(decoder=True)
-        self._static_cache.early_initialization(
-            batch_size=1,
-            num_heads=text_config.num_key_value_heads,
-            head_dim=text_config.head_dim,
-            dtype=self._model.dtype,
-            device=self._device,
-        )
-        self._static_cache.reset()
-        self._attention_mask_buf.zero_()
-        self._rope_delta_buf.zero_()
-        self._write_inputs(self._input_ids_buf.zero_(), current_position=0)
+        previous_small_decode_triton = set_small_decode_triton_enabled(self._model, True)
+        try:
+            text_config = self._model.config.get_text_config(decoder=True)
+            self._static_cache.early_initialization(
+                batch_size=1,
+                num_heads=text_config.num_key_value_heads,
+                head_dim=text_config.head_dim,
+                dtype=self._model.dtype,
+                device=self._device,
+            )
+            self._static_cache.reset()
+            self._attention_mask_buf.zero_()
+            self._rope_delta_buf.zero_()
+            self._write_inputs(self._input_ids_buf.zero_(), current_position=0)
 
-        self._graph = torch.cuda.CUDAGraph()
-        side_stream = torch.cuda.Stream(device=self._device)
-        with torch.cuda.stream(side_stream):
-            for _ in range(self._warmup_steps):
+            self._graph = torch.cuda.CUDAGraph()
+            side_stream = torch.cuda.Stream(device=self._device)
+            with torch.cuda.stream(side_stream):
+                for _ in range(self._warmup_steps):
+                    self._run_step()
+                    self._static_cache.reset()
+                    self._attention_mask_buf.zero_()
+                    self._write_inputs(self._input_ids_buf.zero_(), current_position=0)
+            torch.cuda.current_stream(device=self._device).wait_stream(side_stream)
+
+            self._static_cache.reset()
+            self._attention_mask_buf.zero_()
+            self._write_inputs(self._input_ids_buf.zero_(), current_position=0)
+            torch.cuda.synchronize(self._device)
+            with torch.cuda.graph(self._graph):
                 self._run_step()
-                self._static_cache.reset()
-                self._attention_mask_buf.zero_()
-                self._write_inputs(self._input_ids_buf.zero_(), current_position=0)
-        torch.cuda.current_stream(device=self._device).wait_stream(side_stream)
-
-        self._static_cache.reset()
-        self._attention_mask_buf.zero_()
-        self._write_inputs(self._input_ids_buf.zero_(), current_position=0)
-        torch.cuda.synchronize(self._device)
-        with torch.cuda.graph(self._graph):
-            self._run_step()
-        torch.cuda.synchronize(self._device)
-        self._static_cache.reset()
-        self._attention_mask_buf.zero_()
-        self._write_inputs(self._input_ids_buf.zero_(), current_position=0)
+            torch.cuda.synchronize(self._device)
+            self._static_cache.reset()
+            self._attention_mask_buf.zero_()
+            self._write_inputs(self._input_ids_buf.zero_(), current_position=0)
+        finally:
+            set_small_decode_triton_enabled(self._model, previous_small_decode_triton)
 
     def stage_host_token(self, device_token: torch.Tensor, output_length: int):
         slot = self._next_stage_slot
