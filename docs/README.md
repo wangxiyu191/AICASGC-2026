@@ -10,6 +10,7 @@ Qwen3-VL-2B-Instruct 推理优化过程中的分析报告与记录文档。
 |------|------|
 | [decode_bottleneck_analysis.md](./decode_bottleneck_analysis.md) | **当前重点** CUDAGraph decode 阶段的 GPU kernel 级瓶颈分析与优化方向，基于最新 viztracer trace |
 | [decode_compute_memory_budget.md](./decode_compute_memory_budget.md) | decode 阶段每 token 的算力/访存预算、HBM 理论上限与当前利用率估算 |
+| [flashinfer_attention_notes.md](./flashinfer_attention_notes.md) | FlashInfer Attention / 算子内 trace 调研笔记，提炼后续可借鉴的 kernel 设计与 profiler 思路 |
 | [optimization_log.md](./optimization_log.md) | 逐步优化记录 (step 0 → 24)，包含每次修改的配置与性能数据 |
 | [optimization_attempts.md](./optimization_attempts.md) | 优化尝试与踩坑总结，含失败经验、已验证无效方向与未尝试方向 |
 
