@@ -263,6 +263,46 @@ TTFT 目前的主要证据是 prefill GPU kernel `50.6ms/样本`，其中 `GEMM 
 
 这也说明第一轮 `9/10 exact match` 的问题，更可能来自“fusion 组合过多”或小样本波动，而不是 `small add+rmsnorm` 这个方向本身不可用。
 
+## 11. 为什么 `silu-only` 收益很小？
+
+这个问题已经用 trace 验证过了：**不是精度问题，而是它本来就不在 decode 主热点上。**
+
+### 精度先排除
+
+- 独立 kernel 测试：`_fused_silu_mul` 在 `(1,1,4096/6144/8192)` 的 decode 小 shape 上，与 `F.silu(gate) * up` 做 50 轮随机对比，结果是 **bit-identical**
+- `100` 样本回归：`ENABLE_TRITON_SMALL_ADD_RMSNORM=0`、`ENABLE_TRITON_SMALL_SILU_MUL=1` 与基线 **exact match 100/100**
+
+所以 `silu-only` 不是“有精度风险才没上”，而是“安全但不值钱”。
+
+### Trace 结论
+
+基线 vs `silu-only`：
+
+| 指标 | baseline | silu-only | 变化 |
+|------|----------|-----------|------|
+| decode GPU/步 | 9.26ms | 9.22ms | `-0.4%` |
+| Elementwise | 4.12ms | 4.00ms | `-2.9%` |
+| Reduction | 0.37ms | 0.37ms | 几乎不变 |
+| `SiLU` hotspot | ~0.087ms/步 | ~0.019ms/步 | 有下降，但绝对值小 |
+
+结论：
+
+- `SiLU` kernel 自己确实被优化掉了一部分
+- 但它在 decode 总时延里本来只占很小一块
+- 现在真正大的还是 `Copy / Mul / generic elementwise / Reduction / Attention / GEMV`
+
+也就是说，`silu-only` 没什么收益，**不是因为 fusion 没生效，而是因为它只打到了 MLP 激活这一小段，而这段本来就不是主矛盾**。
+
+### 对下一步优化的意义
+
+如果继续往下做 Triton / CUDA Graph 图内 fusion，优先级应是：
+
+1. `residual + rmsnorm` 相关的 `Copy + Reduction + Mul`
+2. `q_norm + k_norm + rope` 一类仍然制造大量 `Mul/Copy` 的路径
+3. `lm_head` / 线性投影的单 token GEMV 路径
+
+`silu*up` 可以保留为低风险小优化，但它不应该再作为主线投入时间。
+
 ### 优先级建议
 
 ```
