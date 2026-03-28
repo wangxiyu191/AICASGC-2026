@@ -687,6 +687,138 @@ def print_sync_stack_analysis(merged, top_n=10):
                 print(f"        {frame}")
 
 
+def _diff_ops_dict(curr, base):
+    diff = {}
+    for name in set(curr) | set(base):
+        count = curr.get(name, {}).get('count', 0) - base.get(name, {}).get('count', 0)
+        total_dur = curr.get(name, {}).get('total_dur', 0.0) - base.get(name, {}).get('total_dur', 0.0)
+        max_dur = max(curr.get(name, {}).get('max_dur', 0.0), base.get(name, {}).get('max_dur', 0.0))
+        if count > 0 and total_dur > 0:
+            diff[name] = {'count': count, 'total_dur': total_dur, 'max_dur': max_dur}
+    return diff
+
+
+def _pick_op(delta_ops, include_substrings, target_calls_per_step, steady_steps, exclude_substrings=()):
+    candidates = []
+    include_substrings = tuple(include_substrings)
+    exclude_substrings = tuple(exclude_substrings)
+    for name, info in delta_ops.items():
+        if any(token not in name for token in include_substrings):
+            continue
+        if any(token in name for token in exclude_substrings):
+            continue
+        calls_per_step = info['count'] / steady_steps
+        score = abs(calls_per_step - target_calls_per_step)
+        candidates.append((score, -info['total_dur'], name, info))
+    if not candidates:
+        return None
+    _, _, name, info = min(candidates)
+    return name, info
+
+
+def analyze_steady_state_decode(all_stats):
+    """Approximate steady-state decode by subtracting generate_1 from generate_2."""
+    by_file = {stats['file']: stats for stats in all_stats}
+    ttft = by_file.get('generate_1.json')
+    throughput = by_file.get('generate_2.json')
+    if ttft is None or throughput is None or throughput['decode_steps'] <= 1:
+        return
+
+    steady_steps = throughput['decode_steps'] - 1
+    delta_gpu_groups = _diff_ops_dict(throughput['gpu_groups'], ttft['gpu_groups'])
+    delta_kernel_ops = _diff_ops_dict(throughput['kernel_ops'], ttft['kernel_ops'])
+    total_gpu_us = sum(info['total_dur'] for info in delta_gpu_groups.values())
+
+    print(f"\n{'='*100}")
+    print("  STEADY-STATE DECODE ESTIMATE (generate_2 - generate_1)")
+    print(f"{'='*100}")
+    print(f"  Approx steady decode steps:         {steady_steps}")
+    print(f"  Avg GPU kernel time per steady step: {total_gpu_us / steady_steps / 1000:.2f} ms")
+    print("  Note: subtracts TTFT trace to remove prompt prefill + first token from generate_2.")
+
+    print_group_table(
+        delta_gpu_groups,
+        "GPU Kernel per Steady Decode Step",
+        total_gpu_us,
+        divisor=steady_steps,
+    )
+
+    print(f"\n  Top GPU kernel deltas per steady step:")
+    print(f"  {'Time(ms)':<10} {'Calls/step':<12} {'Kernel'}")
+    print(f"  {'-'*10} {'-'*12} {'-'*60}")
+    for name, info in sorted(delta_kernel_ops.items(), key=lambda x: x[1]['total_dur'], reverse=True)[:18]:
+        print(f"  {info['total_dur']/steady_steps/1000:<10.4f} {info['count']/steady_steps:<12.2f} {name}")
+
+    flash = _pick_op(delta_kernel_ops, ('[FlashAttn]',), NUM_DECODER_LAYERS, steady_steps)
+    fused_post = _pick_op(delta_kernel_ops, ('_fused_add_rms_norm_fwd_kernel',), NUM_DECODER_LAYERS, steady_steps)
+    gemm_big = _pick_op(
+        delta_kernel_ops,
+        ('[GEMM prefill]',),
+        NUM_DECODER_LAYERS,
+        steady_steps,
+        exclude_substrings=('sliced1x2', '128x', '256x', 'cutlass', 'sm80_xmma'),
+    )
+    gemm_small = _pick_op(
+        delta_kernel_ops,
+        ('[GEMM prefill]', 'sliced1x2'),
+        NUM_DECODER_LAYERS,
+        steady_steps,
+    )
+    lm_head = _pick_op(
+        delta_kernel_ops,
+        ('[GEMM prefill]', '64x64_sliced1x2_ldg8_f2f_stages_64x5_tn'),
+        1.0,
+        steady_steps,
+    )
+    gemv_both = _pick_op(delta_kernel_ops, ('[GEMV]',), 2 * NUM_DECODER_LAYERS, steady_steps)
+    silu = _pick_op(delta_kernel_ops, ('[Elementwise] SiLU',), NUM_DECODER_LAYERS, steady_steps)
+
+    print(f"\n  Decode structure estimate per steady step:")
+    print("  These rows combine measured kernel deltas with model-structure inference.")
+    print(f"  {'Stage':<28} {'Time(ms)':<10} {'Per-layer(us)':<14} {'Basis'}")
+    print(f"  {'-'*28} {'-'*10} {'-'*14} {'-'*40}")
+
+    def _print_stage(stage, total_ms, basis, per_layer=True):
+        per_layer_us = total_ms * 1000 / NUM_DECODER_LAYERS if per_layer else 0.0
+        per_layer_text = f"{per_layer_us:.1f}" if per_layer else "-"
+        print(f"  {stage:<28} {total_ms:<10.4f} {per_layer_text:<14} {basis}")
+
+    if gemm_small:
+        _print_stage("qkv_proj", gemm_small[1]['total_dur'] / steady_steps / 1000, "count≈28/layer, likely smaller fused linear")
+    if gemm_big:
+        _print_stage("gate_up_proj", gemm_big[1]['total_dur'] / steady_steps / 1000, "count≈28/layer, likely larger fused linear")
+    if flash:
+        _print_stage("attention", flash[1]['total_dur'] / steady_steps / 1000, "FlashAttn kernel count≈28/layer")
+    if gemv_both:
+        total_ms = gemv_both[1]['total_dur'] / steady_steps / 1000
+        _print_stage("o_proj+down_proj", total_ms, "GEMV count≈56/step = 2 per layer")
+        _print_stage("o_proj (inferred)", total_ms * 0.25, "split by weight bytes (2048x2048 vs 2048x6144)")
+        _print_stage("down_proj (inferred)", total_ms * 0.75, "split by weight bytes (2048x2048 vs 2048x6144)")
+    if fused_post:
+        _print_stage("post_attn_add_rmsnorm", fused_post[1]['total_dur'] / steady_steps / 1000, "direct Triton kernel count≈28/layer")
+    reduction_ms = delta_gpu_groups.get('Reduction', {}).get('total_dur', 0.0) / steady_steps / 1000
+    cat_ms = delta_gpu_groups.get('Cat/Concat', {}).get('total_dur', 0.0) / steady_steps / 1000
+    if reduction_ms > 0 or cat_ms > 0:
+        _print_stage("input/qk norm + rope", reduction_ms + cat_ms, "Reduction + Cat/Concat; Mul/Copy counted below")
+    if silu:
+        _print_stage("SiLU activation", silu[1]['total_dur'] / steady_steps / 1000, "native SiLU kernel count≈28/layer")
+    if lm_head:
+        _print_stage("lm_head", lm_head[1]['total_dur'] / steady_steps / 1000, "count≈1/step large vocab projection", per_layer=False)
+
+    known_ms = 0.0
+    for picked in (gemm_small, gemm_big, flash, gemv_both, fused_post, silu, lm_head):
+        if picked:
+            known_ms += picked[1]['total_dur'] / steady_steps / 1000
+    known_ms += reduction_ms + cat_ms
+    residual_ms = total_gpu_us / steady_steps / 1000 - known_ms
+    if residual_ms > 0:
+        _print_stage(
+            "fragmented Copy/Mul/misc",
+            residual_ms,
+            "remaining elementwise/copy/fill/cast/index work; main next target",
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description='Analyze PyTorch profiler trace files')
     parser.add_argument('trace_dir', nargs='?', default='./traces',
@@ -727,6 +859,7 @@ def main():
 
     # Phase breakdown (TTFT vs Decode)
     analyze_phase_breakdown(all_stats)
+    analyze_steady_state_decode(all_stats)
 
     # Merge all stats for global analysis
     merged = merge_stats(all_stats)

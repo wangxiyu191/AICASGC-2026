@@ -615,6 +615,7 @@ class GreedyDecodeEngine:
             "ENABLE_DECODE_NVTX",
             "ENABLE_CUSTOM_DECODE",
             "ENABLE_VIZTRACE",
+            "VIZTRACE_OUTPUT_DIR",
             "CUDA_VISIBLE_DEVICES",
             "PYTORCH_CUDA_ALLOC_CONF",
         )
@@ -943,7 +944,10 @@ class ModelWrapper:
         self._custom_decode = GreedyDecodeEngine(model, self.MAX_TOKENS_THRESHOLD)
         if self._enable_trace:
             from viztracer import VizTracer  # noqa: F401
-            self._trace_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "traces")
+            self._trace_dir = os.environ.get(
+                "VIZTRACE_OUTPUT_DIR",
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "traces"),
+            )
             os.makedirs(self._trace_dir, exist_ok=True)
             print(f"[ModelWrapper] Trace enabled, output: {self._trace_dir}")
 

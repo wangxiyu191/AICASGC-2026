@@ -372,3 +372,71 @@ TTFT 目前的主要证据是 prefill GPU kernel `50.6ms/样本`，其中 `GEMM 
 [3] P3: Vision / prefill TTFT 专项优化
 [4] P4: FlashInfer / 外部 decode kernel（仅在本地可直接落地时考虑）
 ```
+
+## 12. 新工具补充：steady-state decode 分析（`generate_2 - generate_1`）
+
+2026-03-28 又抓了一版新 trace：
+
+- 目录：[`traces/nvtx_decode_breakdown_rf`](../traces/nvtx_decode_breakdown_rf)
+- 说明：尝试给 decode forward 加 NVTX/`record_function` 分段，但在 `viztracer + CUDAGraph replay` 这条链路下，图内用户 range 没有直接保留到 trace 里
+- 因此改为在 [`analyze_traces.py`](../analyze_traces.py) 中新增 **`generate_2 - generate_1` 的 steady-state decode 估算**
+
+这样可以把 `generate_2` 里的 prompt prefill 和首 token 影响尽量扣掉，更接近“稳定 decode 单步”。
+
+### steady-state decode 每步 GPU 时间
+
+新工具输出：
+
+| 类别 | steady-state GPU/步 | 占比 |
+|------|---------------------|------|
+| Elementwise | **3.47ms** | **42.2%** |
+| GEMM | 1.90ms | 23.1% |
+| FlashAttn | 1.33ms | 16.2% |
+| GEMV | 1.04ms | 12.7% |
+| Reduction | 0.28ms | 3.4% |
+| Cat/Concat | 0.12ms | 1.4% |
+| Norm | 0.07ms | 0.9% |
+
+总计约 **`8.22ms / steady decode step`**。
+
+### 按结构估算到 decode 路径
+
+工具里的“Decode structure estimate”给出了一版更接近代码结构的拆解：
+
+| 路径 | steady-state GPU/步 | 单层均摊 |
+|------|---------------------|----------|
+| `qkv_proj` | `0.413ms` | `14.8us/layer` |
+| `gate_up_proj` | `1.125ms` | `40.2us/layer` |
+| `attention` | `1.335ms` | `47.7us/layer` |
+| `o_proj + down_proj` | `1.039ms` | `37.1us/layer` |
+| `post_attn_add_rmsnorm` | `0.075ms` | `2.7us/layer` |
+| `input/qk norm + rope` | `0.398ms` | `14.2us/layer` |
+| `SiLU activation` | `0.069ms` | `2.5us/layer` |
+| `lm_head` | `0.357ms` | 非 per-layer |
+| **fragmented `Copy / Mul / misc`** | **`3.410ms`** | **`121.8us/layer`** |
+
+这里最关键的是最后一行：
+
+- 现在 **真正还没被吃掉的大头**，不是 attention，也不是单个线性层
+- 而是图内剩下的 **碎片化 `Copy / Mul / Cast / Fill / index / generic elementwise`**
+- 它单独就还有 **`3.41ms/步`**，比 attention (`1.33ms`) 还大很多
+
+### 这对下一步优化的含义
+
+因此接下来的优先级可以再收紧一点：
+
+1. **继续压 `Copy / Mul / generic elementwise`**
+   - 主战场仍然是 `q_norm + k_norm + rope`
+   - 以及 layer 内各种小张量 materialization / residual / cache write 边界
+
+2. **`gate_up` / `down_proj` 不算小，但已经是比较“整块”的 GEMM/GEMV**
+   - 它们当然有空间
+   - 但从当前 trace 看，优先级仍低于碎片 elementwise 大盘
+
+3. **`post_attn_add_rmsnorm` 已经不再是主矛盾**
+   - 现在只剩 `0.075ms/步`
+   - 说明默认开启的 `small add+rmsnorm` 已经把这一块压得比较干净
+
+4. **`SiLU` 仍然不是主线**
+   - steady-state 里也只有 `0.069ms/步`
+   - 继续单独围着它打，杠杆还是不够

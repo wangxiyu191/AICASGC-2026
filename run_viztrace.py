@@ -2,8 +2,8 @@
 """Focused trace runner aligned with the real ModelWrapper generate path.
 
 Produces two trace files via ModelWrapper's built-in VizTracer integration:
-  traces/generate_1.json  - TTFT (max_new_tokens=1)
-  traces/generate_2.json  - Throughput (max_new_tokens=128)
+  <output_dir>/generate_1.json  - TTFT (max_new_tokens=1)
+  <output_dir>/generate_2.json  - Throughput (max_new_tokens=128)
 
 Usage:
     TQDM_DISABLE=1 python run_viztrace.py [--warmup N] [--sample-idx IDX] [--mode cudagraph]
@@ -17,7 +17,7 @@ from datasets import load_from_disk
 
 os.environ.setdefault("TQDM_DISABLE", "1")
 
-TRACE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "traces")
+DEFAULT_TRACE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "traces")
 
 
 def prepare_inputs(model, image, question):
@@ -67,9 +67,17 @@ def main():
         action="store_true",
         help="Keep existing traces/generate_*.json instead of deleting them before profiling",
     )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=DEFAULT_TRACE_DIR,
+        help="Directory for generate_*.json trace outputs",
+    )
     args = parser.parse_args()
 
+    trace_dir = os.path.abspath(args.output_dir)
     os.environ["ENABLE_VIZTRACE"] = "1"
+    os.environ["VIZTRACE_OUTPUT_DIR"] = trace_dir
     os.environ["VIZTRACE_WARMUP_CALLS"] = str(10 ** 9)
     if args.mode == "hf":
         os.environ["ENABLE_CUSTOM_DECODE"] = "0"
@@ -86,11 +94,11 @@ def main():
 
     from evaluation_wrapper import VLMModel  # noqa: E402
 
-    os.makedirs(TRACE_DIR, exist_ok=True)
+    os.makedirs(trace_dir, exist_ok=True)
     if not args.keep_existing_traces:
-        for filename in os.listdir(TRACE_DIR):
+        for filename in os.listdir(trace_dir):
             if filename.startswith("generate_") and filename.endswith(".json"):
-                os.remove(os.path.join(TRACE_DIR, filename))
+                os.remove(os.path.join(trace_dir, filename))
 
     print(f"[Profile] Mode: {args.mode}")
     print("[Profile] Loading model...")
@@ -129,7 +137,7 @@ def main():
     traced_model._warmup_calls = 0
 
     # === Trace 1: TTFT (1 token) ===
-    trace_ttft = os.path.join(TRACE_DIR, "generate_1.json")
+    trace_ttft = os.path.join(trace_dir, "generate_1.json")
     print(f"\n[Profile] Tracing TTFT → {trace_ttft}")
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
@@ -137,7 +145,7 @@ def main():
     print(f"  TTFT (traced): {t*1000:.1f} ms  [file: {os.path.getsize(trace_ttft)/1e6:.1f} MB]")
 
     # === Trace 2: Throughput (128 tokens) ===
-    trace_tput = os.path.join(TRACE_DIR, "generate_2.json")
+    trace_tput = os.path.join(trace_dir, "generate_2.json")
     print(f"\n[Profile] Tracing throughput → {trace_tput}")
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
@@ -146,7 +154,7 @@ def main():
     print(f"  Throughput (traced): {n_tok_tput/t:.1f} tok/s ({t*1000:.1f} ms, {n_tok_tput} tokens)  "
           f"[file: {os.path.getsize(trace_tput)/1e6:.1f} MB]")
 
-    print("\n[Profile] Done. Run: python analyze_traces.py ./traces")
+    print(f"\n[Profile] Done. Run: python analyze_traces.py {trace_dir}")
 
 
 if __name__ == "__main__":

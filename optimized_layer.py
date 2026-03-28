@@ -8,7 +8,7 @@ Replaces HF's Qwen3VLTextDecoderLayer:
 - Triton fused RoPE: 5 kernels → 1 kernel per call (eliminates cat/neg/mul/add)
 - CUDA Graph-only small-shape Triton fusion: residual+RMSNorm and SiLU*up
 """
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import os
 import torch
 import torch.nn as nn
@@ -174,11 +174,13 @@ _ENABLE_DECODE_NVTX = os.environ.get("ENABLE_DECODE_NVTX", "0") == "1"
 @contextmanager
 def _nvtx_range(name: str, enabled: bool):
     if enabled:
-        torch.cuda.nvtx.range_push(name)
-        try:
-            yield
-        finally:
-            torch.cuda.nvtx.range_pop()
+        with ExitStack() as stack:
+            stack.enter_context(torch.autograd.profiler.record_function(name))
+            torch.cuda.nvtx.range_push(name)
+            try:
+                yield
+            finally:
+                torch.cuda.nvtx.range_pop()
         return
     yield
 
