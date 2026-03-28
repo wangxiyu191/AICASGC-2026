@@ -7,6 +7,7 @@ Optimizations:
 - Fused decoder layers: Add+RMSNorm, QKV proj, gate_up proj, SwiGLU
 - Step A decode path: custom greedy loop + StaticCache with safe fallback
 """
+from collections import deque
 from typing import Dict
 try:
     from PIL import Image
@@ -43,6 +44,7 @@ class GreedyDecodeEngine:
         self._max_tokens_threshold = max_tokens_threshold
         self._enable_cudagraph = os.environ.get("ENABLE_CUDAGRAPH", "1") == "1"
         self._graph_warmup_steps = int(os.environ.get("CUDAGRAPH_WARMUP_STEPS", "2"))
+        self._async_eos_window = max(1, int(os.environ.get("CUDAGRAPH_ASYNC_EOS_WINDOW", "2")))
 
     def is_supported(self, args, kwargs) -> bool:
         if len(args) > 1:
@@ -126,6 +128,7 @@ class GreedyDecodeEngine:
             current_length = prompt_length + 1
             current_position = prompt_length
             eos_token_id = self._resolve_eos_token_id(kwargs)
+            eos_token_values = self._resolve_eos_token_values(kwargs)
             graph_runner = None
 
             if self._should_use_cudagraph(
@@ -146,6 +149,17 @@ class GreedyDecodeEngine:
                 except Exception as exc:
                     print(f"[GreedyDecodeEngine] CUDA Graph setup failed, fallback to eager decode: {exc}")
                     graph_runner = None
+
+            if graph_runner is not None and eos_token_values and self._async_eos_window > 1:
+                return self._generate_with_async_eos_poll(
+                    next_tokens=next_tokens,
+                    output_ids=output_ids,
+                    current_length=current_length,
+                    current_position=current_position,
+                    max_new_tokens=max_new_tokens,
+                    graph_runner=graph_runner,
+                    eos_token_values=eos_token_values,
+                )
 
             for _ in range(1, max_new_tokens):
                 if eos_token_id is not None and bool((next_tokens.squeeze() == eos_token_id).any()):
@@ -171,6 +185,60 @@ class GreedyDecodeEngine:
 
         return output_ids[:, :current_length]
 
+    def _generate_with_async_eos_poll(
+        self,
+        next_tokens: torch.Tensor,
+        output_ids: torch.Tensor,
+        current_length: int,
+        current_position: int,
+        max_new_tokens: int,
+        graph_runner,
+        eos_token_values,
+    ):
+        pending = deque()
+        pending.append(graph_runner.stage_host_token(next_tokens, output_length=current_length))
+
+        for _ in range(1, max_new_tokens):
+            eos_length = graph_runner.poll_staged_tokens(
+                pending=pending,
+                eos_token_values=eos_token_values,
+                block=False,
+            )
+            if eos_length is not None:
+                current_length = eos_length
+                break
+
+            if len(pending) >= graph_runner.async_eos_window:
+                eos_length = graph_runner.poll_staged_tokens(
+                    pending=pending,
+                    eos_token_values=eos_token_values,
+                    block=True,
+                )
+                if eos_length is not None:
+                    current_length = eos_length
+                    break
+
+            next_tokens = graph_runner.replay(
+                input_ids=next_tokens,
+                current_position=current_position,
+            )
+            output_ids[:, current_length:current_length + 1] = next_tokens
+            current_length += 1
+            current_position += 1
+            pending.append(graph_runner.stage_host_token(next_tokens, output_length=current_length))
+
+        if pending:
+            eos_length = graph_runner.poll_staged_tokens(
+                pending=pending,
+                eos_token_values=eos_token_values,
+                block=True,
+                drain_all=True,
+            )
+            if eos_length is not None:
+                current_length = eos_length
+
+        return output_ids[:, :current_length]
+
     def _resolve_eos_token_id(self, kwargs):
         eos_token_id = kwargs.get("eos_token_id")
         if eos_token_id is None:
@@ -187,6 +255,28 @@ class GreedyDecodeEngine:
         if eos_token_id is not None:
             return torch.tensor([eos_token_id], dtype=torch.long, device=next(self._model.parameters()).device)
         return None
+
+    def _resolve_eos_token_values(self, kwargs):
+        eos_token_id = kwargs.get("eos_token_id")
+        if eos_token_id is None:
+            gen_cfg = getattr(self._model, "generation_config", None)
+            if gen_cfg is not None:
+                eos_token_id = getattr(gen_cfg, "eos_token_id", None)
+        if eos_token_id is None:
+            text_config = self._model.config.get_text_config(decoder=True)
+            eos_token_id = getattr(text_config, "eos_token_id", None)
+
+        if eos_token_id is None:
+            return None
+        if isinstance(eos_token_id, torch.Tensor):
+            eos_token_id = eos_token_id.detach().cpu().view(-1).tolist()
+        elif isinstance(eos_token_id, (list, tuple, set)):
+            eos_token_id = list(eos_token_id)
+        else:
+            eos_token_id = [eos_token_id]
+
+        values = tuple(int(token_id) for token_id in eos_token_id)
+        return values if values else None
 
     def _build_decode_position_ids(self, current_position: int, rope_deltas, device: torch.device):
         text_position_ids = torch.full((1, 1), current_position, dtype=torch.long, device=device)
@@ -252,14 +342,29 @@ class DecodeCudaGraphRunner:
         self._model = model
         self._static_cache = static_cache
         self._device = attention_mask.device
+        self._async_eos_window = max(1, int(os.environ.get("CUDAGRAPH_ASYNC_EOS_WINDOW", "2")))
         self._attention_mask_buf = attention_mask
         self._rope_deltas = rope_deltas
         self._cache_position_buf = torch.empty((1,), dtype=torch.long, device=self._device)
+        self._cache_position_table = torch.arange(
+            attention_mask.shape[1],
+            dtype=torch.long,
+            device=self._device,
+        )
         self._input_ids_buf = torch.empty_like(start_input_ids)
         self._position_ids_buf = torch.empty((3, 1, 1), dtype=torch.long, device=self._device)
         vocab_size = model.config.get_text_config(decoder=True).vocab_size
         self._logits_buf = torch.empty((1, vocab_size), dtype=model.dtype, device=self._device)
         self._next_token_buf = torch.empty((1, 1), dtype=torch.long, device=self._device)
+        self._token_stage_bufs = [
+            torch.empty_like(start_input_ids) for _ in range(self._async_eos_window)
+        ]
+        self._host_token_bufs = [
+            torch.empty((1, 1), dtype=torch.long, device="cpu", pin_memory=True)
+            for _ in range(self._async_eos_window)
+        ]
+        self._host_token_events = [torch.cuda.Event() for _ in range(self._async_eos_window)]
+        self._next_stage_slot = 0
         self._graph = torch.cuda.CUDAGraph()
 
         cache_snapshot = self._snapshot_cache()
@@ -287,6 +392,45 @@ class DecodeCudaGraphRunner:
         self._graph.replay()
         return self._next_token_buf.clone()
 
+    @property
+    def async_eos_window(self):
+        return self._async_eos_window
+
+    def stage_host_token(self, device_token: torch.Tensor, output_length: int):
+        slot = self._next_stage_slot
+        self._next_stage_slot = (self._next_stage_slot + 1) % self._async_eos_window
+        staged_token = self._token_stage_bufs[slot]
+        host_token = self._host_token_bufs[slot]
+        event = self._host_token_events[slot]
+
+        staged_token.copy_(device_token)
+        host_token.copy_(staged_token, non_blocking=True)
+        event.record(torch.cuda.current_stream(device=self._device))
+        return {"slot": slot, "output_length": output_length}
+
+    def poll_staged_tokens(self, pending, eos_token_values, block: bool, drain_all: bool = False):
+        eos_set = set(eos_token_values)
+        eos_length = None
+
+        while pending:
+            record = pending[0]
+            event = self._host_token_events[record["slot"]]
+            if block:
+                event.synchronize()
+            elif not event.query():
+                break
+
+            token = int(self._host_token_bufs[record["slot"]].item())
+            pending.popleft()
+            if token in eos_set and eos_length is None:
+                eos_length = record["output_length"]
+                if not drain_all:
+                    return eos_length
+            elif not drain_all:
+                break
+
+        return eos_length
+
     def _run_step(self):
         outputs = self._model(
             input_ids=self._input_ids_buf,
@@ -303,7 +447,7 @@ class DecodeCudaGraphRunner:
     def _write_inputs(self, input_ids: torch.Tensor, current_position: int):
         self._input_ids_buf.copy_(input_ids)
         self._attention_mask_buf[:, current_position] = True
-        self._cache_position_buf[0] = current_position
+        self._cache_position_buf.copy_(self._cache_position_table.narrow(0, current_position, 1))
         self._position_ids_buf.copy_(self._build_position_ids(current_position))
 
     def _build_position_ids(self, current_position: int):

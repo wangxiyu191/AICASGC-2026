@@ -138,6 +138,69 @@ def categorize_cpu_op(name):
     return 'Other'
 
 
+SYNC_RUNTIME_NAMES = {
+    'cudaStreamSynchronize',
+    'cudaEventSynchronize',
+    'cudaDeviceSynchronize',
+}
+
+
+def _build_fee_stack(fee_events, ts, tid):
+    """Reconstruct the enclosing Python stack for a timestamp on one thread."""
+    containing = []
+    for ev in fee_events:
+        if ev['tid'] != tid:
+            continue
+        start = ev['ts']
+        end = start + ev['dur']
+        if start <= ts <= end:
+            containing.append((start, end, ev['name']))
+
+    stack = []
+    current_end = float('inf')
+    for start, end, name in sorted(containing, key=lambda x: (x[0], -(x[1] - x[0]))):
+        if end <= current_end:
+            stack.append(name)
+            current_end = end
+    return stack
+
+
+def _recent_cpu_ops(events_by_tid, sync_event, lookback_us=120.0, max_ops=8):
+    """Collect CPU ops immediately preceding one sync event on the same thread."""
+    tid_events = events_by_tid.get(sync_event['tid'], [])
+    ts = sync_event['ts']
+    recent = []
+    for ev in reversed(tid_events):
+        if ev['ts'] >= ts:
+            continue
+        if ts - ev['ts'] > lookback_us:
+            break
+        if ev['cat'] == 'cpu_op':
+            recent.append(ev['name'])
+            if len(recent) >= max_ops:
+                break
+    recent.reverse()
+    return recent
+
+
+def _sync_hint(sync_name, stack, prev_cpu_ops):
+    """Heuristic explanation for a sync site."""
+    stack_text = ' | '.join(stack)
+    ops = set(prev_cpu_ops)
+
+    if 'DecodeCudaGraphRunner._write_inputs' in stack_text and 'aten::copy_' in ops and 'aten::select' in ops:
+        return 'Python scalar write into CUDA buffer slice triggers H2D memcpy and stream sync'
+    if 'Event.synchronize' in stack_text:
+        return 'Explicit host wait on CUDA event'
+    if 'Tensor.item' in stack_text or 'aten::item' in ops or 'aten::_local_scalar_dense' in ops:
+        return 'Host scalar materialization from device tensor'
+    if sync_name == 'cudaEventSynchronize':
+        return 'Host waits for recorded CUDA event'
+    if sync_name == 'cudaStreamSynchronize':
+        return 'Host waits for queued work on CUDA stream'
+    return 'Needs manual inspection'
+
+
 def analyze_single_trace(filepath):
     """Load and analyze a single trace file, return summary dict."""
     filesize_mb = os.path.getsize(filepath) / (1024 * 1024)
@@ -171,13 +234,18 @@ def analyze_single_trace(filepath):
         'graph_replay_count': 0,
         'graph_capture_count': 0,
         'decode_source': 'unknown',
+        'sync_sites': [],
     }
+
+    fee_events = []
+    thread_events = defaultdict(list)
 
     for ev in events:
         cat = ev.get('cat', '')
         name = ev.get('name', '')
         dur = ev.get('dur', 0)
         ph = ev.get('ph', '')
+        tid = ev.get('tid')
 
         # Only process complete events and duration events
         if ph not in ('X', 'B', 'E', 'i'):
@@ -188,6 +256,15 @@ def analyze_single_trace(filepath):
         if cat:
             stats['cat_summary'][cat]['count'] += 1
             stats['cat_summary'][cat]['total_dur'] += dur
+
+        if tid is not None and cat in ('FEE', 'cpu_op', 'cuda_runtime'):
+            thread_events[tid].append({
+                'ts': ev.get('ts', 0),
+                'dur': dur,
+                'cat': cat,
+                'name': name,
+                'tid': tid,
+            })
 
         if cat == 'kernel':
             short_name = simplify_kernel_name(name)
@@ -223,6 +300,12 @@ def analyze_single_trace(filepath):
             elif name in ('cudaGraphInstantiateWithFlags', 'cudaGraphGetNodes'):
                 stats['graph_capture_count'] += 1
         elif cat == 'FEE':
+            fee_events.append({
+                'ts': ev.get('ts', 0),
+                'dur': dur,
+                'tid': tid,
+                'name': name,
+            })
             if 'replay (' in name and 'evaluation_wrapper.py' in name:
                 stats['graph_replay_count'] += 1
         elif cat == 'gpu_memcpy':
@@ -245,6 +328,39 @@ def analyze_single_trace(filepath):
     else:
         stats['decode_steps'] = 0
         stats['decode_source'] = 'none'
+
+    for tid in thread_events:
+        thread_events[tid].sort(key=lambda x: x['ts'])
+
+    sync_aggregate = defaultdict(lambda: {
+        'count': 0,
+        'total_dur': 0.0,
+        'max_dur': 0.0,
+        'sync_name': '',
+        'stack': (),
+        'prev_cpu_ops': (),
+        'hint': '',
+    })
+    for ev in events:
+        if ev.get('cat') != 'cuda_runtime' or ev.get('name') not in SYNC_RUNTIME_NAMES:
+            continue
+        stack = tuple(_build_fee_stack(fee_events, ev.get('ts', 0), ev.get('tid')))
+        prev_cpu_ops = tuple(_recent_cpu_ops(thread_events, ev))
+        hint = _sync_hint(ev.get('name', ''), stack, prev_cpu_ops)
+        key = (ev.get('name'), stack, prev_cpu_ops, hint)
+        sync_aggregate[key]['count'] += 1
+        sync_aggregate[key]['total_dur'] += ev.get('dur', 0)
+        sync_aggregate[key]['max_dur'] = max(sync_aggregate[key]['max_dur'], ev.get('dur', 0))
+        sync_aggregate[key]['sync_name'] = ev.get('name', '')
+        sync_aggregate[key]['stack'] = stack
+        sync_aggregate[key]['prev_cpu_ops'] = prev_cpu_ops
+        sync_aggregate[key]['hint'] = hint
+
+    stats['sync_sites'] = sorted(
+        sync_aggregate.values(),
+        key=lambda x: x['total_dur'],
+        reverse=True,
+    )
 
     return stats
 
@@ -293,6 +409,15 @@ def merge_stats(all_stats):
         'gpu_memcpy': defaultdict(lambda: {'count': 0, 'total_dur': 0.0, 'max_dur': 0.0}),
         'gpu_memset': defaultdict(lambda: {'count': 0, 'total_dur': 0.0, 'max_dur': 0.0}),
         'cat_summary': defaultdict(lambda: {'count': 0, 'total_dur': 0.0}),
+        'sync_sites': defaultdict(lambda: {
+            'count': 0,
+            'total_dur': 0.0,
+            'max_dur': 0.0,
+            'sync_name': '',
+            'stack': (),
+            'prev_cpu_ops': (),
+            'hint': '',
+        }),
     }
 
     for stats in all_stats:
@@ -304,6 +429,16 @@ def merge_stats(all_stats):
         for cat, info in stats['cat_summary'].items():
             merged['cat_summary'][cat]['count'] += info['count']
             merged['cat_summary'][cat]['total_dur'] += info['total_dur']
+        for site in stats.get('sync_sites', []):
+            key = (site['sync_name'], site['stack'], site['prev_cpu_ops'], site['hint'])
+            merged['sync_sites'][key]['count'] += site['count']
+            merged['sync_sites'][key]['total_dur'] += site['total_dur']
+            merged['sync_sites'][key]['max_dur'] = max(
+                merged['sync_sites'][key]['max_dur'], site['max_dur'])
+            merged['sync_sites'][key]['sync_name'] = site['sync_name']
+            merged['sync_sites'][key]['stack'] = site['stack']
+            merged['sync_sites'][key]['prev_cpu_ops'] = site['prev_cpu_ops']
+            merged['sync_sites'][key]['hint'] = site['hint']
 
     return merged
 
@@ -526,6 +661,32 @@ def analyze_memory_ops(merged):
             print(f"    {info['total_dur']/1000:.2f} ms  (x{info['count']})  {name}")
 
 
+def print_sync_stack_analysis(merged, top_n=10):
+    """Print aggregated CUDA sync sites with Python stack context."""
+    if not merged['sync_sites']:
+        return
+
+    sites = sorted(merged['sync_sites'].values(), key=lambda x: x['total_dur'], reverse=True)
+    total_sync = sum(site['total_dur'] for site in sites)
+
+    print(f"\n{'='*100}")
+    print("  CUDA SYNC STACK ANALYSIS")
+    print(f"{'='*100}")
+    print(f"  Total sync time: {total_sync/1000:.2f} ms across {sum(site['count'] for site in sites)} calls")
+
+    for idx, site in enumerate(sites[:top_n], start=1):
+        avg_us = site['total_dur'] / site['count'] if site['count'] else 0.0
+        print(f"\n  [{idx}] {site['sync_name']}  total={site['total_dur']/1000:.2f} ms  "
+              f"count={site['count']}  avg={avg_us:.1f} us  max={site['max_dur']:.1f} us")
+        print(f"      Hint: {site['hint']}")
+        if site['prev_cpu_ops']:
+            print(f"      Prev CPU ops: {' -> '.join(site['prev_cpu_ops'])}")
+        if site['stack']:
+            print("      Python stack:")
+            for frame in site['stack'][-8:]:
+                print(f"        {frame}")
+
+
 def main():
     parser = argparse.ArgumentParser(description='Analyze PyTorch profiler trace files')
     parser.add_argument('trace_dir', nargs='?', default='./traces',
@@ -583,6 +744,7 @@ def main():
     analyze_flash_attention(merged)
     analyze_gemm(merged)
     analyze_memory_ops(merged)
+    print_sync_stack_analysis(merged, top_n=12)
     print_top_ops(merged['cuda_runtime'], 'CUDA RUNTIME CALLS', top_n=15)
 
     print(f"\n{'='*100}")
