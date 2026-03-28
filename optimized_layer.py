@@ -162,7 +162,9 @@ class OptimizedDecoderLayer(nn.Module):
                     dropout=0.0, scaling=self.scaling, **kwargs,
                 )
         with _nvtx_range("decode.o_proj", enable_decode_nvtx):
-            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+            attn_output = attn_output.reshape(*input_shape, -1)
+            if not attn_output.is_contiguous():
+                attn_output = attn_output.contiguous()
             attn_output = self.o_proj(attn_output)
 
         # 6. Residual + Post-attention LayerNorm
@@ -189,7 +191,7 @@ class OptimizedDecoderLayer(nn.Module):
 
         # 8. Residual
         with _nvtx_range("decode.residual_add", enable_decode_nvtx):
-            hidden_states = residual + hidden_states
+            hidden_states = hidden_states.add_(residual)
         return hidden_states
 
 

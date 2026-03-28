@@ -1,0 +1,95 @@
+{
+  "system_info": {
+    "python_version": "3.12.3",
+    "torch_version": "2.8.0+cu128",
+    "cuda_version": "12.8",
+    "cudnn_version": "91002",
+    "gpu_name": "NVIDIA A800 80GB PCIe",
+    "gpu_compute_capability": "8.0"
+  },
+  "metadata": {
+    "sample_idx": 0,
+    "layer_idx": 0,
+    "decode_step": 0,
+    "bucketed": true,
+    "prompt_length": 690,
+    "max_cache_len": 832,
+    "captured_decode_step": 0,
+    "o_proj_input_shape": [
+      1,
+      1,
+      2048
+    ],
+    "o_proj_weight_shape": [
+      2048,
+      2048
+    ],
+    "o_proj_weight_is_contiguous": true,
+    "down_proj_input_shape": [
+      1,
+      1,
+      6144
+    ],
+    "down_proj_weight_shape": [
+      2048,
+      6144
+    ],
+    "down_proj_weight_is_contiguous": true,
+    "dtype": "torch.float16",
+    "device": "cuda:0"
+  },
+  "o_proj_benchmarks": {
+    "f_linear": {
+      "time_ms": 0.015252558514475822,
+      "status": "ok"
+    },
+    "f_linear_contiguous_weight": {
+      "time_ms": 0.015375977382063866,
+      "status": "ok",
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "speedup_vs_ref": 0.9919732668355762
+    },
+    "matmul_weight_t": {
+      "time_ms": 0.020276503637433052,
+      "status": "ok",
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "speedup_vs_ref": 0.7522282335854799
+    },
+    "triton_matvec": {
+      "time_ms": 0.04489312879741192,
+      "status": "ok",
+      "max_abs_diff": 1.9073486328125e-06,
+      "mean_abs_diff": 9.89530235528946e-10,
+      "speedup_vs_ref": 0.33975262858834493
+    }
+  },
+  "down_proj_benchmarks": {
+    "f_linear": {
+      "time_ms": 0.02698909491300583,
+      "status": "ok"
+    },
+    "f_linear_contiguous_weight": {
+      "time_ms": 0.026976177468895912,
+      "status": "ok",
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "speedup_vs_ref": 1.0004788463497027
+    },
+    "matmul_weight_t": {
+      "time_ms": 0.026971008628606796,
+      "status": "ok",
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "speedup_vs_ref": 1.0006705824260442
+    },
+    "triton_matvec": {
+      "time_ms": 0.04603664390742779,
+      "status": "ok",
+      "max_abs_diff": 1.9073486328125e-06,
+      "mean_abs_diff": 1.3969838619232178e-09,
+      "speedup_vs_ref": 0.5862524420172008
+    }
+  }
+}
