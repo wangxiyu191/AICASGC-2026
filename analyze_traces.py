@@ -206,6 +206,18 @@ def _sync_hint(sync_name, stack, prev_cpu_ops):
     return 'Needs manual inspection'
 
 
+def _interval_overlap_total(intervals, start_ts, end_ts):
+    """Sum overlap duration between one interval and sorted kernel intervals."""
+    total = 0.0
+    for ev_start, ev_end in intervals:
+        if ev_end <= start_ts:
+            continue
+        if ev_start >= end_ts:
+            break
+        total += max(0.0, min(end_ts, ev_end) - max(start_ts, ev_start))
+    return total
+
+
 def analyze_single_trace(filepath):
     """Load and analyze a single trace file, return summary dict."""
     filesize_mb = os.path.getsize(filepath) / (1024 * 1024)
@@ -240,10 +252,18 @@ def analyze_single_trace(filepath):
         'graph_capture_count': 0,
         'decode_source': 'unknown',
         'sync_sites': [],
+        'sync_phase_summary': {},
+        'graph_window': {},
     }
 
     fee_events = []
     thread_events = defaultdict(list)
+    kernel_intervals = []
+    sync_events = []
+    graph_launch_windows = []
+    first_runtime_ts = None
+    first_kernel_ts = None
+    first_fee_ts = None
 
     for ev in events:
         cat = ev.get('cat', '')
@@ -272,6 +292,10 @@ def analyze_single_trace(filepath):
             })
 
         if cat == 'kernel':
+            ts = ev.get('ts', 0)
+            kernel_intervals.append((ts, ts + dur))
+            if first_kernel_ts is None or ts < first_kernel_ts:
+                first_kernel_ts = ts
             short_name = simplify_kernel_name(name)
             stats['kernel_ops'][short_name]['count'] += 1
             stats['kernel_ops'][short_name]['total_dur'] += dur
@@ -295,6 +319,9 @@ def analyze_single_trace(filepath):
             elif name == 'aten::item':
                 stats['item_count'] += 1
         elif cat == 'cuda_runtime':
+            ts = ev.get('ts', 0)
+            if first_runtime_ts is None or ts < first_runtime_ts:
+                first_runtime_ts = ts
             stats['cuda_runtime'][name]['count'] += 1
             stats['cuda_runtime'][name]['total_dur'] += dur
             stats['cuda_runtime'][name]['max_dur'] = max(
@@ -302,11 +329,23 @@ def analyze_single_trace(filepath):
             if name == 'cudaGraphLaunch':
                 stats['graph_launch_count'] += 1
                 stats['graph_launch_dur'] += dur
+                graph_launch_windows.append((ts, ts + dur))
             elif name in ('cudaGraphInstantiateWithFlags', 'cudaGraphGetNodes'):
                 stats['graph_capture_count'] += 1
+            if name in SYNC_RUNTIME_NAMES:
+                sync_events.append({
+                    'cat': cat,
+                    'name': name,
+                    'ts': ts,
+                    'dur': dur,
+                    'tid': tid,
+                })
         elif cat == 'FEE':
+            ts = ev.get('ts', 0)
+            if first_fee_ts is None or ts < first_fee_ts:
+                first_fee_ts = ts
             fee_events.append({
-                'ts': ev.get('ts', 0),
+                'ts': ts,
                 'dur': dur,
                 'tid': tid,
                 'name': name,
@@ -346,9 +385,7 @@ def analyze_single_trace(filepath):
         'prev_cpu_ops': (),
         'hint': '',
     })
-    for ev in events:
-        if ev.get('cat') != 'cuda_runtime' or ev.get('name') not in SYNC_RUNTIME_NAMES:
-            continue
+    for ev in sync_events:
         stack = tuple(_build_fee_stack(fee_events, ev.get('ts', 0), ev.get('tid')))
         prev_cpu_ops = tuple(_recent_cpu_ops(thread_events, ev))
         hint = _sync_hint(ev.get('name', ''), stack, prev_cpu_ops)
@@ -366,6 +403,42 @@ def analyze_single_trace(filepath):
         key=lambda x: x['total_dur'],
         reverse=True,
     )
+
+    kernel_intervals.sort()
+    if graph_launch_windows:
+        first_graph_ts = min(start for start, _ in graph_launch_windows)
+        last_graph_end_ts = max(end for _, end in graph_launch_windows)
+    else:
+        first_graph_ts = None
+        last_graph_end_ts = None
+
+    sync_phase_summary = {
+        'before_graph': {'count': 0, 'total_dur': 0.0, 'gpu_overlap_dur': 0.0},
+        'during_graph_window': {'count': 0, 'total_dur': 0.0, 'gpu_overlap_dur': 0.0},
+        'after_graph': {'count': 0, 'total_dur': 0.0, 'gpu_overlap_dur': 0.0},
+    }
+    if first_graph_ts is not None:
+        for ev in sync_events:
+            sync_start = ev['ts']
+            sync_end = ev['ts'] + ev['dur']
+            overlap = _interval_overlap_total(kernel_intervals, sync_start, sync_end)
+            if sync_end <= first_graph_ts:
+                bucket = 'before_graph'
+            elif sync_start >= last_graph_end_ts:
+                bucket = 'after_graph'
+            else:
+                bucket = 'during_graph_window'
+            sync_phase_summary[bucket]['count'] += 1
+            sync_phase_summary[bucket]['total_dur'] += ev['dur']
+            sync_phase_summary[bucket]['gpu_overlap_dur'] += overlap
+    stats['sync_phase_summary'] = sync_phase_summary
+    stats['graph_window'] = {
+        'first_fee_ts': first_fee_ts,
+        'first_runtime_ts': first_runtime_ts,
+        'first_kernel_ts': first_kernel_ts,
+        'first_graph_ts': first_graph_ts,
+        'last_graph_end_ts': last_graph_end_ts,
+    }
 
     return stats
 
@@ -485,6 +558,67 @@ def print_per_file_summary(all_stats):
         print(f"  {stats['file']:<22} {stats['filesize_mb']:<10.1f} {stats['num_events']:<10} "
               f"{gpu_dur:<10.1f} {cpu_dur:<10.1f} {mem_dur:<11.2f} {fa_str:>10} "
               f"{stats['decode_steps']:>10} {phase:<10}")
+
+
+def print_sync_phase_summary(all_stats):
+    """Print sync breakdown around the CUDA graph replay window."""
+    relevant = [s for s in all_stats if s.get('graph_window', {}).get('first_graph_ts') is not None]
+    if not relevant:
+        return
+
+    print(f"\n{'='*100}")
+    print("  CUDA SYNC PHASE ANALYSIS")
+    print(f"{'='*100}")
+
+    for stats in relevant:
+        gw = stats['graph_window']
+        first_graph_ts = gw.get('first_graph_ts')
+        first_kernel_ts = gw.get('first_kernel_ts')
+        first_runtime_ts = gw.get('first_runtime_ts')
+        first_fee_ts = gw.get('first_fee_ts')
+        lead_kernel_ms = ((first_graph_ts - first_kernel_ts) / 1000.0
+                          if first_graph_ts is not None and first_kernel_ts is not None else None)
+        lead_runtime_ms = ((first_graph_ts - first_runtime_ts) / 1000.0
+                           if first_graph_ts is not None and first_runtime_ts is not None else None)
+        lead_fee_ms = ((first_graph_ts - first_fee_ts) / 1000.0
+                       if first_graph_ts is not None and first_fee_ts is not None else None)
+
+        print(f"\n  {stats['file']}")
+        if lead_kernel_ms is not None:
+            print(f"    Lead-in before first cudaGraphLaunch: kernel→graph {lead_kernel_ms:.2f} ms, "
+                  f"runtime→graph {lead_runtime_ms:.2f} ms, FEE→graph {lead_fee_ms:.2f} ms")
+        print(f"    {'Phase':<22} {'Count':>8} {'Sync(ms)':>12} {'GPU-overlap(ms)':>16} {'Overlap':>10}")
+        print(f"    {'-'*22} {'-'*8} {'-'*12} {'-'*16} {'-'*10}")
+        for bucket in ('before_graph', 'during_graph_window', 'after_graph'):
+            info = stats.get('sync_phase_summary', {}).get(bucket, {})
+            total_ms = info.get('total_dur', 0.0) / 1000.0
+            overlap_ms = info.get('gpu_overlap_dur', 0.0) / 1000.0
+            overlap_ratio = info.get('gpu_overlap_dur', 0.0) / info.get('total_dur', 1.0) if info.get('total_dur', 0.0) > 0 else None
+            overlap_text = "-" if overlap_ratio is None else f"{overlap_ratio*100:.1f}%"
+            print(f"    {bucket:<22} {info.get('count', 0):>8} {total_ms:>12.2f} {overlap_ms:>16.2f} {overlap_text:>10}")
+
+    aggregate = {
+        'before_graph': {'count': 0, 'total_dur': 0.0, 'gpu_overlap_dur': 0.0},
+        'during_graph_window': {'count': 0, 'total_dur': 0.0, 'gpu_overlap_dur': 0.0},
+        'after_graph': {'count': 0, 'total_dur': 0.0, 'gpu_overlap_dur': 0.0},
+    }
+    for stats in relevant:
+        for bucket in aggregate:
+            info = stats.get('sync_phase_summary', {}).get(bucket, {})
+            aggregate[bucket]['count'] += info.get('count', 0)
+            aggregate[bucket]['total_dur'] += info.get('total_dur', 0.0)
+            aggregate[bucket]['gpu_overlap_dur'] += info.get('gpu_overlap_dur', 0.0)
+
+    print(f"\n  Aggregate across graph traces:")
+    print(f"    {'Phase':<22} {'Count':>8} {'Sync(ms)':>12} {'GPU-overlap(ms)':>16} {'Overlap':>10}")
+    print(f"    {'-'*22} {'-'*8} {'-'*12} {'-'*16} {'-'*10}")
+    for bucket in ('before_graph', 'during_graph_window', 'after_graph'):
+        info = aggregate[bucket]
+        total_ms = info['total_dur'] / 1000.0
+        overlap_ms = info['gpu_overlap_dur'] / 1000.0
+        overlap_ratio = info['gpu_overlap_dur'] / info['total_dur'] if info['total_dur'] > 0 else None
+        overlap_text = "-" if overlap_ratio is None else f"{overlap_ratio*100:.1f}%"
+        print(f"    {bucket:<22} {info['count']:>8} {total_ms:>12.2f} {overlap_ms:>16.2f} {overlap_text:>10}")
 
 
 def analyze_phase_breakdown(all_stats):
@@ -866,6 +1000,7 @@ def main():
 
     # Per-file summary
     print_per_file_summary(all_stats)
+    print_sync_phase_summary(all_stats)
 
     # Phase breakdown (TTFT vs Decode)
     analyze_phase_breakdown(all_stats)
