@@ -16,4 +16,5 @@
 1. 在一项优化完成后，commit提交，方便后续查阅和回滚。
 2. 需要调用from_pretrained（如运行bench）时必须使用TQDM_DISABLE=1，不然肯定stdout阻塞导致benchmark卡住。
 3. benchmark的JSON测试结果统一存放在results/目录中，便于管理和追踪。
+4. viztrace/trace 文件统一存放在traces/目录下；如需分类，对比实验请在traces/下面新建子目录，不要再在仓库根目录新建独立trace目录。
 优化文档：docs/README.md（包含优化计划、日志、踩坑记录、Trace分析、推理引擎分析等文档索引）
