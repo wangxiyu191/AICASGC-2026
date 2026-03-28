@@ -112,10 +112,22 @@ class OptimizedDecoderLayer(nn.Module):
         # 3. QK-Norm + RoPE (before transpose — natural layout for cos/sin broadcast)
         cos, sin = position_embeddings
         with _nvtx_range("decode.qk_norm_rope", enable_decode_nvtx):
-            q = _rms_norm(q.view(hidden_shape_q), self.q_norm_weight, self.rms_norm_eps)
-            k = _rms_norm(k.view(hidden_shape_kv), self.k_norm_weight, self.rms_norm_eps)
-            q = _apply_rotary_emb(q, cos, sin).transpose(1, 2)
-            k = _apply_rotary_emb(k, cos, sin).transpose(1, 2)
+            q = _fused_rms_norm_rope(
+                q.view(hidden_shape_q),
+                self.q_norm_weight,
+                self.rms_norm_eps,
+                cos,
+                sin,
+                prefer_small_triton=prefer_small_decode_triton,
+            ).transpose(1, 2)
+            k = _fused_rms_norm_rope(
+                k.view(hidden_shape_kv),
+                self.k_norm_weight,
+                self.rms_norm_eps,
+                cos,
+                sin,
+                prefer_small_triton=prefer_small_decode_triton,
+            ).transpose(1, 2)
             v = v.view(hidden_shape_kv).transpose(1, 2)
 
         # 4. KV Cache
@@ -168,6 +180,7 @@ class OptimizedDecoderLayer(nn.Module):
 _TRITON_ROWS_THRESHOLD = 32
 _ENABLE_TRITON_SMALL_ADD_RMSNORM = os.environ.get("ENABLE_TRITON_SMALL_ADD_RMSNORM", "1") == "1"
 _ENABLE_TRITON_SMALL_SILU_MUL = os.environ.get("ENABLE_TRITON_SMALL_SILU_MUL", "0") == "1"
+_ENABLE_TRITON_SMALL_QK_NORM_ROPE = os.environ.get("ENABLE_TRITON_SMALL_QK_NORM_ROPE", "1") == "1"
 _ENABLE_DECODE_NVTX = os.environ.get("ENABLE_DECODE_NVTX", "0") == "1"
 
 
@@ -211,6 +224,58 @@ def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor
         BLOCK_N=BLOCK_N,
     )
     return out_2d.view(orig_shape)
+
+
+def _fused_rms_norm_rope(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    prefer_small_triton: bool = False,
+) -> torch.Tensor:
+    """Fuse RMSNorm + RoPE for decode-small shapes when profitable."""
+    batch, seq_len, nheads, D = x.shape
+    half_d = D // 2
+    if (
+        (not prefer_small_triton)
+        or (not _ENABLE_TRITON_SMALL_QK_NORM_ROPE)
+        or x.device.type != "cuda"
+        or weight.device.type != "cuda"
+        or cos.device.type != "cuda"
+        or sin.device.type != "cuda"
+        or seq_len > _TRITON_ROWS_THRESHOLD
+        or x.stride(-1) != 1
+        or weight.stride(-1) != 1
+        or cos.stride(-1) != 1
+        or sin.stride(-1) != 1
+    ):
+        return _apply_rotary_emb(_rms_norm(x, weight, eps), cos, sin)
+
+    m = batch * seq_len
+    x_3d = x.reshape(m, nheads, D)
+    cos_2d = cos.reshape(m, D)
+    sin_2d = sin.reshape(m, D)
+    out_3d = torch.empty_like(x_3d)
+    block_d = triton.next_power_of_2(D)
+    block_half = triton.next_power_of_2(half_d)
+    _fused_rms_norm_rope_fwd_kernel[(m * nheads,)](
+        x_3d,
+        out_3d,
+        weight,
+        cos_2d,
+        sin_2d,
+        nheads,
+        D,
+        half_d,
+        x_3d.stride(0),
+        x_3d.stride(1),
+        cos_2d.stride(0),
+        eps,
+        BLOCK_D=block_d,
+        BLOCK_HALF=block_half,
+    )
+    return out_3d.view_as(x)
 
 
 def _fused_add_rms_norm(
@@ -341,6 +406,54 @@ def _fused_add_rms_norm_fwd_kernel(
 
     tl.store(OUT_SUM + row * out_sum_stride + cols, summed.to(OUT_SUM.dtype.element_ty), mask=mask)
     tl.store(OUT_NORM + row * out_norm_stride + cols, (summed * rstd * w).to(OUT_NORM.dtype.element_ty), mask=mask)
+
+
+@triton.jit
+def _fused_rms_norm_rope_fwd_kernel(
+    X,
+    OUT,
+    W,
+    COS,
+    SIN,
+    nheads,
+    D: tl.constexpr,
+    HALF_D: tl.constexpr,
+    stride_x_m,
+    stride_x_h,
+    stride_cos_m,
+    eps,
+    BLOCK_D: tl.constexpr,
+    BLOCK_HALF: tl.constexpr,
+):
+    """Compute RMSNorm + RoPE for one (sample, head) row."""
+    pid = tl.program_id(0)
+    m = pid // nheads
+    h = pid % nheads
+
+    cols = tl.arange(0, BLOCK_D)
+    mask = cols < D
+    x_base = X + m * stride_x_m + h * stride_x_h
+    x = tl.load(x_base + cols, mask=mask, other=0.0).to(tl.float32)
+    var = tl.sum(x * x, axis=0) / D
+    rstd = tl.rsqrt(var + eps)
+
+    rk = tl.arange(0, BLOCK_HALF)
+    mask_half = rk < HALF_D
+    x0 = tl.load(x_base + rk, mask=mask_half, other=0.0).to(tl.float32)
+    x1 = tl.load(x_base + HALF_D + rk, mask=mask_half, other=0.0).to(tl.float32)
+    w0 = tl.load(W + rk, mask=mask_half, other=0.0).to(tl.float32)
+    w1 = tl.load(W + HALF_D + rk, mask=mask_half, other=0.0).to(tl.float32)
+    cs_base = m * stride_cos_m
+    cos = tl.load(COS + cs_base + rk, mask=mask_half, other=0.0).to(OUT.dtype.element_ty)
+    sin = tl.load(SIN + cs_base + rk, mask=mask_half, other=0.0).to(OUT.dtype.element_ty)
+
+    # Match the native decode path more closely: RMSNorm writes fp16, then RoPE consumes fp16.
+    n0 = (x0 * rstd * w0).to(OUT.dtype.element_ty)
+    n1 = (x1 * rstd * w1).to(OUT.dtype.element_ty)
+    out0 = n0 * cos - n1 * sin
+    out1 = n1 * cos + n0 * sin
+    tl.store(OUT + m * stride_x_m + h * stride_x_h + rk, out0.to(OUT.dtype.element_ty), mask=mask_half)
+    tl.store(OUT + m * stride_x_m + h * stride_x_h + HALF_D + rk, out1.to(OUT.dtype.element_ty), mask=mask_half)
 
 
 @triton.jit

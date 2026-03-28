@@ -440,3 +440,96 @@ TTFT 目前的主要证据是 prefill GPU kernel `50.6ms/样本`，其中 `GEMM 
 4. **`SiLU` 仍然不是主线**
    - steady-state 里也只有 `0.069ms/步`
    - 继续单独围着它打，杠杆还是不够
+
+## 13. 新实验：`q_norm + k_norm + rope` 的 decode 小 shape Triton fusion
+
+在上面的 steady-state 分析里，最值得先打的一段就是：
+
+- `q_norm`
+- `k_norm`
+- `rope`
+
+因为它同时制造：
+
+- `Reduction`
+- `Mul`
+- `Cat`
+- 一部分 generic elementwise / copy 边界
+
+### 实现方式
+
+在 [`optimized_layer.py`](../optimized_layer.py) 中新增了 `_fused_rms_norm_rope()`：
+
+- 把 `RMSNorm + RoPE` 合到一个 Triton kernel
+- 只在 **decode 小 shape** 且 `prefer_small_decode_triton=True` 时启用
+- 仍然保留环境变量开关 `ENABLE_TRITON_SMALL_QK_NORM_ROPE`
+- 数值上与原来的 decode 路径
+  - `F.rms_norm`
+  - `_apply_rotary_emb`
+  保持对齐
+
+独立微基准（`batch in {1,2}`, `heads in {8,16}`, `D=128`）：
+
+- 原路径：约 `121~128us`
+- 新 kernel：约 `49~51us`
+- 单段加速约 **`2.4x~2.6x`**
+
+### 10 样本 benchmark
+
+同机对照：
+
+| 配置 | TTFT | Throughput |
+|------|------|------------|
+| 当前默认（qk+rope fusion 关） | `160.49ms` | `63.68 tok/s` |
+| 打开 `ENABLE_TRITON_SMALL_QK_NORM_ROPE=1` | `126.09ms` | `78.25 tok/s` |
+
+- 吞吐提升约 **`+22.9%`**
+- 与 baseline **`10/10 exact match`**
+
+### 100 样本 benchmark
+
+实验版：
+
+- `66.44ms / 135.47 tok/s`
+
+与 [`results/result_step26_baseline_100.json`](../results/result_step26_baseline_100.json) 对比：
+
+- 吞吐 `104.15 -> 135.47 tok/s`，约 **`+30.1%`**
+- TTFT `64.50 -> 66.44ms`，约 `+3.0%`
+- 预测文本 **`100/100 exact match`**
+
+### Trace 结论
+
+实验 trace 在：
+
+- [`traces/compare/triton_qk_norm_rope`](../traces/compare/triton_qk_norm_rope)
+
+用 `generate_2 - generate_1` steady-state 分析后，decode GPU/步从上一版 fresh baseline 的约 `8.22ms` 降到 `6.34ms`。
+
+关键变化：
+
+| 指标 | baseline steady-state | qk+rope fusion | 变化 |
+|------|------------------------|----------------|------|
+| decode GPU/步 | `8.22ms` | `6.34ms` | **`-22.9%`** |
+| Elementwise | `3.47ms` | `1.77ms` | **`-49.0%`** |
+| Reduction | `0.28ms` | `0.10ms` | **`-64.3%`** |
+| Cat/Concat | `0.12ms` | `~0ms` | 基本吃掉 |
+| FlashAttn | `1.33ms` | `1.33ms` | 持平 |
+| GEMV | `1.04ms` | `1.03ms` | 持平 |
+
+新的 steady-state 结构估算里：
+
+- `input/qk norm + rope` 从 `0.398ms/步` 降到 `0.104ms/步`
+- `fragmented Copy/Mul/misc` 从 `3.41ms/步` 降到 `1.84ms/步`
+
+这说明这次收益不是 benchmark 偶然波动，而是确实把此前最大的 decode 小 kernel 热点吃掉了一大块。
+
+### 当前判断
+
+这条 fusion 已经满足三个条件：
+
+1. **trace 收益明确**
+2. **100 样本输出稳定**
+3. **端到端吞吐提升足够大**
+
+因此它和 `small add+rmsnorm` 一样，已经足够进入默认配置。
