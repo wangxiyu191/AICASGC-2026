@@ -180,7 +180,7 @@ ideal_time = max(FLOPs / 312 TFLOP/s, bytes / 2039 GB/s)
 | gate_up_proj / layer | 24.68 us | 0.16 us | **24.68 us** | 34.9 us | 1.4x |
 | o_proj / layer | 4.11 us | 0.03 us | **4.11 us** | 9.4 us | 2.3x |
 | down_proj / layer | 12.34 us | 0.08 us | **12.34 us** | 28.3 us | 2.3x |
-| attention(KV) / layer, `L=768` | 3.09 us | 0.02 us | **3.09 us** | 23.9 us | 7.7x |
+| attention(KV) / layer, `L=768` | 1.54 us | 0.02 us | **1.54 us** | 23.9 us | 15.5x |
 | input+qk_norm+rope / layer | 0.034 us | ~0 | **0.034 us** | 0.62 us | 18.2x |
 | post_attn_add_rmsnorm / layer | 0.010 us | ~0 | **0.010 us** | 2.5 us | 253.6x |
 | SiLU / layer | 0.012 us | ~0 | **0.012 us** | 2.5 us | 207.4x |
@@ -188,19 +188,65 @@ ideal_time = max(FLOPs / 312 TFLOP/s, bytes / 2039 GB/s)
 
 把这些主项加总后：
 
-- **A800 理想下限约 `1.78 ms / token`**
+- **A800 理想下限约 `1.74 ms / token`**
 - **最新 steady-state trace 实测约 `4.02 ms / token`**
 - 也就是相对这些主项的 roofline 下限，**还有约 `2.3x` 空间**
 
-这个 `1.78 ms` 和上面的 token 级总下限 `1.77 ms` 基本一致，说明这张分解表和整体预算是对齐的。
+这个 `1.74 ms` 和上面的 token 级总下限 `1.77 ms` 基本一致，说明这张分解表和整体预算是对齐的。
 
-### 4.2 这个差距主要卡在哪
+### 4.2 为什么 Attention 看起来还差很多
+
+上表里的 Attention `1.54 us / layer` 是 **full-chip roofline**，也就是默认整张 A800 的 HBM 带宽都能被这一层 decode attention 吃满。
+
+但这对当前 decode shape 明显过于乐观，因为当前主路径的 Attention kernel 并行度非常低：
+
+- 模型是 `16 q heads / 8 kv heads`
+- 当前 grouped-GQA decode attention 是 **1 个 `kv_head` 对应 1 个 CTA**
+- 所以一层 Attention kernel 只有 **8 个 CTA**
+- 这张 A800 80GB PCIe 实测有 **108 个 SM**
+
+也就是说，在不做 split-KV / multi-CTA merge 的前提下，这个 kernel 同时最多只能占住：
+
+```text
+8 / 108 ≈ 7.4% 的 SM
+```
+
+如果粗略假设 HBM 可用带宽也按这个并行度同比缩放，那么当前 shape 下的 **并行度受限 roofline** 大致是：
+
+| 指标 | 数值 |
+|------|------|
+| K/V bytes / layer (`L=768`) | `3,145,728 B` |
+| full-chip HBM roofline | `1.54 us / layer` |
+| shape-limited HBM ceiling | `2039 * 8 / 108 ≈ 151 GB/s` |
+| shape-limited roofline | **`20.8 us / layer`** |
+| step37 实测 | **`23.9 us / layer`** |
+
+换句话说：
+
+- 如果和 **full-chip roofline** 比，当前 Attention 看起来还是 `15.5x`
+- 但如果和 **当前 shape 的并行度受限 roofline** 比，实际上只差：
+
+```text
+23.9 / 20.8 ≈ 1.15x
+```
+
+也就是每层只差大约 `3.1 us`，28 层合计约 `0.087 ms / token`。
+
+这更符合直觉：我们已经把 Attention 从早期的 `~52 us / layer` 压到了现在的 `~24 us / layer`，再拿 full-chip roofline 去看，会夸大“还差很多”的感觉。
+
+因此更准确的结论是：
+
+- **当前 Attention 离 full-chip 理论值仍远**
+- 但这主要是 **decode 小 shape 的并行度天花板**，不完全是 kernel 本身低效
+- 在当前 `8 CTA / layer` 这个结构下，step37 的 Attention 其实已经比较接近可达上限
+
+### 4.3 这个差距主要卡在哪
 
 从上表看，最重要的不是“倍率最大”的那些小算子，而是**绝对时间差**最大的几项：
 
 | 算子 | 实测 - 理想 |
 |------|-------------|
-| attention / 28 layers | **~0.58 ms / token** |
+| attention / 28 layers | **~0.63 ms / token** |
 | down_proj / 28 layers | **~0.45 ms / token** |
 | gate_up_proj / 28 layers | **~0.29 ms / token** |
 | qkv_proj / 28 layers | **~0.19 ms / token** |
@@ -209,15 +255,17 @@ ideal_time = max(FLOPs / 312 TFLOP/s, bytes / 2039 GB/s)
 
 可以直接得到两个判断：
 
-1. **attention 仍然是离理论下限最远的主力项**
-   - 即便已经做了 grouped-GQA、`cache_position` prefix-specialization、launch tuning 和 dot-style block kernel，当前 decode attention 仍比 “只按 KV 读” 的理想下限高约 `7.7x`
-   - 这说明 attention 这部分并不是“没优化到”，而是**离 roofline 还非常远**
+1. **attention 仍然是 full-chip roofline 下差距最大的主力项**
+   - 但这里要区分两层含义：
+   - 相对 full-chip roofline，当前 attention 的确还高约 `15.5x`
+   - 相对当前 decode shape 的并行度受限 roofline，当前 attention 其实只高约 `1.15x`
+   - 所以它后续不是“完全没优化好”，而是已经开始明显受制于并行度天花板
 
 2. **大线性层已经相对接近带宽下限**
    - `qkv / gate_up / o_proj / down_proj / lm_head` 大多只比理想下限高 `1.2x ~ 2.4x`
    - 它们当然还有空间，但已经不像 attention 那样是一个数量级的差距
 
-所以如果只看“离极限还差多少”，**attention kernel 本体** 其实是最新默认路径里最值得继续压的一段。
+所以如果只看 full-chip 理论值，Attention 还是最该盯的一段；但如果把当前 decode 并行度也考虑进去，那么 **下一步 Attention 真正值得做的不是继续抠单 CTA 内部细节，而是想办法提高可并行度**。
 
 当前已经验证的最新本地实验（decode attention dot-style fast path 开启）：
 
@@ -236,7 +284,7 @@ ideal_time = max(FLOPs / 312 TFLOP/s, bytes / 2039 GB/s)
 204 / 564 ≈ 36.2%
 ```
 
-也就是说，当前和理论上限之间仍然还有约 `2.9x ~ 3.2x` 空间。
+也就是说，当前和理论上限之间仍然还有约 `2.8x ~ 3.1x` 空间。
 
 ---
 
@@ -266,7 +314,7 @@ latest trace（`triton_decode_attention_dot`）显示：
 HBM 读 -> 小计算 -> HBM 写 -> 再读 -> 再算 -> 再写
 ```
 
-因此虽然理论上是带宽受限，但实际只吃到了约 `24%` 的有效带宽。
+因此虽然理论上是带宽受限，但按 full-chip 口径看，当前 steady-state 也只吃到了约 `36%` 的有效带宽。
 
 ---
 
@@ -284,17 +332,21 @@ HBM 读 -> 小计算 -> HBM 写 -> 再读 -> 再算 -> 再写
 
 ### 最值得继续做
 
-1. **继续打 elementwise / reduction**
-   重点是 `Copy/Mul/Reduction`，不是继续围着 `SiLU` 打转
+1. **如果继续做 Attention，优先级应转向“提高并行度”**
+   比如更低开销的 split-KV / multi-CTA merge，或者更接近 FlashInfer 的 decode/prefill-style 组织，而不是只在单 CTA 内再抠一点点标量优化
 
-2. **考虑 `q_norm + k_norm + rope` 的更深 fusion**
+2. **同时应该开始重视 decode GEMV**
+   最新 trace 下 `o_proj + down_proj` 已经有 `~1.06 ms / step`，绝对时间比 Attention 还大；其中 `down_proj` 的理论差距也已经接近 Attention
+
+3. **继续打 elementwise / reduction**
+   重点仍是 `Copy/Mul/Reduction`，不是继续围着 `SiLU` 打转
    这条路径还会制造大量 `Mul/Copy`
 
-3. **检查 `lm_head` 的单 token GEMV 上限**
+4. **检查 `lm_head` 的单 token GEMV 上限**
    它单独就有 `0.58 GiB` 权重读，是很大的固定成本
 
-4. **attention decode kernel 专项优化**
-   当前 FlashAttn 约 `1.43ms/步`，仍有空间，但优先级应低于 elementwise 大盘
+5. **attention decode kernel 专项优化**
+   但目标应从“再抠单 CTA 内部细节”切到“提高并行度”；否则很容易已经接近当前 shape 的局部上限
 
 ---
 
@@ -303,6 +355,10 @@ HBM 读 -> 小计算 -> HBM 写 -> 再读 -> 再算 -> 再写
 从理论预算和 trace 同时看，当前 decode 已经不是“CPU dispatch 问题”，而是：
 
 - **架构上属于 HBM 带宽受限**
-- **实现上属于图内 elementwise/reduction 过碎，带宽利用率低**
+- **实现上同时受到小 shape Attention 并行度不足、decode GEMV 成本、以及图内 elementwise/reduction 过碎的限制**
 
-因此下一阶段最合理的方向不是再做通用编译器赌博，而是继续做 **decode 图内的 targeted fusion**，优先围绕 `Copy/Mul/Reduction` 这三类热点。
+因此下一阶段最合理的方向不是再做通用编译器赌博，而是继续做 **decode 图内的 targeted optimization**：
+
+- Attention 侧优先想办法提高并行度
+- GEMV 侧优先看 `o_proj/down_proj`
+- elementwise 侧继续压 `Copy/Mul/Reduction`
