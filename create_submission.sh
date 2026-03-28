@@ -6,8 +6,15 @@
 set -e
 
 # Configuration
-OUTPUT_NAME="${1:-submission.zip}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMMIT_ID="$(git -C "$SCRIPT_DIR" rev-parse --short HEAD)"
+BASE_OUTPUT_NAME="${1:-submission.zip}"
+
+if [[ "$BASE_OUTPUT_NAME" == *.zip ]]; then
+    OUTPUT_NAME="${BASE_OUTPUT_NAME%.zip}_${COMMIT_ID}.zip"
+else
+    OUTPUT_NAME="${BASE_OUTPUT_NAME}_${COMMIT_ID}.zip"
+fi
 
 # Files to include
 WRAPPER_FILE="evaluation_wrapper.py"
