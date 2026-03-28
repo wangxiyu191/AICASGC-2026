@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Benchmark decode-phase o_proj / down_proj implementations on real captured tensors.
+"""Benchmark decode-phase o_proj / down_proj / lm_head implementations on real captured tensors.
 
 This tool mirrors benchmark-style prefill + custom decode, captures one layer's
-decode-time `o_proj` and `down_proj` inputs, then benchmarks a few linear-call variants.
+decode-time `o_proj` / `down_proj` / `lm_head` inputs, then benchmarks a few linear-call variants.
 """
 
 from __future__ import annotations
@@ -36,6 +36,8 @@ class LinearCapture:
         self.decode_step = decode_step
         self.o_proj_call_index = 0
         self.down_proj_call_index = 0
+        self.lm_head_call_index = 0
+        self._seen_prefill_lm_head = False
         self.payload = {}
 
     def maybe_capture_o_proj(self, module, args):
@@ -61,6 +63,21 @@ class LinearCapture:
                 "bias": module.bias.detach().clone() if module.bias is not None else None,
             }
         self.down_proj_call_index += 1
+
+    def maybe_capture_lm_head(self, module, args):
+        x = args[0]
+        if x.shape[1] != 1:
+            return
+        if not self._seen_prefill_lm_head:
+            self._seen_prefill_lm_head = True
+            return
+        if self.lm_head_call_index == self.decode_step and "lm_head" not in self.payload:
+            self.payload["lm_head"] = {
+                "x": x.detach().clone(),
+                "weight": module.weight.detach().clone(),
+                "bias": module.bias.detach().clone() if module.bias is not None else None,
+            }
+        self.lm_head_call_index += 1
 
 
 def _build_bucketed_mask(vlm: VLMModel, inputs, max_new_tokens: int, bucketed: bool):
@@ -102,6 +119,7 @@ def _run_capture(
     capture = LinearCapture(decode_step=decode_step)
     o_handle = target_layer.o_proj.register_forward_pre_hook(capture.maybe_capture_o_proj)
     d_handle = target_layer.down_proj.register_forward_pre_hook(capture.maybe_capture_down_proj)
+    l_handle = model.lm_head.register_forward_pre_hook(capture.maybe_capture_lm_head)
 
     previous_small_decode_triton = set_small_decode_triton_enabled(model, True)
     try:
@@ -140,7 +158,7 @@ def _run_capture(
                     logits_to_keep=1,
                 )
                 next_tokens = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
-                if "o_proj" in capture.payload and "down_proj" in capture.payload:
+                if {"o_proj", "down_proj", "lm_head"} <= capture.payload.keys():
                     return capture.payload, {
                         "prompt_length": int(prompt_length),
                         "max_cache_len": int(max_cache_len),
@@ -152,6 +170,7 @@ def _run_capture(
         set_small_decode_triton_enabled(model, previous_small_decode_triton)
         o_handle.remove()
         d_handle.remove()
+        l_handle.remove()
 
     raise RuntimeError(
         "Failed to capture linear tensors. "
@@ -228,6 +247,97 @@ def _triton_matvec(x, weight, bias):
     return out_vec.view(*x.shape[:-1], weight.shape[0])
 
 
+@triton.jit
+def _splitk_matvec_fwd_kernel(
+    X,
+    W,
+    OUT_FP32,
+    K,
+    N,
+    CHUNK_K,
+    stride_w_n,
+    stride_w_k,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_split = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
+
+    chunk_start = pid_split * CHUNK_K
+    chunk_end = tl.minimum(chunk_start + CHUNK_K, K)
+    for start_k in range(chunk_start, chunk_end, BLOCK_K):
+        offs_k = start_k + tl.arange(0, BLOCK_K)
+        x = tl.load(X + offs_k, mask=offs_k < chunk_end, other=0.0).to(tl.float32)
+        w_ptrs = W + offs_m[:, None] * stride_w_n + offs_k[None, :] * stride_w_k
+        w = tl.load(w_ptrs, mask=(offs_m[:, None] < N) & (offs_k[None, :] < chunk_end), other=0.0).to(tl.float32)
+        acc += tl.sum(w * x[None, :], axis=1)
+
+    tl.atomic_add(OUT_FP32 + offs_m, acc, mask=offs_m < N)
+
+
+@triton.jit
+def _splitk_matvec_finalize_kernel(
+    OUT_FP32,
+    BIAS,
+    OUT,
+    N,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    acc = tl.load(OUT_FP32 + offs_m, mask=offs_m < N, other=0.0)
+    if HAS_BIAS:
+        acc += tl.load(BIAS + offs_m, mask=offs_m < N, other=0.0).to(tl.float32)
+    tl.store(OUT + offs_m, acc.to(OUT.dtype.element_ty), mask=offs_m < N)
+
+
+def _triton_splitk_matvec_impl(x, weight, bias, split_k: int, block_m: int, block_k: int):
+    x_vec = x.reshape(-1).contiguous()
+    n = weight.shape[0]
+    k = weight.shape[1]
+    chunk_k = triton.cdiv(k, split_k)
+    scratch = torch.zeros((n,), dtype=torch.float32, device=x.device)
+    out_vec = torch.empty((n,), dtype=x.dtype, device=x.device)
+    _splitk_matvec_fwd_kernel[(triton.cdiv(n, block_m), split_k)](
+        x_vec,
+        weight,
+        scratch,
+        k,
+        n,
+        chunk_k,
+        weight.stride(0),
+        weight.stride(1),
+        BLOCK_M=block_m,
+        BLOCK_K=block_k,
+        num_warps=4,
+        num_stages=2,
+    )
+    _splitk_matvec_finalize_kernel[(triton.cdiv(n, block_m),)](
+        scratch,
+        bias if bias is not None else out_vec,
+        out_vec,
+        n,
+        HAS_BIAS=bias is not None,
+        BLOCK_M=block_m,
+        num_warps=4,
+        num_stages=1,
+    )
+    return out_vec.view(*x.shape[:-1], n)
+
+
+def _triton_splitk4_matvec(x, weight, bias):
+    block_k = 256 if weight.shape[1] >= 4096 else 128
+    return _triton_splitk_matvec_impl(x, weight, bias, split_k=4, block_m=128, block_k=block_k)
+
+
+def _triton_splitk8_matvec(x, weight, bias):
+    block_k = 256 if weight.shape[1] >= 4096 else 128
+    return _triton_splitk_matvec_impl(x, weight, bias, split_k=8, block_m=128, block_k=block_k)
+
+
 def _bench_impl(fn, x, weight, bias, warmup: int, iters: int):
     for _ in range(warmup):
         fn(x, weight, bias)
@@ -247,6 +357,8 @@ def _run_benchmarks(payload, warmup: int, iters: int):
         "f_linear_contiguous_weight": _f_linear_contig,
         "matmul_weight_t": _matmul_t,
         "triton_matvec": _triton_matvec,
+        "triton_splitk4_matvec": _triton_splitk4_matvec,
+        "triton_splitk8_matvec": _triton_splitk8_matvec,
     }
     results = {}
     ref_out, ref_ms = _bench_impl(
@@ -261,22 +373,28 @@ def _run_benchmarks(payload, warmup: int, iters: int):
     for name, fn in variants.items():
         if name == "f_linear":
             continue
-        out, ms = _bench_impl(
-            fn,
-            payload["x"],
-            payload["weight"],
-            payload["bias"],
-            warmup=warmup,
-            iters=iters,
-        )
-        diff = (out - ref_out).abs().float()
-        results[name] = {
-            "time_ms": ms,
-            "status": "ok",
-            "max_abs_diff": float(diff.max().item()),
-            "mean_abs_diff": float(diff.mean().item()),
-            "speedup_vs_ref": ref_ms / ms if ms > 0 else None,
-        }
+        try:
+            out, ms = _bench_impl(
+                fn,
+                payload["x"],
+                payload["weight"],
+                payload["bias"],
+                warmup=warmup,
+                iters=iters,
+            )
+            diff = (out - ref_out).abs().float()
+            results[name] = {
+                "time_ms": ms,
+                "status": "ok",
+                "max_abs_diff": float(diff.max().item()),
+                "mean_abs_diff": float(diff.mean().item()),
+                "speedup_vs_ref": ref_ms / ms if ms > 0 else None,
+            }
+        except Exception as exc:
+            results[name] = {
+                "status": "error",
+                "error": str(exc),
+            }
     return results
 
 
@@ -338,11 +456,15 @@ def main():
             "down_proj_input_shape": list(payloads["down_proj"]["x"].shape),
             "down_proj_weight_shape": list(payloads["down_proj"]["weight"].shape),
             "down_proj_weight_is_contiguous": bool(payloads["down_proj"]["weight"].is_contiguous()),
+            "lm_head_input_shape": list(payloads["lm_head"]["x"].shape),
+            "lm_head_weight_shape": list(payloads["lm_head"]["weight"].shape),
+            "lm_head_weight_is_contiguous": bool(payloads["lm_head"]["weight"].is_contiguous()),
             "dtype": str(payloads["o_proj"]["x"].dtype),
             "device": str(payloads["o_proj"]["x"].device),
         },
         "o_proj_benchmarks": _run_benchmarks(payloads["o_proj"], warmup=args.warmup, iters=args.iters),
         "down_proj_benchmarks": _run_benchmarks(payloads["down_proj"], warmup=args.warmup, iters=args.iters),
+        "lm_head_benchmarks": _run_benchmarks(payloads["lm_head"], warmup=args.warmup, iters=args.iters),
     }
 
     output_path = Path(args.output)
@@ -351,12 +473,27 @@ def main():
 
     print("[LinearBench] o_proj")
     for name, info in output["o_proj_benchmarks"].items():
+        if info.get("status") != "ok":
+            print(f"  {name:<24} ERROR  {info.get('error', 'unknown error')}")
+            continue
         speedup = info.get("speedup_vs_ref")
         speedup_text = "-" if speedup is None else f"{speedup:.2f}x"
         print(f"  {name:<24} {info['time_ms']:.4f} ms  {speedup_text}")
 
     print("[LinearBench] down_proj")
     for name, info in output["down_proj_benchmarks"].items():
+        if info.get("status") != "ok":
+            print(f"  {name:<24} ERROR  {info.get('error', 'unknown error')}")
+            continue
+        speedup = info.get("speedup_vs_ref")
+        speedup_text = "-" if speedup is None else f"{speedup:.2f}x"
+        print(f"  {name:<24} {info['time_ms']:.4f} ms  {speedup_text}")
+
+    print("[LinearBench] lm_head")
+    for name, info in output["lm_head_benchmarks"].items():
+        if info.get("status") != "ok":
+            print(f"  {name:<24} ERROR  {info.get('error', 'unknown error')}")
+            continue
         speedup = info.get("speedup_vs_ref")
         speedup_text = "-" if speedup is None else f"{speedup:.2f}x"
         print(f"  {name:<24} {info['time_ms']:.4f} ms  {speedup_text}")

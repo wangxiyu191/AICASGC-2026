@@ -1,0 +1,186 @@
+{
+  "system_info": {
+    "python_version": "3.12.3",
+    "torch_version": "2.8.0+cu128",
+    "cuda_version": "12.8",
+    "cudnn_version": "91002",
+    "gpu_name": "NVIDIA A800 80GB PCIe",
+    "gpu_compute_capability": "8.0"
+  },
+  "metadata": {
+    "sample_idx": 0,
+    "layer_idx": 14,
+    "decode_step": 16,
+    "bucketed": true,
+    "prompt_length": 690,
+    "max_cache_len": 832,
+    "captured_decode_step": 16,
+    "o_proj_input_shape": [
+      1,
+      1,
+      2048
+    ],
+    "o_proj_weight_shape": [
+      2048,
+      2048
+    ],
+    "o_proj_weight_is_contiguous": true,
+    "down_proj_input_shape": [
+      1,
+      1,
+      6144
+    ],
+    "down_proj_weight_shape": [
+      2048,
+      6144
+    ],
+    "down_proj_weight_is_contiguous": true,
+    "lm_head_input_shape": [
+      1,
+      1,
+      2048
+    ],
+    "lm_head_weight_shape": [
+      151936,
+      2048
+    ],
+    "lm_head_weight_is_contiguous": true,
+    "dtype": "torch.float16",
+    "device": "cuda:0"
+  },
+  "o_proj_benchmarks": {
+    "f_linear": {
+      "time_ms": 0.014922171831130981,
+      "status": "ok"
+    },
+    "f_linear_contiguous_weight": {
+      "time_ms": 0.0144919753074646,
+      "status": "ok",
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "speedup_vs_ref": 1.029685154338125
+    },
+    "matmul_weight_t": {
+      "time_ms": 0.019350945949554443,
+      "status": "ok",
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "speedup_vs_ref": 0.7711339729867089
+    },
+    "triton_matvec": {
+      "time_ms": 0.04522070288658142,
+      "status": "ok",
+      "max_abs_diff": 0.00048828125,
+      "mean_abs_diff": 3.2782554626464844e-07,
+      "speedup_vs_ref": 0.3299854022295376
+    },
+    "triton_splitk4_matvec": {
+      "time_ms": 0.08141681551933289,
+      "status": "ok",
+      "max_abs_diff": 0.00048828125,
+      "mean_abs_diff": 3.2782554626464844e-07,
+      "speedup_vs_ref": 0.1832812022423995
+    },
+    "triton_splitk8_matvec": {
+      "time_ms": 0.08073821663856506,
+      "status": "ok",
+      "max_abs_diff": 0.00048828125,
+      "mean_abs_diff": 3.2782554626464844e-07,
+      "speedup_vs_ref": 0.18482166751257326
+    },
+    "triton_dot_matvec": {
+      "status": "error",
+      "error": "at 23:15:\n    BLOCK_K: tl.constexpr,\n):\n    pid = tl.program_id(0)\n    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)\n    acc = tl.zeros((BLOCK_M, 1), dtype=tl.float32)\n    for start_k in range(0, K, BLOCK_K):\n        offs_k = start_k + tl.arange(0, BLOCK_K)\n        x = tl.load(X + offs_k, mask=offs_k < K, other=0.0)\n        x = tl.reshape(x, (BLOCK_K, 1))\n        w_ptrs = W + offs_m[:, None] * stride_w_n + offs_k[None, :] * stride_w_k\n        w = tl.load(w_ptrs, mask=(offs_m[:, None] < N) & (offs_k[None, :] < K), other=0.0)\n        acc += tl.dot(w, x)\n               ^"
+    }
+  },
+  "down_proj_benchmarks": {
+    "f_linear": {
+      "time_ms": 0.0277666375041008,
+      "status": "ok"
+    },
+    "f_linear_contiguous_weight": {
+      "time_ms": 0.02758566290140152,
+      "status": "ok",
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "speedup_vs_ref": 1.0065604587189414
+    },
+    "matmul_weight_t": {
+      "time_ms": 0.027680732309818268,
+      "status": "ok",
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "speedup_vs_ref": 1.0031034292489458
+    },
+    "triton_matvec": {
+      "time_ms": 0.054100751876831055,
+      "status": "ok",
+      "max_abs_diff": 0.000244140625,
+      "mean_abs_diff": 3.246823325753212e-07,
+      "speedup_vs_ref": 0.513239401317674
+    },
+    "triton_splitk4_matvec": {
+      "time_ms": 0.09181637316942215,
+      "status": "ok",
+      "max_abs_diff": 0.000244140625,
+      "mean_abs_diff": 3.842869773507118e-07,
+      "speedup_vs_ref": 0.30241488032711794
+    },
+    "triton_splitk8_matvec": {
+      "time_ms": 0.0838233157992363,
+      "status": "ok",
+      "max_abs_diff": 0.000244140625,
+      "mean_abs_diff": 3.76836396753788e-07,
+      "speedup_vs_ref": 0.3312519582332459
+    },
+    "triton_dot_matvec": {
+      "status": "error",
+      "error": "at 23:15:\n    BLOCK_K: tl.constexpr,\n):\n    pid = tl.program_id(0)\n    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)\n    acc = tl.zeros((BLOCK_M, 1), dtype=tl.float32)\n    for start_k in range(0, K, BLOCK_K):\n        offs_k = start_k + tl.arange(0, BLOCK_K)\n        x = tl.load(X + offs_k, mask=offs_k < K, other=0.0)\n        x = tl.reshape(x, (BLOCK_K, 1))\n        w_ptrs = W + offs_m[:, None] * stride_w_n + offs_k[None, :] * stride_w_k\n        w = tl.load(w_ptrs, mask=(offs_m[:, None] < N) & (offs_k[None, :] < K), other=0.0)\n        acc += tl.dot(w, x)\n               ^"
+    }
+  },
+  "lm_head_benchmarks": {
+    "f_linear": {
+      "time_ms": 0.35940416157245636,
+      "status": "ok"
+    },
+    "f_linear_contiguous_weight": {
+      "time_ms": 0.359148271381855,
+      "status": "ok",
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "speedup_vs_ref": 1.0007124917784422
+    },
+    "matmul_weight_t": {
+      "time_ms": 0.3595130145549774,
+      "status": "ok",
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "speedup_vs_ref": 0.999697221023679
+    },
+    "triton_matvec": {
+      "time_ms": 0.3957245871424675,
+      "status": "ok",
+      "max_abs_diff": 0.015625,
+      "mean_abs_diff": 6.673795269307448e-06,
+      "speedup_vs_ref": 0.9082179203665827
+    },
+    "triton_splitk4_matvec": {
+      "time_ms": 0.374080128967762,
+      "status": "ok",
+      "max_abs_diff": 0.015625,
+      "mean_abs_diff": 6.779781870136503e-06,
+      "speedup_vs_ref": 0.9607678508992109
+    },
+    "triton_splitk8_matvec": {
+      "time_ms": 0.3825581446290016,
+      "status": "ok",
+      "max_abs_diff": 0.015625,
+      "mean_abs_diff": 6.591291366930818e-06,
+      "speedup_vs_ref": 0.9394759113572145
+    },
+    "triton_dot_matvec": {
+      "status": "error",
+      "error": "at 23:15:\n    BLOCK_K: tl.constexpr,\n):\n    pid = tl.program_id(0)\n    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)\n    acc = tl.zeros((BLOCK_M, 1), dtype=tl.float32)\n    for start_k in range(0, K, BLOCK_K):\n        offs_k = start_k + tl.arange(0, BLOCK_K)\n        x = tl.load(X + offs_k, mask=offs_k < K, other=0.0)\n        x = tl.reshape(x, (BLOCK_K, 1))\n        w_ptrs = W + offs_m[:, None] * stride_w_n + offs_k[None, :] * stride_w_k\n        w = tl.load(w_ptrs, mask=(offs_m[:, None] < N) & (offs_k[None, :] < K), other=0.0)\n        acc += tl.dot(w, x)\n               ^"
+    }
+  }
+}
