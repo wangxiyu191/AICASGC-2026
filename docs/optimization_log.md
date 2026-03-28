@@ -364,6 +364,83 @@ Step 9 (score 0.0820) 的根因是 EOS 检测失败——custom decode 不停止
 - TTFT 也小幅改善到 `60.74 ms`
 - `10/10` 输出与 `step18` 完全一致
 
+## Step 21-23: CUDAGraph fail-fast 语义与自定义 decode 兜底移除
+
+### 背景
+
+Step 20 之后 CUDAGraph 路径已稳定。为了在线上评测环境及早暴露问题（而非静默 fallback 导致性能退化而不自知），对错误处理逻辑做了收紧。
+
+### Step 21: ENABLE_CUDAGRAPH fail-fast
+
+将 `ENABLE_CUDAGRAPH=1` 的语义从"尽力而为"改为"硬要求"：请求若不支持 custom decode、未通过 `_should_use_cudagraph()`、`ENABLE_CUSTOM_DECODE=0`，或 runner setup/capture/replay/async 路径失败，均直接抛 `CudaGraphExecutionError`，不再静默 fallback。异常信息附带 Python/torch/CUDA/transformers/flash_attn 等版本和关键环境变量。
+
+### Step 22: 限定 fail-fast 作用域
+
+修正 step 21 过于激进的问题：仅对"GreedyDecodeEngine 支持且 `_should_use_cudagraph()` 为真"的请求要求必须走 graph。TTFT 的 `max_new_tokens=1` 和完整答案生成的 `max_new_tokens=1024` 不再误报。
+
+| 指标 | 值 | 结果文件 |
+|------|-----|----------|
+| TTFT | 60.90 ms | `results/result_cudagraph_failfast_check_10.json` |
+| Throughput | 102.52 tok/s | |
+| 样本数 | 10 | A800 |
+
+### Step 23: 移除 custom decode 的 HF fallback
+
+去掉 `ModelWrapper` 中 custom decode 失败后回退到 HF generate 的两处兜底逻辑。只要 `ENABLE_CUSTOM_DECODE=1` 且请求命中 custom decode，异常直接上抛。
+
+## Step 24: 线上 A800 评测
+
+2026-03-28 提交线上评测，包含 step 20-23 全部改动。
+
+| 指标 | Step 7 (旧提交) | Step 24 (本次) | 变化 |
+|------|-----------------|----------------|------|
+| Score | 0.4470 | **0.9576** | **+114%** |
+| Accuracy | 0.6933 | 0.6978 | +0.6% |
+| TTFT | 62.42 ms | 60.32 ms | -3.4% |
+| Throughput | 41.93 tok/s | **108.82 tok/s** | **+159%** |
+| 样本数 | 5000 | 5000 | A800 |
+
+排名从第 27 名提升至约第 8-9 名（基于 3/27 排名数据）。
+
+## Step 24 后 Trace 分析：CUDAGraph decode 瓶颈
+
+### 测试方法
+
+使用 viztracer (`log_torch=True`, CUPTI) 在 A800 上抓取 CUDAGraph decode 的 kernel 级 trace，通过 `analyze_traces.py` 分析。
+
+### Decode 阶段 (130 decode steps, 2 throughput 样本)
+
+**核心数据：每步 GPU kernel 10.15ms = 理论上限 ~99 tok/s**
+
+A800 HBM 带宽 ~2TB/s, FP16 权重 ~4GB → 理论极限 ~500 tok/s。当前带宽利用率约 20%。
+
+| 类别 | 时间/步 | 占比 | 内核数/步 | 说明 |
+|------|---------|------|-----------|------|
+| **Elementwise** | **4.29ms** | **42.2%** | ~500+ | Copy/Mul/SiLU/Fill/Cast 等微小 kernel |
+| GEMM | 2.28ms | 22.5% | ~60 | cublas tensor core GEMM (batch=1 仍选 GEMM tile) |
+| FlashAttn (mem_efficient) | 2.01ms | 19.8% | ~29 | SDPA→mem_efficient 后端, ~67us/次 |
+| GEMV | 1.01ms | 10.0% | ~57 | QKV fused + gate_up fused |
+| Reduction | 0.36ms | 3.5% | ~114 | RMSNorm variance |
+| Cat/Concat | 0.14ms | 1.4% | ~58 | |
+
+### Host 侧
+
+- `cudaGraphLaunch`: 3.23ms/步 (host dispatch graph replay)
+- `cudaEventSynchronize`: 6.0ms avg (async EOS 的阻塞等待)
+- CPU op time per step: 仅 2.14ms — **瓶颈已从 CPU 转移到 GPU**
+
+### 关键结论
+
+1. CUDAGraph 消除了 kernel launch 开销，但 graph 内部 **数百个微小 elementwise kernel 的 HBM roundtrip** 是新的主瓶颈
+2. 每步 500+ 个 elementwise kernel，每个 2-4us，独立读写 HBM → 带宽浪费严重
+3. FlashAttn mem_efficient 对 decode (query_len=1) 场景不是最优，有换用 FlashInfer decode kernel 的空间
+
+### 优化方向
+
+- **Elementwise 融合**: torch.compile 自动融合 或 手写 Triton fused kernel (residual+RMSNorm, SiLU*up)
+- **Decode attention**: FlashInfer decode-specific kernel
+- **GEMM→GEMV**: batch=1 专用 GEMV kernel
+
 ## 踩坑记录
 
 ### torch.compile + flash_attn_varlen 不兼容

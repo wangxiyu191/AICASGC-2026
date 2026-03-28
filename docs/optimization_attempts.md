@@ -244,22 +244,62 @@ RuntimeError: The size of tensor a (16) must match the size of tensor b (8)
 
 ---
 
-## 未尝试的方向
+## Phase 5: CUDAGraph 池化与预建 (Step 19-20)
+
+### CUDAGraph runner pool + bucket 复用
+
+之前每次 generate 都新建 StaticCache + capture graph，跨请求成本无法摊薄。改为按 `(device, bucket_max_cache_len)` 索引的 runner pool，每个 bucket 持有独立的 StaticCache + attention_mask + graph。
+
+**结果:** Throughput 77.84 → 95.68 tok/s (+22.9%)
+
+### 预建 32 个 CUDAGraph bucket
+
+在模型 `__init__` 时预建 64..2048 (step=64) 的 32 个 bucket graph，避免首次请求承担 capture 成本。
+
+**结果:** Throughput 95.68 → 102.51 tok/s (+7.1%)
+
+---
+
+## Phase 6: Fail-fast 语义收紧 (Step 21-23)
+
+移除所有 CUDAGraph 和 custom decode 的静默 fallback：
+- `ENABLE_CUDAGRAPH=1` 时 graph-eligible 请求必须走 graph，失败直接抛异常
+- `ENABLE_CUSTOM_DECODE=1` 时 custom decode 失败不再 fallback 到 HF generate
+- 异常信息附带完整环境诊断
+
+**意义:** 在线上评测环境及早暴露问题，避免静默回退导致性能退化而不自知。
+
+---
+
+## Step 24: 线上评测验证
+
+| 指标 | 旧提交 (Step 7) | 新提交 (Step 24) | 变化 |
+|------|-----------------|------------------|------|
+| Score | 0.4470 | **0.9576** | **+114%** |
+| Accuracy | 0.6933 | 0.6978 | +0.6% |
+| TTFT | 62.42 ms | 60.32 ms | -3.4% |
+| Throughput | 41.93 tok/s | **108.82 tok/s** | **+159%** |
+
+---
+
+## 未尝试的方向 (更新于 2026-03-28)
 
 ### 可能有效的优化
 
-1. **CUDA Graph 捕获 decode 阶段** - 固定 input shape，消除全部 kernel launch 开销
-2. **torch.compile + StaticCache** - 需解决动态 shape recompile 问题
-3. **消除模型内部 item()/is_nonzero 同步点** - 改善 TTFT
-4. **减少 dtype 转换开销** - RMSNorm float32 转换在 trace 中占比 17%
+1. **torch.compile 模型 forward 后再 CUDAGraph capture** - 让编译器自动融合 elementwise ops，减少 graph 内 HBM roundtrip
+2. **Triton fused residual+RMSNorm kernel** - decode 阶段 elementwise 占 42% GPU 时间，fusion 可大幅减少 HBM 访问
+3. **FlashInfer decode attention** - 替代 SDPA mem_efficient，单 token decode 专用
+4. **Vision encoder 优化** - TTFT 60ms → 42ms 还有空间（torch.compile 或 CUDAGraph 捕获 ViT）
+5. **batch=1 GEMV 专用 kernel** - cublas 对 M=1 选 GEMM tile 不够高效
 
 ### 已验证无效/收益有限的方向
 
 1. **仅优化 generate 循环** - 瓶颈在模型内部 forward
 2. **torch.compile 无脑用** - 动态 KV Cache shape 导致 recompile
-3. **StaticCache 简单套用** - 需要正确处理 cache_position
-4. **Triton RMSNorm/SwiGLU** - decode 小 tensor 下 launch 开销反超计算收益
+3. **StaticCache 简单套用** - 需要正确处理 cache_position（已在 custom decode 中解决）
+4. **Triton RMSNorm/SwiGLU (decode 小 tensor)** - launch 开销反超计算收益
 5. **flash_attention_2** - decode 阶段 CPU dispatch 开销导致吞吐量退化 ~40%
+6. **直接套用 sglang/vllm 后端** - 比赛规则不允许黑盒工具套用
 
 ---
 
@@ -287,18 +327,21 @@ eos_token_id = text_config.eos_token_id  # 151645
 
 ---
 
-## 性能数据汇总
+## 性能数据汇总 (更新于 2026-03-28)
 
 | Step | 优化内容 | TTFT (ms) | Throughput (tok/s) | 环境 | 备注 |
 |------|---------|-----------|-------------------|------|------|
 | 0 | Baseline FP16 | 133.13 | 37.22 | A10 | |
 | 1a | flash_attn_2 | 128.20 | 29.79 | A10 | throughput -20% |
 | 1c | sdpa | 121.35 | 37.57 | A10 | TTFT -9% |
-| 2 | 官方 A800 评测 (flash_attn_2) | 68.32 | 33.07 | A800 | Score 未知 |
-| 3 | torch.compile | 121.99 | 24.51 | A10 | recompile 导致退化 |
-| 5 | 自定义 decode loop | 151.11 | 25.29 | A10 | 模型内部 sync 瓶颈 |
-| 6 | P0: force sdpa | 123.99 | 35.03 | A10 | 修复 flash_attn 退化 |
-| 7 | A800 sdpa 验证 | 62.42 | 41.93 | A800 | Score 0.4470, Acc 0.6933 |
-| 8 | **fused QKV+gate_up** | 126.35 | 39.58 | A10 | **throughput +13%** |
+| 2 | 官方 A800 评测 (flash_attn_2) | 68.32 | 33.07 | A800 | |
+| 7 | A800 sdpa 验证 | 62.42 | 41.93 | A800 | Score 0.4470 |
+| 8 | fused QKV+gate_up | 126.35 | 39.58 | A10 | throughput +13% |
+| 12 | Triton prefill + native decode | 111.81 | 54.90 | A10 | |
+| 15 | CUDAGraph (A10) | 113.65 | 82.00 | A10 | |
+| 16 | CUDAGraph (A800) | 62.27 | 75.53 | A800 | |
+| 19 | Graph pool + bucket | 61.33 | 95.68 | A800 | |
+| 20 | Prebuild 32 buckets | 60.74 | 102.51 | A800 | |
+| **24** | **线上评测** | **60.32** | **108.82** | **A800** | **Score 0.9576** |
 
-**当前最优:** P0 (sdpa) + OptimizedDecoderLayer (fused QKV + gate_up)
+**当前最优:** SDPA + OptimizedDecoderLayer + Triton prefill/native decode + CUDAGraph pool + prebuild buckets
