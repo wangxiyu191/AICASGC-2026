@@ -8,6 +8,7 @@ Replaces HF's Qwen3VLTextDecoderLayer:
 - Triton fused RoPE: 5 kernels → 1 kernel per call (eliminates cat/neg/mul/add)
 - CUDA Graph-only small-shape Triton fusion: residual+RMSNorm and SiLU*up
 """
+from contextlib import contextmanager
 import os
 import torch
 import torch.nn as nn
@@ -96,22 +97,26 @@ class OptimizedDecoderLayer(nn.Module):
         hidden_shape_q = (*input_shape, self.num_heads, self.head_dim)
         hidden_shape_kv = (*input_shape, self.num_kv_heads, self.head_dim)
         prefer_small_decode_triton = self._prefer_small_decode_triton
+        enable_decode_nvtx = _should_enable_decode_nvtx(hidden_states, past_key_values)
 
         # 1. Input LayerNorm
         residual = hidden_states
-        hidden_states = _rms_norm(hidden_states, self.input_layernorm_weight, self.rms_norm_eps)
+        with _nvtx_range("decode.input_rmsnorm", enable_decode_nvtx):
+            hidden_states = _rms_norm(hidden_states, self.input_layernorm_weight, self.rms_norm_eps)
 
         # 2. Fused QKV (1 GEMM instead of 3)
-        qkv = F.linear(hidden_states, self.qkv_weight)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        with _nvtx_range("decode.qkv_proj", enable_decode_nvtx):
+            qkv = F.linear(hidden_states, self.qkv_weight)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # 3. QK-Norm + RoPE (before transpose — natural layout for cos/sin broadcast)
         cos, sin = position_embeddings
-        q = _rms_norm(q.view(hidden_shape_q), self.q_norm_weight, self.rms_norm_eps)
-        k = _rms_norm(k.view(hidden_shape_kv), self.k_norm_weight, self.rms_norm_eps)
-        q = _apply_rotary_emb(q, cos, sin).transpose(1, 2)
-        k = _apply_rotary_emb(k, cos, sin).transpose(1, 2)
-        v = v.view(hidden_shape_kv).transpose(1, 2)
+        with _nvtx_range("decode.qk_norm_rope", enable_decode_nvtx):
+            q = _rms_norm(q.view(hidden_shape_q), self.q_norm_weight, self.rms_norm_eps)
+            k = _rms_norm(k.view(hidden_shape_kv), self.k_norm_weight, self.rms_norm_eps)
+            q = _apply_rotary_emb(q, cos, sin).transpose(1, 2)
+            k = _apply_rotary_emb(k, cos, sin).transpose(1, 2)
+            v = v.view(hidden_shape_kv).transpose(1, 2)
 
         # 4. KV Cache
         if past_key_values is not None:
@@ -119,43 +124,73 @@ class OptimizedDecoderLayer(nn.Module):
                 "sin": sin.unsqueeze(1), "cos": cos.unsqueeze(1),
                 "cache_position": cache_position,
             }
-            k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
+            with _nvtx_range("decode.kv_cache_update", enable_decode_nvtx):
+                k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
 
         # 5. Attention (SDPA)
-        attn_output, _ = self._attention_interface(
-            self, q, k, v, attention_mask,
-            dropout=0.0, scaling=self.scaling, **kwargs,
-        )
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
+        with _nvtx_range("decode.attention", enable_decode_nvtx):
+            attn_output, _ = self._attention_interface(
+                self, q, k, v, attention_mask,
+                dropout=0.0, scaling=self.scaling, **kwargs,
+            )
+        with _nvtx_range("decode.o_proj", enable_decode_nvtx):
+            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+            attn_output = self.o_proj(attn_output)
 
         # 6. Residual + Post-attention LayerNorm
-        residual, hidden_states = _fused_add_rms_norm(
-            residual,
-            attn_output,
-            self.post_attn_layernorm_weight,
-            self.rms_norm_eps,
-            prefer_small_triton=prefer_small_decode_triton,
-        )
+        with _nvtx_range("decode.post_attn_add_rmsnorm", enable_decode_nvtx):
+            residual, hidden_states = _fused_add_rms_norm(
+                residual,
+                attn_output,
+                self.post_attn_layernorm_weight,
+                self.rms_norm_eps,
+                prefer_small_triton=prefer_small_decode_triton,
+            )
 
         # 7. Fused gate+up (1 GEMM instead of 2) + SiLU activation
-        gate_up = F.linear(hidden_states, self.gate_up_weight)
-        gate, up = gate_up.chunk(2, dim=-1)
-        hidden_states = _fused_silu_mul(
-            gate,
-            up,
-            prefer_small_triton=prefer_small_decode_triton,
-        )
-        hidden_states = self.down_proj(hidden_states)
+        with _nvtx_range("decode.gate_up_silu", enable_decode_nvtx):
+            gate_up = F.linear(hidden_states, self.gate_up_weight)
+            gate, up = gate_up.chunk(2, dim=-1)
+            hidden_states = _fused_silu_mul(
+                gate,
+                up,
+                prefer_small_triton=prefer_small_decode_triton,
+            )
+        with _nvtx_range("decode.down_proj", enable_decode_nvtx):
+            hidden_states = self.down_proj(hidden_states)
 
         # 8. Residual
-        hidden_states = residual + hidden_states
+        with _nvtx_range("decode.residual_add", enable_decode_nvtx):
+            hidden_states = residual + hidden_states
         return hidden_states
 
 
 _TRITON_ROWS_THRESHOLD = 32
 _ENABLE_TRITON_SMALL_ADD_RMSNORM = os.environ.get("ENABLE_TRITON_SMALL_ADD_RMSNORM", "1") == "1"
 _ENABLE_TRITON_SMALL_SILU_MUL = os.environ.get("ENABLE_TRITON_SMALL_SILU_MUL", "0") == "1"
+_ENABLE_DECODE_NVTX = os.environ.get("ENABLE_DECODE_NVTX", "0") == "1"
+
+
+@contextmanager
+def _nvtx_range(name: str, enabled: bool):
+    if enabled:
+        torch.cuda.nvtx.range_push(name)
+        try:
+            yield
+        finally:
+            torch.cuda.nvtx.range_pop()
+        return
+    yield
+
+
+def _should_enable_decode_nvtx(hidden_states: torch.Tensor, past_key_values) -> bool:
+    return (
+        _ENABLE_DECODE_NVTX
+        and hidden_states.is_cuda
+        and hidden_states.dim() >= 2
+        and hidden_states.shape[-2] == 1
+        and past_key_values is not None
+    )
 
 
 def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:

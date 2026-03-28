@@ -612,6 +612,7 @@ class GreedyDecodeEngine:
             "CUDAGRAPH_ASYNC_EOS_WINDOW",
             "CUDAGRAPH_BUCKET_SIZE",
             "CUDAGRAPH_PREBUILD_MAX_CACHE_LEN",
+            "ENABLE_DECODE_NVTX",
             "ENABLE_CUSTOM_DECODE",
             "ENABLE_VIZTRACE",
             "CUDA_VISIBLE_DEVICES",
