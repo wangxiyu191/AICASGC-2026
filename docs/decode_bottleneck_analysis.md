@@ -533,3 +533,67 @@ TTFT 目前的主要证据是 prefill GPU kernel `50.6ms/样本`，其中 `GEMM 
 3. **端到端吞吐提升足够大**
 
 因此它和 `small add+rmsnorm` 一样，已经足够进入默认配置。
+
+## 14. 继续补：decode input RMSNorm 的小 shape Triton
+
+在 `q_norm + k_norm + rope` 合掉之后，剩下最明确的 RMSNorm 热点其实就只剩每层开头那一个 input RMSNorm。
+
+### 实现
+
+在 [`optimized_layer.py`](../optimized_layer.py) 里补了：
+
+- `ENABLE_TRITON_SMALL_RMSNORM`
+- 只对 **decode 小 shape** 的 `_rms_norm(..., prefer_small_triton=True)` 生效
+- 当前实际只覆盖 layer 开头的 input RMSNorm
+
+独立微基准（`(1,1,2048)`）：
+
+- `F.rms_norm`: 约 `52.9us`
+- Triton small RMSNorm: 约 `32.1us`
+
+### 10 样本验证
+
+同轮对照：
+
+| 配置 | TTFT | Throughput |
+|------|------|------------|
+| 当前主线 | `162.73ms` | `75.10 tok/s` |
+| + `ENABLE_TRITON_SMALL_RMSNORM=1` | `110.04ms` | `79.01 tok/s` |
+
+- 吞吐约 `+5.2%`
+- 输出 **`10/10 exact match`**
+
+这里 TTFT 波动偏大，因此不把这组 `10` 样本的 TTFT 数值本身当强结论，更主要看 throughput 和 trace。
+
+### Trace 结论
+
+trace 在：
+
+- [`traces/compare/triton_small_rmsnorm`](../traces/compare/triton_small_rmsnorm)
+
+相对上一阶段的 `triton_qk_norm_rope`：
+
+| 指标 | qk+rope 后 | 再开 small RMSNorm | 变化 |
+|------|------------|--------------------|------|
+| steady-state decode GPU/步 | `6.34ms` | `5.84ms` | **`-7.9%`** |
+| Elementwise | `1.77ms` | `1.28ms` | **`-27.7%`** |
+| Reduction | `0.10ms` | `0.01ms` | **`-90%`** |
+| FlashAttn | `1.33ms` | `1.34ms` | 持平 |
+| GEMV | `1.03ms` | `1.02ms` | 持平 |
+
+steady-state 结构估算里：
+
+- `fragmented Copy/Mul/misc` 进一步从 `1.84ms/步` 压到 `1.42ms/步`
+- `input/qk norm + rope` 只剩 `0.017ms/步`
+
+这说明 input RMSNorm 这条虽然不是像 `qk+rope` 那样的大块收益，但它确实把剩余的 `Reduction + Elementwise` 又往下压了一截。
+
+### 当前判断
+
+这条优化的收益比 `qk+rope` 小，但满足：
+
+- 数值对齐
+- trace 收益明确
+- `10` 样本输出稳定
+
+因此也可以先作为默认配置保留，后面如果更大样本出现回退，再单独回滚。

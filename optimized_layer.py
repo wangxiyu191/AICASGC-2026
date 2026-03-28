@@ -102,7 +102,12 @@ class OptimizedDecoderLayer(nn.Module):
         # 1. Input LayerNorm
         residual = hidden_states
         with _nvtx_range("decode.input_rmsnorm", enable_decode_nvtx):
-            hidden_states = _rms_norm(hidden_states, self.input_layernorm_weight, self.rms_norm_eps)
+            hidden_states = _rms_norm(
+                hidden_states,
+                self.input_layernorm_weight,
+                self.rms_norm_eps,
+                prefer_small_triton=prefer_small_decode_triton,
+            )
 
         # 2. Fused QKV (1 GEMM instead of 3)
         with _nvtx_range("decode.qkv_proj", enable_decode_nvtx):
@@ -178,6 +183,7 @@ class OptimizedDecoderLayer(nn.Module):
 
 
 _TRITON_ROWS_THRESHOLD = 32
+_ENABLE_TRITON_SMALL_RMSNORM = os.environ.get("ENABLE_TRITON_SMALL_RMSNORM", "1") == "1"
 _ENABLE_TRITON_SMALL_ADD_RMSNORM = os.environ.get("ENABLE_TRITON_SMALL_ADD_RMSNORM", "1") == "1"
 _ENABLE_TRITON_SMALL_SILU_MUL = os.environ.get("ENABLE_TRITON_SMALL_SILU_MUL", "0") == "1"
 _ENABLE_TRITON_SMALL_QK_NORM_ROPE = os.environ.get("ENABLE_TRITON_SMALL_QK_NORM_ROPE", "1") == "1"
@@ -208,11 +214,26 @@ def _should_enable_decode_nvtx(hidden_states: torch.Tensor, past_key_values) -> 
     )
 
 
-def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+def _rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    prefer_small_triton: bool = False,
+) -> torch.Tensor:
     """RMSNorm: Triton for prefill (large M), F.rms_norm for decode (small M)."""
     N = x.shape[-1]
     M = x.numel() // N
-    if M <= _TRITON_ROWS_THRESHOLD:
+    if (
+        M <= _TRITON_ROWS_THRESHOLD
+        and (
+            (not prefer_small_triton)
+            or (not _ENABLE_TRITON_SMALL_RMSNORM)
+            or x.device.type != "cuda"
+            or weight.device.type != "cuda"
+            or x.stride(-1) != 1
+            or weight.stride(-1) != 1
+        )
+    ):
         return F.rms_norm(x, (N,), weight, eps)
     orig_shape = x.shape
     x_2d = x.contiguous().reshape(M, N)
