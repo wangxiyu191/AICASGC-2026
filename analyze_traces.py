@@ -22,6 +22,9 @@ NUM_DECODER_LAYERS = 28
 
 def simplify_kernel_name(name):
     """Shorten verbose CUDA kernel names for readability."""
+    if 'small_decode_attention' in name.lower():
+        return '[Attention] _small_decode_attention_fwd_kernel'
+
     # Flash attention kernels
     if 'flash' in name.lower() or 'fmha' in name.lower():
         if 'fwd' in name.lower():
@@ -96,6 +99,8 @@ def simplify_kernel_name(name):
 def categorize_gpu_kernel(name):
     """Categorize a GPU kernel into a high-level group."""
     nl = name.lower()
+    if 'small_decode_attention' in nl:
+        return 'Attention'
     if 'flash' in nl or 'fmha' in nl:
         return 'FlashAttn'
     if 'gemv' in nl:
@@ -749,7 +754,9 @@ def analyze_steady_state_decode(all_stats):
     for name, info in sorted(delta_kernel_ops.items(), key=lambda x: x[1]['total_dur'], reverse=True)[:18]:
         print(f"  {info['total_dur']/steady_steps/1000:<10.4f} {info['count']/steady_steps:<12.2f} {name}")
 
-    flash = _pick_op(delta_kernel_ops, ('[FlashAttn]',), NUM_DECODER_LAYERS, steady_steps)
+    attention_kernel = _pick_op(delta_kernel_ops, ('[Attention]',), NUM_DECODER_LAYERS, steady_steps)
+    if attention_kernel is None:
+        attention_kernel = _pick_op(delta_kernel_ops, ('[FlashAttn]',), NUM_DECODER_LAYERS, steady_steps)
     fused_post = _pick_op(delta_kernel_ops, ('_fused_add_rms_norm_fwd_kernel',), NUM_DECODER_LAYERS, steady_steps)
     gemm_big = _pick_op(
         delta_kernel_ops,
@@ -787,8 +794,11 @@ def analyze_steady_state_decode(all_stats):
         _print_stage("qkv_proj", gemm_small[1]['total_dur'] / steady_steps / 1000, "count≈28/layer, likely smaller fused linear")
     if gemm_big:
         _print_stage("gate_up_proj", gemm_big[1]['total_dur'] / steady_steps / 1000, "count≈28/layer, likely larger fused linear")
-    if flash:
-        _print_stage("attention", flash[1]['total_dur'] / steady_steps / 1000, "FlashAttn kernel count≈28/layer")
+    if attention_kernel:
+        basis = "decode attention kernel count≈28/layer"
+        if '[FlashAttn]' in attention_kernel[0]:
+            basis = "FlashAttn kernel count≈28/layer"
+        _print_stage("attention", attention_kernel[1]['total_dur'] / steady_steps / 1000, basis)
     if gemv_both:
         total_ms = gemv_both[1]['total_dur'] / steady_steps / 1000
         _print_stage("o_proj+down_proj", total_ms, "GEMV count≈56/step = 2 per layer")
@@ -806,7 +816,7 @@ def analyze_steady_state_decode(all_stats):
         _print_stage("lm_head", lm_head[1]['total_dur'] / steady_steps / 1000, "count≈1/step large vocab projection", per_layer=False)
 
     known_ms = 0.0
-    for picked in (gemm_small, gemm_big, flash, gemv_both, fused_post, silu, lm_head):
+    for picked in (gemm_small, gemm_big, attention_kernel, gemv_both, fused_post, silu, lm_head):
         if picked:
             known_ms += picked[1]['total_dur'] / steady_steps / 1000
     known_ms += reduction_ms + cat_ms

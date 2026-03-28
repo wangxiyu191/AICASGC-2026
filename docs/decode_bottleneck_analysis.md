@@ -127,6 +127,39 @@ CUDAGraph capture (如 bucket 未预建)
    - trace 也说明它只能吃掉很小一部分 `Mul`
    - 后续除非顺手并入更大 MLP fusion，否则单独继续挖意义不大
 
+### 3.3 新增实验：decode attention 直接去掉 `repeat_kv` 物化
+
+在当前默认配置基础上，又补了一条更直接的 attention 小路径：
+
+- 条件：`batch=1`、`q_len=1`、decode + CUDAGraph 小路径
+- 做法：不再走 HF `sdpa_attention_forward()` 里的 `repeat_kv(key/value)`，改为 Triton single-token streaming softmax
+- 输入：直接消费现成的 4D bool causal mask，因此不会破坏当前 `StaticCache(max_cache_len)` 的图捕获形状
+
+这一版的核心不是让 attention kernel 本体更快，而是**把 attention 前后的 K/V 展开 copy 直接删掉**。
+
+同环境对照：
+
+| 对比项 | baseline | Triton decode attention | 变化 |
+|--------|----------|-------------------------|------|
+| 10 样本 benchmark | 62.29 ms / 132.71 tok/s | 62.06 ms / 133.91 tok/s | throughput +0.9% |
+| 10 样本答案一致性 | - | exact match 10/10 | 无精度问题 |
+| steady decode GPU/步 | 6.04 ms | 5.40 ms | **-10.6%** |
+| `[Elementwise] Copy` | 0.763 ms/步 | 0.216 ms/步 | **-71.7%** |
+| `[Elementwise] Cast/Copy` | 0.121 ms/步 | 0.010 ms/步 | **-92.1%** |
+| `cudaLaunchKernel` | 51/步 | 44/步 | -7/步 |
+
+对应 trace：
+
+- baseline: [traces/compare/triton_decode_attention_baseline](../traces/compare/triton_decode_attention_baseline)
+- experiment: [traces/compare/triton_decode_attention](../traces/compare/triton_decode_attention)
+
+结论：
+
+- `Copy / Cast / Fill` 的一大块，确实来自 decode attention 路径里 `repeat_kv` 触发的 K/V 物化
+- 新 Triton attention kernel 自身时间约 `1.62 ms/步`，比原来的 FlashAttention decode kernel (`1.38 ms/步`) 略慢
+- 但它换来了更少的物化 copy，净效果仍是 decode GPU/步下降约 `0.64 ms`
+- 目前整机 benchmark 提升只有 `~0.9%`，说明**新的主限制已经更多落到 host event sync 和剩余 GEMM/GEMV 上**，而不是 attention copy
+
 ## 4. 带宽利用率估算
 
 - A800 HBM 带宽: ~2039 GB/s

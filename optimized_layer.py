@@ -146,10 +146,20 @@ class OptimizedDecoderLayer(nn.Module):
 
         # 5. Attention (SDPA)
         with _nvtx_range("decode.attention", enable_decode_nvtx):
-            attn_output, _ = self._attention_interface(
-                self, q, k, v, attention_mask,
-                dropout=0.0, scaling=self.scaling, **kwargs,
+            attn_output = _small_decode_attention(
+                q,
+                k,
+                v,
+                attention_mask,
+                self.scaling,
+                self.num_key_value_groups,
+                prefer_small_triton=prefer_small_decode_triton,
             )
+            if attn_output is None:
+                attn_output, _ = self._attention_interface(
+                    self, q, k, v, attention_mask,
+                    dropout=0.0, scaling=self.scaling, **kwargs,
+                )
         with _nvtx_range("decode.o_proj", enable_decode_nvtx):
             attn_output = attn_output.reshape(*input_shape, -1).contiguous()
             attn_output = self.o_proj(attn_output)
@@ -187,6 +197,7 @@ _ENABLE_TRITON_SMALL_RMSNORM = os.environ.get("ENABLE_TRITON_SMALL_RMSNORM", "1"
 _ENABLE_TRITON_SMALL_ADD_RMSNORM = os.environ.get("ENABLE_TRITON_SMALL_ADD_RMSNORM", "1") == "1"
 _ENABLE_TRITON_SMALL_SILU_MUL = os.environ.get("ENABLE_TRITON_SMALL_SILU_MUL", "0") == "1"
 _ENABLE_TRITON_SMALL_QK_NORM_ROPE = os.environ.get("ENABLE_TRITON_SMALL_QK_NORM_ROPE", "1") == "1"
+_ENABLE_TRITON_SMALL_DECODE_ATTENTION = os.environ.get("ENABLE_TRITON_SMALL_DECODE_ATTENTION", "1") == "1"
 _ENABLE_DECODE_NVTX = os.environ.get("ENABLE_DECODE_NVTX", "0") == "1"
 
 
@@ -376,6 +387,74 @@ def _fused_silu_mul(
     return out_flat.view_as(gate)
 
 
+def _small_decode_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    scaling: float,
+    num_key_value_groups: int,
+    prefer_small_triton: bool = False,
+) -> torch.Tensor | None:
+    """Single-token decode attention without repeat_kv copies."""
+    if (
+        (not prefer_small_triton)
+        or (not _ENABLE_TRITON_SMALL_DECODE_ATTENTION)
+        or attention_mask is None
+        or q.device.type != "cuda"
+        or k.device.type != "cuda"
+        or v.device.type != "cuda"
+        or q.ndim != 4
+        or k.ndim != 4
+        or v.ndim != 4
+        or q.shape[0] != 1
+        or q.shape[2] != 1
+        or q.shape[1] % k.shape[1] != 0
+        or num_key_value_groups != (q.shape[1] // k.shape[1])
+        or attention_mask.ndim != 4
+        or attention_mask.dtype != torch.bool
+        or attention_mask.shape[0] != 1
+        or attention_mask.shape[2] != 1
+        or attention_mask.shape[3] != k.shape[2]
+        or q.shape[-1] != k.shape[-1]
+        or q.shape[-1] != v.shape[-1]
+        or q.stride(-1) != 1
+        or k.stride(-1) != 1
+        or v.stride(-1) != 1
+    ):
+        return None
+
+    seq_len = k.shape[2]
+    head_dim = q.shape[-1]
+    block_n = 64 if seq_len <= 1024 else 128
+    out = torch.empty((1, q.shape[1], head_dim), dtype=q.dtype, device=q.device)
+    mask_1d = attention_mask[0, 0, 0]
+    _small_decode_attention_fwd_kernel[(q.shape[1],)](
+        q,
+        k,
+        v,
+        mask_1d,
+        out,
+        q.stride(0),
+        q.stride(1),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        out.stride(0),
+        out.stride(1),
+        q.shape[1],
+        num_key_value_groups,
+        scaling,
+        HEAD_DIM=head_dim,
+        SEQ_LEN=seq_len,
+        BLOCK_N=block_n,
+    )
+    return out.unsqueeze(2).transpose(1, 2)
+
+
 @triton.jit
 def _rms_norm_fwd_kernel(
     X, Y, W,
@@ -493,6 +572,65 @@ def _fused_silu_mul_fwd_kernel(
     up = tl.load(UP + offsets, mask=mask, other=0.0).to(tl.float32)
     silu = gate / (1.0 + tl.exp(-gate))
     tl.store(OUT + offsets, (silu * up).to(OUT.dtype.element_ty), mask=mask)
+
+
+@triton.jit
+def _small_decode_attention_fwd_kernel(
+    Q,
+    K,
+    V,
+    MASK,
+    OUT,
+    stride_q_b,
+    stride_q_h,
+    stride_k_b,
+    stride_k_h,
+    stride_k_s,
+    stride_v_b,
+    stride_v_h,
+    stride_v_s,
+    stride_out_b,
+    stride_out_h,
+    num_heads,
+    num_key_value_groups,
+    scale,
+    HEAD_DIM: tl.constexpr,
+    SEQ_LEN: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Streaming softmax attention for q_len=1 decode without GQA materialization."""
+    head_idx = tl.program_id(0)
+    kv_head_idx = head_idx // num_key_value_groups
+    offs_d = tl.arange(0, HEAD_DIM)
+    q = tl.load(Q + head_idx * stride_q_h + offs_d, mask=offs_d < HEAD_DIM, other=0.0).to(tl.float32)
+
+    m_i = -float("inf")
+    l_i = 0.0
+    acc = tl.zeros((HEAD_DIM,), dtype=tl.float32)
+
+    for start_n in range(0, SEQ_LEN, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        token_mask = offs_n < SEQ_LEN
+        valid_mask = tl.load(MASK + offs_n, mask=token_mask, other=0)
+        valid_mask = valid_mask != 0
+
+        k_ptrs = K + kv_head_idx * stride_k_h + offs_n[:, None] * stride_k_s + offs_d[None, :]
+        k = tl.load(k_ptrs, mask=token_mask[:, None], other=0.0).to(tl.float32)
+        qk = tl.sum(k * q[None, :], axis=1) * scale
+        qk = tl.where(valid_mask, qk, -float("inf"))
+
+        m_ij = tl.maximum(m_i, tl.max(qk, axis=0))
+        p = tl.exp(qk - m_ij)
+        alpha = tl.exp(m_i - m_ij)
+
+        v_ptrs = V + kv_head_idx * stride_v_h + offs_n[:, None] * stride_v_s + offs_d[None, :]
+        v = tl.load(v_ptrs, mask=token_mask[:, None], other=0.0).to(tl.float32)
+        acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
+        l_i = l_i * alpha + tl.sum(p, axis=0)
+        m_i = m_ij
+
+    acc = acc / l_i
+    tl.store(OUT + head_idx * stride_out_h + offs_d, acc.to(OUT.dtype.element_ty), mask=offs_d < HEAD_DIM)
 
 
 def _apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
