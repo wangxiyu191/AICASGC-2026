@@ -317,6 +317,21 @@ def _triton_grouped_cachepos_prefix(q, k, v, attention_mask, scaling, num_key_va
     return out
 
 
+def _triton_grouped_cachepos_prefix_dot(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position):
+    out = optimized_layer._small_decode_attention_grouped_prefix_cachepos_dot(
+        q,
+        k,
+        v,
+        scaling,
+        num_key_value_groups,
+        cache_position,
+        prefer_small_triton=True,
+    )
+    if out is None:
+        raise RuntimeError("Grouped cache-position dot Triton decode attention returned None for captured tensors")
+    return out
+
+
 def _triton_current(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position):
     out = optimized_layer._small_decode_attention(
         q,
@@ -371,6 +386,7 @@ def _run_benchmarks(payload, warmup: int, iters: int):
         "triton_per_q_head": lambda q, k, v, attention_mask, scaling, num_key_value_groups, _cache_position: _triton_per_q_head(q, k, v, attention_mask, scaling, num_key_value_groups),
         "triton_grouped_gqa": lambda q, k, v, attention_mask, scaling, num_key_value_groups, _cache_position: _triton_grouped_gqa(q, k, v, attention_mask, scaling, num_key_value_groups),
         "triton_grouped_cachepos_prefix": _triton_grouped_cachepos_prefix,
+        "triton_grouped_cachepos_prefix_dot": _triton_grouped_cachepos_prefix_dot,
         "triton_current": _triton_current,
         "sdpa_enable_gqa_mask": lambda q, k, v, attention_mask, scaling, num_key_value_groups, _cache_position: _sdpa_gqa_mask(q, k, v, attention_mask, scaling, num_key_value_groups),
         "sdpa_enable_gqa_valid_prefix": lambda q, k, v, attention_mask, scaling, num_key_value_groups, _cache_position: _sdpa_gqa_valid_only(q, k, v, attention_mask, scaling, num_key_value_groups),

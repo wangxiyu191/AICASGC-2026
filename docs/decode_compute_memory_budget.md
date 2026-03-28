@@ -172,25 +172,25 @@ ideal_time = max(FLOPs / 312 TFLOP/s, bytes / 2039 GB/s)
 - 线性层按权重读取主导估算
 - attention 按 `L=768`、只取 K/V 读取这个主项估算
 - 小算子（RMSNorm / RoPE / SiLU）按 activation bytes 粗估，它们的“倍率”很容易很夸张，但绝对值通常很小
-- 实测列来自最新 trace [traces/compare/triton_decode_attention_launch_tuned](../traces/compare/triton_decode_attention_launch_tuned) 的 steady-state decode 分解
+- 实测列来自最新 trace [traces/compare/triton_decode_attention_dot](../traces/compare/triton_decode_attention_dot) 的 steady-state decode 分解
 
 | 算子 | 理想带宽时间 | 理想算力时间 | A800 理想下限 | 最新实测 | 实测/理想 |
 |------|--------------|--------------|---------------|----------|-----------|
 | qkv_proj / layer | 8.23 us | 0.05 us | **8.23 us** | 14.7 us | 1.8x |
-| gate_up_proj / layer | 24.68 us | 0.16 us | **24.68 us** | 34.8 us | 1.4x |
-| o_proj / layer | 4.11 us | 0.03 us | **4.11 us** | 9.3 us | 2.3x |
-| down_proj / layer | 12.34 us | 0.08 us | **12.34 us** | 27.9 us | 2.3x |
-| attention(KV) / layer, `L=768` | 3.09 us | 0.02 us | **3.09 us** | 35.9 us | 11.6x |
+| gate_up_proj / layer | 24.68 us | 0.16 us | **24.68 us** | 34.9 us | 1.4x |
+| o_proj / layer | 4.11 us | 0.03 us | **4.11 us** | 9.4 us | 2.3x |
+| down_proj / layer | 12.34 us | 0.08 us | **12.34 us** | 28.3 us | 2.3x |
+| attention(KV) / layer, `L=768` | 3.09 us | 0.02 us | **3.09 us** | 23.9 us | 7.7x |
 | input+qk_norm+rope / layer | 0.034 us | ~0 | **0.034 us** | 0.62 us | 18.2x |
-| post_attn_add_rmsnorm / layer | 0.010 us | ~0 | **0.010 us** | 2.5 us | 251.8x |
+| post_attn_add_rmsnorm / layer | 0.010 us | ~0 | **0.010 us** | 2.5 us | 253.6x |
 | SiLU / layer | 0.012 us | ~0 | **0.012 us** | 2.5 us | 207.4x |
-| lm_head / token | 305.21 us | 2.00 us | **305.21 us** | 356.3 us | 1.2x |
+| lm_head / token | 305.21 us | 2.00 us | **305.21 us** | 356.7 us | 1.2x |
 
 把这些主项加总后：
 
 - **A800 理想下限约 `1.78 ms / token`**
-- **最新 steady-state trace 实测约 `4.32 ms / token`**
-- 也就是相对这些主项的 roofline 下限，**还有约 `2.4x` 空间**
+- **最新 steady-state trace 实测约 `4.02 ms / token`**
+- 也就是相对这些主项的 roofline 下限，**还有约 `2.3x` 空间**
 
 这个 `1.78 ms` 和上面的 token 级总下限 `1.77 ms` 基本一致，说明这张分解表和整体预算是对齐的。
 
@@ -200,9 +200,9 @@ ideal_time = max(FLOPs / 312 TFLOP/s, bytes / 2039 GB/s)
 
 | 算子 | 实测 - 理想 |
 |------|-------------|
-| attention / 28 layers | **~0.92 ms / token** |
-| down_proj / 28 layers | **~0.43 ms / token** |
-| gate_up_proj / 28 layers | **~0.28 ms / token** |
+| attention / 28 layers | **~0.58 ms / token** |
+| down_proj / 28 layers | **~0.45 ms / token** |
+| gate_up_proj / 28 layers | **~0.29 ms / token** |
 | qkv_proj / 28 layers | **~0.19 ms / token** |
 | o_proj / 28 layers | **~0.14 ms / token** |
 | lm_head | **~0.06 ms / token** |
@@ -210,7 +210,7 @@ ideal_time = max(FLOPs / 312 TFLOP/s, bytes / 2039 GB/s)
 可以直接得到两个判断：
 
 1. **attention 仍然是离理论下限最远的主力项**
-   - 即便已经做了 grouped-GQA、`cache_position` prefix-specialization 和 launch tuning，当前 decode attention 仍比 “只按 KV 读” 的理想下限高约 `11.6x`
+   - 即便已经做了 grouped-GQA、`cache_position` prefix-specialization、launch tuning 和 dot-style block kernel，当前 decode attention 仍比 “只按 KV 读” 的理想下限高约 `7.7x`
    - 这说明 attention 这部分并不是“没优化到”，而是**离 roofline 还非常远**
 
 2. **大线性层已经相对接近带宽下限**
@@ -219,21 +219,21 @@ ideal_time = max(FLOPs / 312 TFLOP/s, bytes / 2039 GB/s)
 
 所以如果只看“离极限还差多少”，**attention kernel 本体** 其实是最新默认路径里最值得继续压的一段。
 
-当前已经验证的最新本地实验（decode attention launch-tuned fast path 开启）：
+当前已经验证的最新本地实验（decode attention dot-style fast path 开启）：
 
-- `10` 样本 benchmark：`62.89 ms / 174.08 tok/s`
-- latest steady-state trace：`4.66 ms / step`，约对应 `193 tok/s` 的 GPU-only 上限
+- `10` 样本 benchmark：`63.56 ms / 183.05 tok/s`
+- latest steady-state trace：`4.35 ms / step`，约对应 `204 tok/s` 的 GPU-only 上限
 
 因此当前有效带宽利用率大致为：
 
 ```text
-174 / 564 ≈ 30.9%
+183 / 564 ≈ 32.5%
 ```
 
 如果只看 GPU steady-state 上限，则大致为：
 
 ```text
-193 / 564 ≈ 34.2%
+204 / 564 ≈ 36.2%
 ```
 
 也就是说，当前和理论上限之间仍然还有约 `2.9x ~ 3.2x` 空间。
@@ -244,15 +244,15 @@ ideal_time = max(FLOPs / 312 TFLOP/s, bytes / 2039 GB/s)
 
 理论上限不是问题，现实问题在于 **HBM roundtrip 浪费**。
 
-latest trace（`triton_decode_attention_launch_tuned`）显示：
+latest trace（`triton_decode_attention_dot`）显示：
 
 | 类别 | decode GPU/步 | 占比 |
 |------|---------------|------|
-| GEMM | 1.74ms | 37.4% |
-| GEMV | 1.04ms | 22.4% |
-| Attention | 1.01ms | 21.6% |
-| Elementwise | 0.57ms | 12.3% |
-| Norm | 0.28ms | 5.9% |
+| GEMM | 1.75ms | 40.2% |
+| GEMV | 1.06ms | 24.3% |
+| Attention | 0.67ms | 15.4% |
+| Elementwise | 0.57ms | 13.2% |
+| Norm | 0.28ms | 6.4% |
 
 主热点不是“大矩阵乘本身算不动”，而是：
 

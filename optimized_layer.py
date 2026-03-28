@@ -199,6 +199,7 @@ _ENABLE_TRITON_SMALL_ADD_RMSNORM = os.environ.get("ENABLE_TRITON_SMALL_ADD_RMSNO
 _ENABLE_TRITON_SMALL_SILU_MUL = os.environ.get("ENABLE_TRITON_SMALL_SILU_MUL", "0") == "1"
 _ENABLE_TRITON_SMALL_QK_NORM_ROPE = os.environ.get("ENABLE_TRITON_SMALL_QK_NORM_ROPE", "1") == "1"
 _ENABLE_TRITON_SMALL_DECODE_ATTENTION = os.environ.get("ENABLE_TRITON_SMALL_DECODE_ATTENTION", "1") == "1"
+_ENABLE_TRITON_SMALL_DECODE_ATTENTION_DOT = os.environ.get("ENABLE_TRITON_SMALL_DECODE_ATTENTION_DOT", "1") == "1"
 _ENABLE_DECODE_NVTX = os.environ.get("ENABLE_DECODE_NVTX", "0") == "1"
 
 
@@ -409,6 +410,18 @@ def _small_decode_attention(
     ):
         return None
 
+    if _ENABLE_TRITON_SMALL_DECODE_ATTENTION_DOT:
+        out = _small_decode_attention_grouped_prefix_cachepos_dot(
+            q,
+            k,
+            v,
+            scaling,
+            num_key_value_groups,
+            cache_position,
+            prefer_small_triton=prefer_small_triton,
+        )
+        if out is not None:
+            return out
     out = _small_decode_attention_grouped_prefix_cachepos(
         q,
         k,
@@ -613,6 +626,68 @@ def _small_decode_attention_grouped_prefix_cachepos(
     block_n, num_warps, num_stages = _small_decode_attention_grouped_prefix_cachepos_launch_config(seq_len)
     out = torch.empty((1, q.shape[1], head_dim), dtype=q.dtype, device=q.device)
     _small_decode_attention_grouped_prefix_cachepos_fwd_kernel[(k.shape[1],)](
+        q,
+        k,
+        v,
+        cache_position,
+        out,
+        q.stride(0),
+        q.stride(1),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        out.stride(0),
+        out.stride(1),
+        scaling,
+        HEAD_DIM=head_dim,
+        MAX_SEQ_LEN=seq_len,
+        BLOCK_N=block_n,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return out.unsqueeze(2).transpose(1, 2)
+
+
+def _small_decode_attention_grouped_prefix_cachepos_dot(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scaling: float,
+    num_key_value_groups: int,
+    cache_position: torch.Tensor | None,
+    prefer_small_triton: bool = False,
+) -> torch.Tensor | None:
+    """Experimental grouped decode attention using tl.dot for qk / pv blocks."""
+    if (
+        not prefer_small_triton
+        or not _ENABLE_TRITON_SMALL_DECODE_ATTENTION
+        or cache_position is None
+        or cache_position.device.type != "cuda"
+        or cache_position.ndim != 1
+        or cache_position.numel() != 1
+        or num_key_value_groups != 2
+    ):
+        return None
+    if (
+        q.device.type != "cuda"
+        or k.device.type != "cuda"
+        or v.device.type != "cuda"
+        or q.shape[0] != 1
+        or q.shape[2] != 1
+        or q.stride(-1) != 1
+        or k.stride(-1) != 1
+        or v.stride(-1) != 1
+    ):
+        return None
+
+    seq_len = k.shape[2]
+    head_dim = q.shape[-1]
+    block_n, num_warps, num_stages = _small_decode_attention_grouped_prefix_cachepos_launch_config(seq_len)
+    out = torch.empty((1, q.shape[1], head_dim), dtype=q.dtype, device=q.device)
+    _small_decode_attention_grouped_prefix_cachepos_dot_fwd_kernel[(k.shape[1],)](
         q,
         k,
         v,
@@ -968,6 +1043,71 @@ def _small_decode_attention_grouped_prefix_cachepos_fwd_kernel(
     acc1 = acc1 / l1
     tl.store(OUT + q_head_idx0 * stride_out_h + offs_d, acc0.to(OUT.dtype.element_ty), mask=offs_d < HEAD_DIM)
     tl.store(OUT + q_head_idx1 * stride_out_h + offs_d, acc1.to(OUT.dtype.element_ty), mask=offs_d < HEAD_DIM)
+
+
+@triton.jit
+def _small_decode_attention_grouped_prefix_cachepos_dot_fwd_kernel(
+    Q,
+    K,
+    V,
+    CACHE_POSITION,
+    OUT,
+    stride_q_b,
+    stride_q_h,
+    stride_k_b,
+    stride_k_h,
+    stride_k_s,
+    stride_v_b,
+    stride_v_h,
+    stride_v_s,
+    stride_out_b,
+    stride_out_h,
+    scale,
+    HEAD_DIM: tl.constexpr,
+    MAX_SEQ_LEN: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Experimental grouped decode attention using matrix-style dot blocks."""
+    kv_head_idx = tl.program_id(0)
+    offs_d = tl.arange(0, HEAD_DIM)
+    offs_h = tl.arange(0, 16)
+    mask_h = offs_h < 2
+    valid_len = tl.load(CACHE_POSITION).to(tl.int32) + 1
+    valid_len = tl.minimum(valid_len, MAX_SEQ_LEN)
+    q_head_idx = kv_head_idx * 2 + tl.minimum(offs_h, 1)
+
+    q_ptrs = Q + q_head_idx[:, None] * stride_q_h + offs_d[None, :]
+    q = tl.load(q_ptrs, mask=mask_h[:, None] & (offs_d[None, :] < HEAD_DIM), other=0.0)
+
+    e_max = tl.zeros((16,), dtype=tl.float32)
+    e_sum = tl.zeros((16,), dtype=tl.float32)
+    acc = tl.zeros((16, HEAD_DIM), dtype=tl.float32)
+
+    start_n = 0
+    while start_n < valid_len:
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        token_mask = offs_n < valid_len
+
+        k_ptrs = K + kv_head_idx * stride_k_h + offs_d[:, None] + offs_n[None, :] * stride_k_s
+        k = tl.load(k_ptrs, mask=(offs_d[:, None] < HEAD_DIM) & token_mask[None, :], other=0.0)
+        qk = tl.dot(q, k, out_dtype=tl.float32) * scale
+        qk = tl.where(mask_h[:, None] & token_mask[None, :], qk, -float("inf"))
+
+        prev_e_max = tl.where(mask_h, e_max, 0.0)
+        n_e_max = tl.where(mask_h, tl.maximum(tl.max(qk, axis=1), prev_e_max), 0.0)
+        re_scale = tl.where(mask_h, tl.exp(prev_e_max - n_e_max), 0.0)
+        p = tl.where(mask_h[:, None], tl.exp(qk - n_e_max[:, None]), 0.0)
+
+        v_ptrs = V + kv_head_idx * stride_v_h + offs_n[:, None] * stride_v_s + offs_d[None, :]
+        v = tl.load(v_ptrs, mask=token_mask[:, None] & (offs_d[None, :] < HEAD_DIM), other=0.0)
+        acc = acc * re_scale[:, None] + tl.dot(p.to(v.dtype), v, out_dtype=tl.float32)
+        e_sum = e_sum * re_scale + tl.sum(p, axis=1)
+        e_max = n_e_max
+        start_n += BLOCK_N
+
+    out = acc / e_sum[:, None]
+    out_ptrs = OUT + q_head_idx[:, None] * stride_out_h + offs_d[None, :]
+    tl.store(out_ptrs, out.to(OUT.dtype.element_ty), mask=mask_h[:, None] & (offs_d[None, :] < HEAD_DIM))
 
 
 def _apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
