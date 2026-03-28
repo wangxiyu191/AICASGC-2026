@@ -66,6 +66,67 @@ CUDAGraph capture (如 bucket 未预建)
 
 **每步 ~1400 个 elementwise kernel**, 每个只做一次简单 HBM 读写。kernel 间不共享寄存器/SRAM，反复从 HBM load-compute-store 造成带宽浪费。
 
+### 3.1 这些 `Copy / Mul / Reduction` 在当前代码里分别来自哪里
+
+结合最新默认配置（`small decode add+rmsnorm` 已开启）和当前实现，主要来源可以直接映射到下面几段：
+
+- `Reduction`
+  - 主要是剩余 **3 个 RMSNorm**：
+    - input RMSNorm: [`optimized_layer.py:102`](../optimized_layer.py#L102)
+    - q RMSNorm: [`optimized_layer.py:110`](../optimized_layer.py#L110)
+    - k RMSNorm: [`optimized_layer.py:111`](../optimized_layer.py#L111)
+  - post-attn RMSNorm 原本也会贡献一组 reduction，但现在已经由 [`_fused_add_rms_norm()`](../optimized_layer.py#L179) 合掉了，所以 trace 里 `Reduction` 已明显下降。
+
+- `Mul`
+  - 第一大头是 **decode RoPE** 的逐元素乘加：
+    - [`optimized_layer.py:327`](../optimized_layer.py#L327) 到 [`optimized_layer.py:338`](../optimized_layer.py#L338)
+    - 这里会展开成 `x1*cos - x2*sin` 和 `x2*cos + x1*sin`
+  - 第二部分是 RMSNorm 的 scale：
+    - decode 小 shape 下 `_rms_norm()` 走 `F.rms_norm`，内部会有逐元素乘
+    - 位置在 [`optimized_layer.py:161`](../optimized_layer.py#L161) 到 [`optimized_layer.py:176`](../optimized_layer.py#L176)
+  - 第三部分是 MLP 里的 `SiLU(gate) * up`：
+    - [`optimized_layer.py:142`](../optimized_layer.py#L142) 到 [`optimized_layer.py:148`](../optimized_layer.py#L148)
+    - 但从单独 trace 看，这一块已经不是主要瓶颈，收益明显小于 add+rmsnorm
+
+- `Copy`
+  - 第一大头是 **KV cache 写入**：
+    - layer 内调用点在 [`optimized_layer.py:117`](../optimized_layer.py#L117) 到 [`optimized_layer.py:122`](../optimized_layer.py#L122)
+    - 实际实现是 `StaticLayer.update()` 里的 `index_copy_`：
+      - [`venv/lib/python3.12/site-packages/transformers/cache_utils.py:333`](../venv/lib/python3.12/site-packages/transformers/cache_utils.py#L333)
+      - [`venv/lib/python3.12/site-packages/transformers/cache_utils.py:334`](../venv/lib/python3.12/site-packages/transformers/cache_utils.py#L334)
+  - 第二部分是 attention 输出整理：
+    - [`optimized_layer.py:129`](../optimized_layer.py#L129) 的 `.reshape(...).contiguous()`
+  - 第三部分是 decode 小张量在 view/split/cat/materialize 边界上的中间结果落地：
+    - `qkv.split(...)` 见 [`optimized_layer.py:106`](../optimized_layer.py#L106)
+    - RoPE 的 `torch.cat(...)` 见 [`optimized_layer.py:337`](../optimized_layer.py#L337)
+    - 最后一层残差 `residual + hidden_states` 见 [`optimized_layer.py:152`](../optimized_layer.py#L152)
+
+### 3.2 对应该怎么优化
+
+从 trace 和代码结构看，下一步更值得做的是继续压掉 “剩余 RMSNorm + RoPE + cache write” 这几类小 kernel，而不是继续深挖 `SiLU`。
+
+建议优先级：
+
+1. **做 decode `q_norm + k_norm + rope` 融合**
+   - 直接吃掉一部分 `Reduction + Mul + Cat`
+   - 这段现在是最典型的 “多个超小 kernel 串起来” 模式
+   - 对 batch=1, seq=1 decode 特别友好
+
+2. **做 decode `input_rmsnorm + qkv` 融合**
+   - 把 input RMSNorm 的 reduction 和后面的 QKV 读写边界压掉
+   - 这是层内剩下最肥的一段未融合前处理
+   - 难度会比 add+rmsnorm 高，因为要把 norm 与 linear 的访存布局一起处理
+
+3. **专门处理 KV cache 写入**
+   - 当前 `index_copy_` 是通用路径，灵活但不够轻
+   - decode 单 token 下，本质上是对固定位置写一小片连续块，更适合定制化写回
+   - 这块主要目标是压 `Copy` 和少量 runtime 开销
+
+4. **`SiLU(gate) * up` 先保持默认开启，但不再作为主攻方向**
+   - 精度已确认没问题
+   - trace 也说明它只能吃掉很小一部分 `Mul`
+   - 后续除非顺手并入更大 MLP fusion，否则单独继续挖意义不大
+
 ## 4. 带宽利用率估算
 
 - A800 HBM 带宽: ~2039 GB/s
