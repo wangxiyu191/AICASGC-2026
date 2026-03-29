@@ -99,6 +99,7 @@ def _install_attention_capture(capture: AttentionCapture):
         num_key_value_groups,
         prefer_small_triton=False,
         cache_position=None,
+        splitkv_workspace=None,
     ):
         capture.maybe_capture(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position)
         return original(
@@ -110,6 +111,7 @@ def _install_attention_capture(capture: AttentionCapture):
             num_key_value_groups,
             prefer_small_triton=prefer_small_triton,
             cache_position=cache_position,
+            splitkv_workspace=splitkv_workspace,
         )
 
     optimized_layer._small_decode_attention = wrapped
@@ -332,6 +334,26 @@ def _triton_grouped_cachepos_prefix_dot(q, k, v, attention_mask, scaling, num_ke
     return out
 
 
+def _triton_grouped_cachepos_splitkv(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position):
+    previous = optimized_layer._ENABLE_TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV
+    optimized_layer._ENABLE_TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV = True
+    try:
+        out = optimized_layer._small_decode_attention_grouped_prefix_cachepos_splitkv(
+            q,
+            k,
+            v,
+            scaling,
+            num_key_value_groups,
+            cache_position,
+            prefer_small_triton=True,
+        )
+    finally:
+        optimized_layer._ENABLE_TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV = previous
+    if out is None:
+        raise RuntimeError("Grouped cache-position split-KV Triton decode attention returned None for captured tensors")
+    return out
+
+
 def _triton_current(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position):
     out = optimized_layer._small_decode_attention(
         q,
@@ -387,6 +409,7 @@ def _run_benchmarks(payload, warmup: int, iters: int):
         "triton_grouped_gqa": lambda q, k, v, attention_mask, scaling, num_key_value_groups, _cache_position: _triton_grouped_gqa(q, k, v, attention_mask, scaling, num_key_value_groups),
         "triton_grouped_cachepos_prefix": _triton_grouped_cachepos_prefix,
         "triton_grouped_cachepos_prefix_dot": _triton_grouped_cachepos_prefix_dot,
+        "triton_grouped_cachepos_splitkv": _triton_grouped_cachepos_splitkv,
         "triton_current": _triton_current,
         "sdpa_enable_gqa_mask": lambda q, k, v, attention_mask, scaling, num_key_value_groups, _cache_position: _sdpa_gqa_mask(q, k, v, attention_mask, scaling, num_key_value_groups),
         "sdpa_enable_gqa_valid_prefix": lambda q, k, v, attention_mask, scaling, num_key_value_groups, _cache_position: _sdpa_gqa_valid_only(q, k, v, attention_mask, scaling, num_key_value_groups),

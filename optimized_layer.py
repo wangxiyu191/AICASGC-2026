@@ -82,6 +82,9 @@ class OptimizedDecoderLayer(nn.Module):
             self._attn_implementation, eager_attention_forward,
         )
         self._prefer_small_decode_triton = False
+        self._splitkv_workspace = None
+        if _ENABLE_TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV:
+            self._ensure_splitkv_workspace()
 
     def forward(
         self,
@@ -166,6 +169,7 @@ class OptimizedDecoderLayer(nn.Module):
                 self.num_key_value_groups,
                 prefer_small_triton=prefer_small_decode_triton,
                 cache_position=cache_position,
+                splitkv_workspace=self._splitkv_workspace,
             )
             if attn_output is None:
                 attn_output, _ = self._attention_interface(
@@ -205,6 +209,44 @@ class OptimizedDecoderLayer(nn.Module):
             hidden_states = hidden_states.add_(residual)
         return hidden_states
 
+    def _ensure_splitkv_workspace(self, split_k: int = 4):
+        if self.qkv_weight.device.type != "cuda":
+            self._splitkv_workspace = None
+            return
+        if (
+            self._splitkv_workspace is not None
+            and self._splitkv_workspace["split_k"] == split_k
+            and self._splitkv_workspace["partial_acc"].device == self.qkv_weight.device
+        ):
+            return
+        partial_acc = torch.empty(
+            (self.num_kv_heads, split_k, self.num_key_value_groups, self.head_dim),
+            dtype=torch.float32,
+            device=self.qkv_weight.device,
+        )
+        partial_l = torch.empty(
+            (self.num_kv_heads, split_k, self.num_key_value_groups),
+            dtype=torch.float32,
+            device=self.qkv_weight.device,
+        )
+        partial_m = torch.empty(
+            (self.num_kv_heads, split_k, self.num_key_value_groups),
+            dtype=torch.float32,
+            device=self.qkv_weight.device,
+        )
+        out = torch.empty(
+            (1, self.num_heads, self.head_dim),
+            dtype=self.qkv_weight.dtype,
+            device=self.qkv_weight.device,
+        )
+        self._splitkv_workspace = {
+            "split_k": split_k,
+            "partial_acc": partial_acc,
+            "partial_l": partial_l,
+            "partial_m": partial_m,
+            "out": out,
+        }
+
 
 _TRITON_ROWS_THRESHOLD = 32
 _ENABLE_TRITON_SMALL_RMSNORM = os.environ.get("ENABLE_TRITON_SMALL_RMSNORM", "1") == "1"
@@ -213,6 +255,7 @@ _ENABLE_TRITON_SMALL_SILU_MUL = os.environ.get("ENABLE_TRITON_SMALL_SILU_MUL", "
 _ENABLE_TRITON_SMALL_QK_NORM_ROPE = os.environ.get("ENABLE_TRITON_SMALL_QK_NORM_ROPE", "1") == "1"
 _ENABLE_TRITON_SMALL_DECODE_ATTENTION = os.environ.get("ENABLE_TRITON_SMALL_DECODE_ATTENTION", "1") == "1"
 _ENABLE_TRITON_SMALL_DECODE_ATTENTION_DOT = os.environ.get("ENABLE_TRITON_SMALL_DECODE_ATTENTION_DOT", "1") == "1"
+_ENABLE_TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV = os.environ.get("ENABLE_TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV", "1") == "1"
 _ENABLE_TRITON_SMALL_DECODE_STATIC_KV = os.environ.get("ENABLE_TRITON_SMALL_DECODE_STATIC_KV", "1") == "1"
 _ENABLE_DECODE_NVTX = os.environ.get("ENABLE_DECODE_NVTX", "0") == "1"
 
@@ -482,6 +525,7 @@ def _small_decode_attention(
     num_key_value_groups: int,
     prefer_small_triton: bool = False,
     cache_position: torch.Tensor | None = None,
+    splitkv_workspace: dict | None = None,
 ) -> torch.Tensor | None:
     """Single-token decode attention without repeat_kv copies."""
     if not _small_decode_attention_inputs_ok(
@@ -493,6 +537,19 @@ def _small_decode_attention(
         prefer_small_triton=prefer_small_triton,
     ):
         return None
+
+    out = _small_decode_attention_grouped_prefix_cachepos_splitkv(
+        q,
+        k,
+        v,
+        scaling,
+        num_key_value_groups,
+        cache_position,
+        prefer_small_triton=prefer_small_triton,
+        workspace=splitkv_workspace,
+    )
+    if out is not None:
+        return out
 
     if _ENABLE_TRITON_SMALL_DECODE_ATTENTION_DOT:
         out = _small_decode_attention_grouped_prefix_cachepos_dot(
@@ -837,6 +894,116 @@ def _small_decode_attention_grouped_prefix_cachepos_dot(
     return out.unsqueeze(2).transpose(1, 2)
 
 
+def _small_decode_attention_grouped_prefix_cachepos_splitkv(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scaling: float,
+    num_key_value_groups: int,
+    cache_position: torch.Tensor | None,
+    prefer_small_triton: bool = False,
+    workspace: dict | None = None,
+) -> torch.Tensor | None:
+    if (
+        not prefer_small_triton
+        or not _ENABLE_TRITON_SMALL_DECODE_ATTENTION
+        or not _ENABLE_TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV
+        or cache_position is None
+        or cache_position.device.type != "cuda"
+        or cache_position.ndim != 1
+        or cache_position.numel() != 1
+        or num_key_value_groups != 2
+    ):
+        return None
+    if (
+        q.device.type != "cuda"
+        or k.device.type != "cuda"
+        or v.device.type != "cuda"
+        or q.shape[0] != 1
+        or q.shape[2] != 1
+        or q.stride(-1) != 1
+        or k.stride(-1) != 1
+        or v.stride(-1) != 1
+    ):
+        return None
+
+    seq_len = k.shape[2]
+    head_dim = q.shape[-1]
+    split_k, block_n, num_warps, num_stages = _small_decode_attention_grouped_prefix_cachepos_splitkv_launch_config(seq_len)
+    if split_k <= 1:
+        return None
+
+    if (
+        workspace is not None
+        and workspace.get("split_k") == split_k
+        and workspace["partial_acc"].device == q.device
+        and workspace["out"].dtype == q.dtype
+    ):
+        partial_acc = workspace["partial_acc"]
+        partial_l = workspace["partial_l"]
+        partial_m = workspace["partial_m"]
+        out = workspace["out"]
+    else:
+        partial_acc = torch.empty((k.shape[1], split_k, 2, head_dim), dtype=torch.float32, device=q.device)
+        partial_l = torch.empty((k.shape[1], split_k, 2), dtype=torch.float32, device=q.device)
+        partial_m = torch.empty((k.shape[1], split_k, 2), dtype=torch.float32, device=q.device)
+        out = torch.empty((1, q.shape[1], head_dim), dtype=q.dtype, device=q.device)
+
+    _small_decode_attention_grouped_prefix_cachepos_splitkv_fwd_kernel[(k.shape[1], split_k)](
+        q,
+        k,
+        v,
+        cache_position,
+        partial_acc,
+        partial_l,
+        partial_m,
+        q.stride(0),
+        q.stride(1),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        partial_acc.stride(0),
+        partial_acc.stride(1),
+        partial_acc.stride(2),
+        partial_l.stride(0),
+        partial_l.stride(1),
+        partial_l.stride(2),
+        partial_m.stride(0),
+        partial_m.stride(1),
+        partial_m.stride(2),
+        scaling,
+        HEAD_DIM=head_dim,
+        MAX_SEQ_LEN=seq_len,
+        BLOCK_N=block_n,
+        SPLIT_K=split_k,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    _small_decode_attention_grouped_prefix_cachepos_splitkv_merge_kernel[(k.shape[1],)](
+        partial_acc,
+        partial_l,
+        partial_m,
+        out,
+        partial_acc.stride(0),
+        partial_acc.stride(1),
+        partial_acc.stride(2),
+        partial_l.stride(0),
+        partial_l.stride(1),
+        partial_l.stride(2),
+        partial_m.stride(0),
+        partial_m.stride(1),
+        partial_m.stride(2),
+        out.stride(0),
+        out.stride(1),
+        HEAD_DIM=head_dim,
+        SPLIT_K=split_k,
+    )
+    return out.unsqueeze(2).transpose(1, 2)
+
+
 def _small_decode_attention_grouped_prefix_cachepos_launch_config(seq_len: int) -> tuple[int, int, int]:
     """Launch config tuned for decode buckets seen in benchmark traces."""
     if seq_len <= 512:
@@ -844,6 +1011,15 @@ def _small_decode_attention_grouped_prefix_cachepos_launch_config(seq_len: int) 
     if seq_len <= 2048:
         return 128, 4, 4
     return 128, 8, 2
+
+
+def _small_decode_attention_grouped_prefix_cachepos_splitkv_launch_config(seq_len: int) -> tuple[int, int, int, int]:
+    """Split-KV config for increasing decode attention parallelism on long-ish caches."""
+    if seq_len < 512:
+        return 1, 64, 2, 2
+    if seq_len < 1024:
+        return 4, 64, 2, 2
+    return 4, 128, 2, 2
 
 
 @triton.jit
@@ -1234,6 +1410,154 @@ def _small_decode_attention_grouped_prefix_cachepos_dot_fwd_kernel(
     tl.store(out_ptrs, out.to(OUT.dtype.element_ty), mask=mask_h[:, None] & (offs_d[None, :] < HEAD_DIM))
 
 
+@triton.jit
+def _small_decode_attention_grouped_prefix_cachepos_splitkv_fwd_kernel(
+    Q,
+    K,
+    V,
+    CACHE_POSITION,
+    PARTIAL_ACC,
+    PARTIAL_L,
+    PARTIAL_M,
+    stride_q_b,
+    stride_q_h,
+    stride_k_b,
+    stride_k_h,
+    stride_k_s,
+    stride_v_b,
+    stride_v_h,
+    stride_v_s,
+    stride_pa_kh,
+    stride_pa_split,
+    stride_pa_head,
+    stride_pl_kh,
+    stride_pl_split,
+    stride_pl_head,
+    stride_pm_kh,
+    stride_pm_split,
+    stride_pm_head,
+    scale,
+    HEAD_DIM: tl.constexpr,
+    MAX_SEQ_LEN: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    kv_head_idx = tl.program_id(0)
+    split_idx = tl.program_id(1)
+    offs_d = tl.arange(0, HEAD_DIM)
+    valid_len = tl.load(CACHE_POSITION).to(tl.int32) + 1
+    valid_len = tl.minimum(valid_len, MAX_SEQ_LEN)
+    chunk_size = tl.cdiv(valid_len, SPLIT_K)
+    chunk_start = split_idx * chunk_size
+    chunk_end = tl.minimum(chunk_start + chunk_size, valid_len)
+
+    q_head_idx0 = kv_head_idx * 2
+    q_head_idx1 = q_head_idx0 + 1
+    q0 = tl.load(Q + q_head_idx0 * stride_q_h + offs_d, mask=offs_d < HEAD_DIM, other=0.0).to(tl.float32)
+    q1 = tl.load(Q + q_head_idx1 * stride_q_h + offs_d, mask=offs_d < HEAD_DIM, other=0.0).to(tl.float32)
+
+    m0 = -float("inf")
+    m1 = -float("inf")
+    l0 = 0.0
+    l1 = 0.0
+    acc0 = tl.zeros((HEAD_DIM,), dtype=tl.float32)
+    acc1 = tl.zeros((HEAD_DIM,), dtype=tl.float32)
+
+    start_n = chunk_start
+    while start_n < chunk_end:
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        token_mask = offs_n < chunk_end
+
+        k_ptrs = K + kv_head_idx * stride_k_h + offs_n[:, None] * stride_k_s + offs_d[None, :]
+        k = tl.load(k_ptrs, mask=token_mask[:, None], other=0.0).to(tl.float32)
+        qk0 = tl.sum(k * q0[None, :], axis=1) * scale
+        qk1 = tl.sum(k * q1[None, :], axis=1) * scale
+
+        m0_new = tl.maximum(m0, tl.max(qk0, axis=0))
+        m1_new = tl.maximum(m1, tl.max(qk1, axis=0))
+        p0 = tl.exp(qk0 - m0_new)
+        p1 = tl.exp(qk1 - m1_new)
+        alpha0 = tl.exp(m0 - m0_new)
+        alpha1 = tl.exp(m1 - m1_new)
+
+        v_ptrs = V + kv_head_idx * stride_v_h + offs_n[:, None] * stride_v_s + offs_d[None, :]
+        v = tl.load(v_ptrs, mask=token_mask[:, None], other=0.0).to(tl.float32)
+        acc0 = acc0 * alpha0 + tl.sum(p0[:, None] * v, axis=0)
+        acc1 = acc1 * alpha1 + tl.sum(p1[:, None] * v, axis=0)
+        l0 = l0 * alpha0 + tl.sum(p0, axis=0)
+        l1 = l1 * alpha1 + tl.sum(p1, axis=0)
+        m0 = m0_new
+        m1 = m1_new
+        start_n += BLOCK_N
+
+    partial_acc_base = PARTIAL_ACC + kv_head_idx * stride_pa_kh + split_idx * stride_pa_split
+    tl.store(partial_acc_base + 0 * stride_pa_head + offs_d, acc0, mask=offs_d < HEAD_DIM)
+    tl.store(partial_acc_base + 1 * stride_pa_head + offs_d, acc1, mask=offs_d < HEAD_DIM)
+
+    partial_l_base = PARTIAL_L + kv_head_idx * stride_pl_kh + split_idx * stride_pl_split
+    partial_m_base = PARTIAL_M + kv_head_idx * stride_pm_kh + split_idx * stride_pm_split
+    tl.store(partial_l_base + 0 * stride_pl_head, l0)
+    tl.store(partial_l_base + 1 * stride_pl_head, l1)
+    tl.store(partial_m_base + 0 * stride_pm_head, m0)
+    tl.store(partial_m_base + 1 * stride_pm_head, m1)
+
+
+@triton.jit
+def _small_decode_attention_grouped_prefix_cachepos_splitkv_merge_kernel(
+    PARTIAL_ACC,
+    PARTIAL_L,
+    PARTIAL_M,
+    OUT,
+    stride_pa_kh,
+    stride_pa_split,
+    stride_pa_head,
+    stride_pl_kh,
+    stride_pl_split,
+    stride_pl_head,
+    stride_pm_kh,
+    stride_pm_split,
+    stride_pm_head,
+    stride_out_b,
+    stride_out_h,
+    HEAD_DIM: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    kv_head_idx = tl.program_id(0)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    max0 = -float("inf")
+    max1 = -float("inf")
+    for split_idx in range(SPLIT_K):
+        m_base = PARTIAL_M + kv_head_idx * stride_pm_kh + split_idx * stride_pm_split
+        max0 = tl.maximum(max0, tl.load(m_base + 0 * stride_pm_head))
+        max1 = tl.maximum(max1, tl.load(m_base + 1 * stride_pm_head))
+
+    sum0 = 0.0
+    sum1 = 0.0
+    acc0 = tl.zeros((HEAD_DIM,), dtype=tl.float32)
+    acc1 = tl.zeros((HEAD_DIM,), dtype=tl.float32)
+    for split_idx in range(SPLIT_K):
+        l_base = PARTIAL_L + kv_head_idx * stride_pl_kh + split_idx * stride_pl_split
+        m_base = PARTIAL_M + kv_head_idx * stride_pm_kh + split_idx * stride_pm_split
+        acc_base = PARTIAL_ACC + kv_head_idx * stride_pa_kh + split_idx * stride_pa_split
+
+        m0 = tl.load(m_base + 0 * stride_pm_head)
+        m1 = tl.load(m_base + 1 * stride_pm_head)
+        scale0 = tl.exp(m0 - max0)
+        scale1 = tl.exp(m1 - max1)
+        sum0 += tl.load(l_base + 0 * stride_pl_head) * scale0
+        sum1 += tl.load(l_base + 1 * stride_pl_head) * scale1
+        acc0 += tl.load(acc_base + 0 * stride_pa_head + offs_d, mask=offs_d < HEAD_DIM, other=0.0) * scale0
+        acc1 += tl.load(acc_base + 1 * stride_pa_head + offs_d, mask=offs_d < HEAD_DIM, other=0.0) * scale1
+
+    out0 = acc0 / sum0
+    out1 = acc1 / sum1
+    q_head_idx0 = kv_head_idx * 2
+    q_head_idx1 = q_head_idx0 + 1
+    tl.store(OUT + q_head_idx0 * stride_out_h + offs_d, out0.to(OUT.dtype.element_ty), mask=offs_d < HEAD_DIM)
+    tl.store(OUT + q_head_idx1 * stride_out_h + offs_d, out1.to(OUT.dtype.element_ty), mask=offs_d < HEAD_DIM)
+
+
 def _apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     """RoPE: Triton for prefill (large seq), native PyTorch for decode (seq=1)."""
     batch, seq_len, nheads, D = x.shape
@@ -1327,4 +1651,6 @@ def set_small_decode_triton_enabled(model, enabled: bool) -> bool:
         if isinstance(layer, OptimizedDecoderLayer):
             previous = layer._prefer_small_decode_triton
             layer._prefer_small_decode_triton = enabled
+            if enabled and _ENABLE_TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV:
+                layer._ensure_splitkv_workspace()
     return previous
