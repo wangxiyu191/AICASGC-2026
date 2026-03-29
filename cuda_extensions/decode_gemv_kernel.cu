@@ -392,6 +392,88 @@ __global__ void persistent_matvec_half_fwd_kernel(
     }
 }
 
+// ============================================================
+// hfma2 variant: accumulate in half2, per-tile flush to float
+// - Reduces instruction count (~6x fewer ALU ops in inner loop)
+// - Per-tile flush keeps precision safe (max 16 hfma2 per flush)
+// ============================================================
+__global__ void persistent_matvec_hfma2_fwd_kernel(
+    const at::Half* __restrict__ x,
+    const at::Half* __restrict__ weight,
+    const at::Half* __restrict__ bias,
+    at::Half* __restrict__ out,
+    int64_t stride_wn,
+    int n,
+    int k,
+    bool has_bias) {
+    __shared__ __half x_sh[kVecTileK_v2];
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+
+    const __half* x_half = reinterpret_cast<const __half*>(x);
+    const __half* w_half = reinterpret_cast<const __half*>(weight);
+
+    for (int row_base = blockIdx.x * 4; row_base < n; row_base += gridDim.x * 4) {
+        const int row = row_base + warp;
+        float sum = 0.0f;
+
+        for (int tile_start = 0; tile_start < k; tile_start += kVecTileK_v2) {
+            const int tile_elems = min(kVecTileK_v2, k - tile_start);
+
+            // 128-bit vectorized load of x into shared memory
+            const int vec8_limit_load = tile_elems & ~7;
+            for (int idx = threadIdx.x * 8; idx < vec8_limit_load; idx += kRow4Threads * 8) {
+                *reinterpret_cast<uint4*>(&x_sh[idx]) =
+                    *reinterpret_cast<const uint4*>(&x_half[tile_start + idx]);
+            }
+            for (int idx = vec8_limit_load + threadIdx.x; idx < tile_elems; idx += kRow4Threads) {
+                x_sh[idx] = x_half[tile_start + idx];
+            }
+            __syncthreads();
+
+            if (row < n) {
+                // hfma2 accumulation with per-tile flush
+                __half2 h2_acc = __float2half2_rn(0.0f);
+                const int compute_vec_limit = tile_elems & ~7;
+                for (int idx = lane * 8; idx < compute_vec_limit; idx += 32 * 8) {
+                    const uint4 x_vec = *reinterpret_cast<const uint4*>(&x_sh[idx]);
+                    const uint4 w_vec = *reinterpret_cast<const uint4*>(
+                        &w_half[row * stride_wn + tile_start + idx]);
+
+                    const __half2* x2 = reinterpret_cast<const __half2*>(&x_vec);
+                    const __half2* w2 = reinterpret_cast<const __half2*>(&w_vec);
+
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        h2_acc = __hfma2(x2[i], w2[i], h2_acc);
+                    }
+                }
+                // flush half2 accumulator to float
+                const float2 f2 = __half22float2(h2_acc);
+                sum += f2.x + f2.y;
+
+                // scalar tail (stays in float)
+                for (int idx = compute_vec_limit + lane; idx < tile_elems; idx += 32) {
+                    sum += __half2float(x_sh[idx]) * __half2float(w_half[row * stride_wn + tile_start + idx]);
+                }
+            }
+            __syncthreads();
+        }
+
+        if (row < n) {
+            sum = warp_sum(sum);
+            if (lane == 0) {
+                float result = sum;
+                if (has_bias) {
+                    result += __half2float(reinterpret_cast<const __half*>(bias)[row]);
+                }
+                reinterpret_cast<__half*>(out)[row] = __float2half(result);
+            }
+        }
+    }
+}
+
 }  // namespace
 
 torch::Tensor splitk_matvec_cuda(
@@ -790,6 +872,49 @@ torch::Tensor nosplit_matvec_half_cuda(
     const int grid_blocks = (n + 3) / 4;
 
     persistent_matvec_half_fwd_kernel<<<grid_blocks, kRow4Threads, 0, stream>>>(
+        x.data_ptr<at::Half>(),
+        weight.data_ptr<at::Half>(),
+        has_bias ? bias.data_ptr<at::Half>() : nullptr,
+        out.data_ptr<at::Half>(),
+        weight.stride(0),
+        n,
+        k,
+        has_bias
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    return out;
+}
+
+torch::Tensor nosplit_hfma2_matvec_half_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& out,
+    bool has_bias) {
+    TORCH_CHECK(x.is_cuda(), "x must be CUDA");
+    TORCH_CHECK(weight.is_cuda(), "weight must be CUDA");
+    TORCH_CHECK(out.is_cuda(), "out must be CUDA");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat16, "hfma2 nosplit only supports fp16");
+    TORCH_CHECK(weight.scalar_type() == torch::kFloat16, "hfma2 nosplit only supports fp16");
+    TORCH_CHECK(weight.stride(1) == 1, "hfma2 nosplit requires contiguous weight");
+    TORCH_CHECK(x.dim() == 1, "x must be flattened [K]");
+    TORCH_CHECK(weight.dim() == 2, "weight must be [N, K]");
+    TORCH_CHECK(weight.size(1) == x.size(0), "weight/x shape mismatch");
+    TORCH_CHECK(out.scalar_type() == torch::kFloat16, "out must be fp16");
+    if (has_bias) {
+        TORCH_CHECK(bias.is_cuda(), "bias must be CUDA when present");
+        TORCH_CHECK(bias.numel() == weight.size(0), "bias size mismatch");
+    }
+
+    const int n = static_cast<int>(weight.size(0));
+    const int k = static_cast<int>(weight.size(1));
+    c10::cuda::CUDAGuard device_guard(x.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    const int grid_blocks = (n + 3) / 4;
+
+    persistent_matvec_hfma2_fwd_kernel<<<grid_blocks, kRow4Threads, 0, stream>>>(
         x.data_ptr<at::Half>(),
         weight.data_ptr<at::Half>(),
         has_bias ? bias.data_ptr<at::Half>() : nullptr,
