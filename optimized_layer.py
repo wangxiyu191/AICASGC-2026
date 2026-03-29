@@ -209,7 +209,9 @@ class OptimizedDecoderLayer(nn.Module):
             hidden_states = hidden_states.add_(residual)
         return hidden_states
 
-    def _ensure_splitkv_workspace(self, split_k: int = 4):
+    def _ensure_splitkv_workspace(self, split_k: int | None = None):
+        if split_k is None:
+            split_k = _default_splitkv_workspace_split_k()
         if self.qkv_weight.device.type != "cuda":
             self._splitkv_workspace = None
             return
@@ -256,6 +258,10 @@ _ENABLE_TRITON_SMALL_QK_NORM_ROPE = os.environ.get("ENABLE_TRITON_SMALL_QK_NORM_
 _ENABLE_TRITON_SMALL_DECODE_ATTENTION = os.environ.get("ENABLE_TRITON_SMALL_DECODE_ATTENTION", "1") == "1"
 _ENABLE_TRITON_SMALL_DECODE_ATTENTION_DOT = os.environ.get("ENABLE_TRITON_SMALL_DECODE_ATTENTION_DOT", "1") == "1"
 _ENABLE_TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV = os.environ.get("ENABLE_TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV", "1") == "1"
+_TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_SPLIT_K = int(os.environ.get("TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_SPLIT_K", "0"))
+_TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_BLOCK_N = int(os.environ.get("TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_BLOCK_N", "0"))
+_TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_NUM_WARPS = int(os.environ.get("TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_NUM_WARPS", "0"))
+_TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_NUM_STAGES = int(os.environ.get("TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_NUM_STAGES", "0"))
 _ENABLE_TRITON_SMALL_DECODE_STATIC_KV = os.environ.get("ENABLE_TRITON_SMALL_DECODE_STATIC_KV", "1") == "1"
 _ENABLE_DECODE_NVTX = os.environ.get("ENABLE_DECODE_NVTX", "0") == "1"
 
@@ -1016,10 +1022,26 @@ def _small_decode_attention_grouped_prefix_cachepos_launch_config(seq_len: int) 
 def _small_decode_attention_grouped_prefix_cachepos_splitkv_launch_config(seq_len: int) -> tuple[int, int, int, int]:
     """Split-KV config for increasing decode attention parallelism on long-ish caches."""
     if seq_len < 512:
-        return 1, 64, 2, 2
-    if seq_len < 1024:
-        return 4, 64, 2, 2
-    return 4, 128, 2, 2
+        split_k, block_n, num_warps, num_stages = 1, 64, 2, 2
+    elif seq_len < 1024:
+        split_k, block_n, num_warps, num_stages = 4, 64, 2, 2
+    else:
+        split_k, block_n, num_warps, num_stages = 4, 128, 2, 2
+    if _TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_SPLIT_K > 0:
+        split_k = _TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_SPLIT_K
+    if _TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_BLOCK_N > 0:
+        block_n = _TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_BLOCK_N
+    if _TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_NUM_WARPS > 0:
+        num_warps = _TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_NUM_WARPS
+    if _TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_NUM_STAGES > 0:
+        num_stages = _TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_NUM_STAGES
+    return split_k, block_n, num_warps, num_stages
+
+
+def _default_splitkv_workspace_split_k() -> int:
+    if _TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_SPLIT_K > 0:
+        return _TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_SPLIT_K
+    return 4
 
 
 @triton.jit

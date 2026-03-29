@@ -1,0 +1,112 @@
+{
+  "system_info": {
+    "python_version": "3.10.9",
+    "torch_version": "2.8.0+cu128",
+    "cuda_version": "12.8",
+    "cudnn_version": "91002",
+    "gpu_name": "NVIDIA A10",
+    "gpu_compute_capability": "8.6"
+  },
+  "metadata": {
+    "sample_idx": 0,
+    "layer_idx": 14,
+    "decode_step": 16,
+    "bucketed": true,
+    "q_shape": [
+      1,
+      16,
+      1,
+      128
+    ],
+    "k_shape": [
+      1,
+      8,
+      832,
+      128
+    ],
+    "v_shape": [
+      1,
+      8,
+      832,
+      128
+    ],
+    "attention_mask_shape": [
+      1,
+      1,
+      1,
+      832
+    ],
+    "dtype": "torch.bfloat16",
+    "device": "cuda:0",
+    "valid_len": 707,
+    "prefix_mask": true,
+    "scaling": 0.08838834764831845,
+    "num_key_value_groups": 2,
+    "prompt_length": 690,
+    "max_cache_len": 832,
+    "captured_decode_step": 16,
+    "cache_position": 706
+  },
+  "benchmarks": {
+    "hf_repeat_kv_sdpa": {
+      "time_ms": 0.08824483181039493,
+      "status": "ok"
+    },
+    "triton_per_q_head": {
+      "time_ms": 0.06777686066925526,
+      "status": "ok",
+      "max_abs_diff": 0.015625,
+      "mean_abs_diff": 0.00025477539747953415,
+      "speedup_vs_hf": 1.3019905457265342
+    },
+    "triton_grouped_gqa": {
+      "time_ms": 0.06539961323142052,
+      "status": "ok",
+      "max_abs_diff": 0.015625,
+      "mean_abs_diff": 0.00025477539747953415,
+      "speedup_vs_hf": 1.3493173346168763
+    },
+    "triton_grouped_cachepos_prefix": {
+      "time_ms": 0.057049794122576714,
+      "status": "ok",
+      "max_abs_diff": 0.015625,
+      "mean_abs_diff": 0.0006343815475702286,
+      "speedup_vs_hf": 1.5468036855802287
+    },
+    "triton_grouped_cachepos_prefix_dot": {
+      "time_ms": 0.05707227004071077,
+      "status": "ok",
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "speedup_vs_hf": 1.5461945310296605
+    },
+    "triton_grouped_cachepos_splitkv": {
+      "time_ms": 0.11812251371641953,
+      "status": "ok",
+      "max_abs_diff": 0.015625,
+      "mean_abs_diff": 0.0006343815475702286,
+      "speedup_vs_hf": 0.7470619193073311
+    },
+    "triton_current": {
+      "time_ms": 0.12479474147160848,
+      "status": "ok",
+      "max_abs_diff": 0.015625,
+      "mean_abs_diff": 0.0006343815475702286,
+      "speedup_vs_hf": 0.707119793428725
+    },
+    "sdpa_enable_gqa_mask": {
+      "time_ms": 0.17938742724557719,
+      "status": "ok",
+      "max_abs_diff": 0.015625,
+      "mean_abs_diff": 0.0002538515254855156,
+      "speedup_vs_hf": 0.49192316967448235
+    },
+    "sdpa_enable_gqa_valid_prefix": {
+      "time_ms": 0.14165445851782957,
+      "status": "ok",
+      "max_abs_diff": 0.015625,
+      "mean_abs_diff": 0.00023322831839323044,
+      "speedup_vs_hf": 0.622958378675302
+    }
+  }
+}
