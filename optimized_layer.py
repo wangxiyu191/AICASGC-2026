@@ -1108,7 +1108,7 @@ def _small_decode_attention_grouped_prefix_cachepos_splitkv_launch_config(seq_le
     if seq_len < 512:
         split_k, block_n, num_warps, num_stages = 1, 64, 2, 2
     elif seq_len < 1024:
-        split_k, block_n, num_warps, num_stages = 4, 64, 2, 2
+        split_k, block_n, num_warps, num_stages = 8, 64, 2, 2
     else:
         split_k, block_n, num_warps, num_stages = 4, 128, 2, 2
     if _TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_SPLIT_K > 0:

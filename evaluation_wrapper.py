@@ -1058,7 +1058,7 @@ class VLMModel:
         t0 = _time.perf_counter()
         self._model = AutoModelForImageTextToText.from_pretrained(
             model_path,
-            torch_dtype="auto",
+            torch_dtype=torch.float16,
             device_map=device,
             attn_implementation=attn_impl,
         )

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Benchmark decode-phase o_proj / down_proj / lm_head implementations on real captured tensors.
+"""Benchmark decode-phase linear implementations on real captured tensors.
 
 This tool mirrors benchmark-style prefill + custom decode, captures one layer's
-decode-time `o_proj` / `down_proj` / `lm_head` inputs, then benchmarks a few linear-call variants.
+decode-time `qkv` / `gate_up` / `o_proj` / `down_proj` / `lm_head` inputs,
+then benchmarks a few linear-call variants.
 """
 
 from __future__ import annotations
@@ -32,13 +33,39 @@ from optimized_layer import set_small_decode_triton_enabled
 
 
 class LinearCapture:
-    def __init__(self, decode_step: int):
+    def __init__(self, decode_step: int, target_layer, lm_head):
         self.decode_step = decode_step
+        self.qkv_call_index = 0
+        self.gate_up_call_index = 0
         self.o_proj_call_index = 0
         self.down_proj_call_index = 0
         self.lm_head_call_index = 0
         self._seen_prefill_lm_head = False
         self.payload = {}
+        self._qkv_weight_ptr = target_layer.qkv_weight.data_ptr()
+        self._gate_up_weight_ptr = target_layer.gate_up_weight.data_ptr()
+        self._lm_head_weight_ptr = lm_head.weight.data_ptr()
+
+    def maybe_capture_f_linear(self, x, weight, bias):
+        if x.shape[1] != 1:
+            return
+        weight_ptr = weight.data_ptr()
+        if weight_ptr == self._qkv_weight_ptr:
+            if self.qkv_call_index == self.decode_step and "qkv" not in self.payload:
+                self.payload["qkv"] = {
+                    "x": x.detach().clone(),
+                    "weight": weight.detach().clone(),
+                    "bias": bias.detach().clone() if bias is not None else None,
+                }
+            self.qkv_call_index += 1
+        elif weight_ptr == self._gate_up_weight_ptr:
+            if self.gate_up_call_index == self.decode_step and "gate_up" not in self.payload:
+                self.payload["gate_up"] = {
+                    "x": x.detach().clone(),
+                    "weight": weight.detach().clone(),
+                    "bias": bias.detach().clone() if bias is not None else None,
+                }
+            self.gate_up_call_index += 1
 
     def maybe_capture_o_proj(self, module, args):
         x = args[0]
@@ -116,13 +143,20 @@ def _run_capture(
     static_cache = StaticCache(config=vlm._model.config, max_cache_len=max_cache_len)
     model = vlm._model
     target_layer = model.model.language_model.layers[layer_idx]
-    capture = LinearCapture(decode_step=decode_step)
+    capture = LinearCapture(decode_step=decode_step, target_layer=target_layer, lm_head=model.lm_head)
     o_handle = target_layer.o_proj.register_forward_pre_hook(capture.maybe_capture_o_proj)
     d_handle = target_layer.down_proj.register_forward_pre_hook(capture.maybe_capture_down_proj)
     l_handle = model.lm_head.register_forward_pre_hook(capture.maybe_capture_lm_head)
 
     previous_small_decode_triton = set_small_decode_triton_enabled(model, False)
+    orig_f_linear = F.linear
+
+    def _capturing_linear(x, weight, bias=None):
+        capture.maybe_capture_f_linear(x, weight, bias)
+        return orig_f_linear(x, weight, bias)
+
     try:
+        F.linear = _capturing_linear
         with torch.no_grad():
             outputs = model(
                 input_ids=inputs.input_ids,
@@ -158,7 +192,7 @@ def _run_capture(
                     logits_to_keep=1,
                 )
                 next_tokens = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
-                if {"o_proj", "down_proj", "lm_head"} <= capture.payload.keys():
+                if {"qkv", "gate_up", "o_proj", "down_proj", "lm_head"} <= capture.payload.keys():
                     return capture.payload, {
                         "prompt_length": int(prompt_length),
                         "max_cache_len": int(max_cache_len),
@@ -167,6 +201,7 @@ def _run_capture(
                     }
                 current_position += 1
     finally:
+        F.linear = orig_f_linear
         set_small_decode_triton_enabled(model, previous_small_decode_triton)
         o_handle.remove()
         d_handle.remove()
@@ -431,7 +466,7 @@ def _run_benchmarks(payload, warmup: int, iters: int, use_graph: bool = False):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark decode o_proj/down_proj implementations on real captured tensors")
+    parser = argparse.ArgumentParser(description="Benchmark decode linear implementations on real captured tensors")
     parser.add_argument("--model-path", type=str, default="./Qwen3-VL-2B-Instruct")
     parser.add_argument("--dataset-path", type=str, default="./data")
     parser.add_argument("--sample-idx", type=int, default=0)
@@ -490,6 +525,12 @@ def main():
             "prompt_length": capture_meta["prompt_length"],
             "max_cache_len": capture_meta["max_cache_len"],
             "captured_decode_step": capture_meta["captured_decode_step"],
+            "qkv_input_shape": list(payloads["qkv"]["x"].shape),
+            "qkv_weight_shape": list(payloads["qkv"]["weight"].shape),
+            "qkv_weight_is_contiguous": bool(payloads["qkv"]["weight"].is_contiguous()),
+            "gate_up_input_shape": list(payloads["gate_up"]["x"].shape),
+            "gate_up_weight_shape": list(payloads["gate_up"]["weight"].shape),
+            "gate_up_weight_is_contiguous": bool(payloads["gate_up"]["weight"].is_contiguous()),
             "o_proj_input_shape": list(payloads["o_proj"]["x"].shape),
             "o_proj_weight_shape": list(payloads["o_proj"]["weight"].shape),
             "o_proj_weight_is_contiguous": bool(payloads["o_proj"]["weight"].is_contiguous()),
@@ -502,6 +543,8 @@ def main():
             "dtype": str(payloads["o_proj"]["x"].dtype),
             "device": str(payloads["o_proj"]["x"].device),
         },
+        "qkv_benchmarks": _run_benchmarks(payloads["qkv"], warmup=args.warmup, iters=args.iters, use_graph=args.graph),
+        "gate_up_benchmarks": _run_benchmarks(payloads["gate_up"], warmup=args.warmup, iters=args.iters, use_graph=args.graph),
         "o_proj_benchmarks": _run_benchmarks(payloads["o_proj"], warmup=args.warmup, iters=args.iters, use_graph=args.graph),
         "down_proj_benchmarks": _run_benchmarks(payloads["down_proj"], warmup=args.warmup, iters=args.iters, use_graph=args.graph),
         "lm_head_benchmarks": _run_benchmarks(payloads["lm_head"], warmup=args.warmup, iters=args.iters, use_graph=args.graph),
@@ -511,32 +554,15 @@ def main():
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(output, indent=2, ensure_ascii=False))
 
-    print("[LinearBench] o_proj")
-    for name, info in output["o_proj_benchmarks"].items():
-        if info.get("status") != "ok":
-            print(f"  {name:<24} ERROR  {info.get('error', 'unknown error')}")
-            continue
-        speedup = info.get("speedup_vs_ref")
-        speedup_text = "-" if speedup is None else f"{speedup:.2f}x"
-        print(f"  {name:<24} {info['time_ms']:.4f} ms  {speedup_text}")
-
-    print("[LinearBench] down_proj")
-    for name, info in output["down_proj_benchmarks"].items():
-        if info.get("status") != "ok":
-            print(f"  {name:<24} ERROR  {info.get('error', 'unknown error')}")
-            continue
-        speedup = info.get("speedup_vs_ref")
-        speedup_text = "-" if speedup is None else f"{speedup:.2f}x"
-        print(f"  {name:<24} {info['time_ms']:.4f} ms  {speedup_text}")
-
-    print("[LinearBench] lm_head")
-    for name, info in output["lm_head_benchmarks"].items():
-        if info.get("status") != "ok":
-            print(f"  {name:<24} ERROR  {info.get('error', 'unknown error')}")
-            continue
-        speedup = info.get("speedup_vs_ref")
-        speedup_text = "-" if speedup is None else f"{speedup:.2f}x"
-        print(f"  {name:<24} {info['time_ms']:.4f} ms  {speedup_text}")
+    for target in ("qkv", "gate_up", "o_proj", "down_proj", "lm_head"):
+        print(f"[LinearBench] {target}")
+        for name, info in output[f"{target}_benchmarks"].items():
+            if info.get("status") != "ok":
+                print(f"  {name:<24} ERROR  {info.get('error', 'unknown error')}")
+                continue
+            speedup = info.get("speedup_vs_ref")
+            speedup_text = "-" if speedup is None else f"{speedup:.2f}x"
+            print(f"  {name:<24} {info['time_ms']:.4f} ms  {speedup_text}")
 
     print(f"[LinearBench] Saved to: {output_path}")
 

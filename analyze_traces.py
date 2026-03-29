@@ -13,7 +13,8 @@ Usage:
 import argparse
 import json
 import os
-from collections import defaultdict
+from bisect import bisect_left
+from collections import Counter, defaultdict
 from pathlib import Path
 
 # Qwen3-VL-2B has 28 decoder layers
@@ -143,6 +144,19 @@ def categorize_cpu_op(name):
     return 'Other'
 
 
+def simplify_timeline_name(cat, name):
+    """Compact label for per-step timeline dumps."""
+    if cat == 'kernel':
+        return simplify_kernel_name(name)
+    if cat == 'gpu_memcpy':
+        return f"[Memcpy] {name}"
+    if cat == 'gpu_memset':
+        return f"[Memset] {name}"
+    if cat == 'cuda_runtime':
+        return f"[Runtime] {name}"
+    return name
+
+
 SYNC_RUNTIME_NAMES = {
     'cudaStreamSynchronize',
     'cudaEventSynchronize',
@@ -231,6 +245,7 @@ def analyze_single_trace(filepath):
 
     stats = {
         'file': filepath.name,
+        'trace_path': str(filepath),
         'filesize_mb': filesize_mb,
         'num_events': len(events),
         'kernel_ops': defaultdict(lambda: {'count': 0, 'total_dur': 0.0, 'max_dur': 0.0}),
@@ -441,6 +456,180 @@ def analyze_single_trace(filepath):
     }
 
     return stats
+
+
+def _sample_positions(total, sample_count, skip_first=False):
+    """Pick evenly spaced 0-based sample positions."""
+    if total <= 0 or sample_count <= 0:
+        return []
+
+    start = 1 if skip_first and total > 1 else 0
+    if total - start <= sample_count:
+        return list(range(start, total))
+
+    if sample_count == 1:
+        return [start]
+
+    span = (total - 1) - start
+    picked = []
+    for i in range(sample_count):
+        pos = start + round(span * i / (sample_count - 1))
+        if not picked or pos != picked[-1]:
+            picked.append(pos)
+
+    if picked[-1] != total - 1:
+        picked[-1] = total - 1
+    return picked
+
+
+def _load_step_windows(trace_path):
+    """Re-open one trace and extract per-cudaGraphLaunch GPU op windows."""
+    with open(trace_path, 'r') as f:
+        events = json.load(f).get('traceEvents', [])
+
+    launches = sorted(
+        [ev for ev in events if ev.get('cat') == 'cuda_runtime' and ev.get('name') == 'cudaGraphLaunch'],
+        key=lambda ev: ev.get('ts', 0),
+    )
+    if not launches:
+        return []
+
+    gpu_ops = sorted(
+        [ev for ev in events if ev.get('cat') in ('kernel', 'gpu_memcpy', 'gpu_memset')],
+        key=lambda ev: ev.get('ts', 0),
+    )
+    if not gpu_ops:
+        return []
+
+    op_starts = [ev.get('ts', 0) for ev in gpu_ops]
+    last_gpu_end = max(ev.get('ts', 0) + ev.get('dur', 0) for ev in gpu_ops)
+    windows = []
+
+    for idx, launch in enumerate(launches):
+        start_ts = launch.get('ts', 0)
+        end_ts = launches[idx + 1].get('ts', 0) if idx + 1 < len(launches) else last_gpu_end + 1
+        left = bisect_left(op_starts, start_ts)
+        right = bisect_left(op_starts, end_ts)
+
+        ops = []
+        attention_anchor_indices = []
+        cat_counter = Counter()
+        for ev in gpu_ops[left:right]:
+            cat = ev.get('cat', '')
+            name = ev.get('name', '')
+            short_name = simplify_timeline_name(cat, name)
+            op = {
+                'cat': cat,
+                'name': name,
+                'short_name': short_name,
+                'offset_us': ev.get('ts', 0) - start_ts,
+                'dur_us': ev.get('dur', 0),
+            }
+            if '[Attention]' in short_name or '[FlashAttn' in short_name:
+                attention_anchor_indices.append(len(ops))
+            ops.append(op)
+            cat_counter[cat] += 1
+
+        windows.append({
+            'step_idx': idx,
+            'launch_dur_us': launch.get('dur', 0),
+            'window_dur_us': max(0.0, end_ts - start_ts),
+            'ops': ops,
+            'attention_anchor_indices': attention_anchor_indices,
+            'cat_counter': cat_counter,
+            'kernel_time_us': sum(op['dur_us'] for op in ops if op['cat'] == 'kernel'),
+        })
+
+    return windows
+
+
+def _collapse_ops(ops):
+    """Collapse consecutive identical ops for readable timeline dumps."""
+    collapsed = []
+    for op in ops:
+        key = (op['cat'], op['short_name'])
+        if collapsed and collapsed[-1]['key'] == key:
+            collapsed[-1]['count'] += 1
+            collapsed[-1]['total_dur_us'] += op['dur_us']
+            collapsed[-1]['max_dur_us'] = max(collapsed[-1]['max_dur_us'], op['dur_us'])
+        else:
+            collapsed.append({
+                'key': key,
+                'cat': op['cat'],
+                'short_name': op['short_name'],
+                'offset_us': op['offset_us'],
+                'count': 1,
+                'total_dur_us': op['dur_us'],
+                'max_dur_us': op['dur_us'],
+            })
+    return collapsed
+
+
+def print_decode_step_samples(
+    all_stats,
+    step_samples=3,
+    step_op_limit=80,
+    layer_samples=3,
+    layer_neighborhood=12,
+):
+    """Print sampled decode-step timelines and local layer neighborhoods."""
+    graph_stats = [s for s in all_stats if s.get('graph_launch_count', 0) > 0]
+    if not graph_stats or step_samples <= 0:
+        return
+
+    print(f"\n{'='*100}")
+    print("  DECODE STEP TIMELINE SAMPLES")
+    print(f"{'='*100}")
+    print("  Each sampled step is one cudaGraphLaunch window.")
+    print("  Sequence view is collapsed by consecutive identical ops for readability.")
+
+    for stats in graph_stats:
+        windows = _load_step_windows(stats['trace_path'])
+        if not windows:
+            continue
+
+        sample_positions = _sample_positions(len(windows), step_samples, skip_first=(len(windows) > 2))
+        print(f"\n  Trace: {stats['file']}  total graph launches={len(windows)}  sampled steps={len(sample_positions)}")
+
+        for pos in sample_positions:
+            step = windows[pos]
+            ops = step['ops']
+            collapsed = _collapse_ops(ops)
+            kernel_count = step['cat_counter'].get('kernel', 0)
+            memcpy_count = step['cat_counter'].get('gpu_memcpy', 0)
+            memset_count = step['cat_counter'].get('gpu_memset', 0)
+            print(f"\n  Step {pos + 1}/{len(windows)}"
+                  f"  window={step['window_dur_us']/1000:.2f} ms"
+                  f"  launch={step['launch_dur_us']/1000:.2f} ms"
+                  f"  kernel_time={step['kernel_time_us']/1000:.2f} ms")
+            print(f"    Raw ops: {len(ops)}  kernels={kernel_count} memcpy={memcpy_count} memset={memset_count}"
+                  f"  attention_anchors={len(step['attention_anchor_indices'])}")
+            print(f"    Collapsed sequence groups shown: {min(step_op_limit, len(collapsed))}/{len(collapsed)}")
+            print(f"    {'Idx':<5} {'Offset(us)':<12} {'Dur(us)':<10} {'Count':<7} {'Op'}")
+            print(f"    {'-'*5} {'-'*12} {'-'*10} {'-'*7} {'-'*60}")
+            for idx, seg in enumerate(collapsed[:step_op_limit], start=1):
+                print(f"    {idx:<5} {seg['offset_us']:<12.1f} {seg['total_dur_us']:<10.1f} {seg['count']:<7} {seg['short_name']}")
+            if len(collapsed) > step_op_limit:
+                print(f"    ... {len(collapsed) - step_op_limit} more collapsed groups omitted")
+
+            anchors = step['attention_anchor_indices']
+            if not anchors:
+                continue
+
+            layer_positions = _sample_positions(len(anchors), layer_samples, skip_first=False)
+            print(f"\n    Layer-local neighborhoods (using attention kernel as anchor):")
+            for layer_pos in layer_positions:
+                anchor_op_idx = anchors[layer_pos]
+                lo = max(0, anchor_op_idx - layer_neighborhood)
+                hi = min(len(ops), anchor_op_idx + layer_neighborhood + 1)
+                print(f"      Layer anchor {layer_pos + 1}/{len(anchors)}  raw_op={anchor_op_idx + 1}"
+                      f"  showing ops[{lo + 1}:{hi}]")
+                print(f"      {'Op#':<6} {'Offset(us)':<12} {'Dur(us)':<10} {'Mark':<5} {'Op'}")
+                print(f"      {'-'*6} {'-'*12} {'-'*10} {'-'*5} {'-'*60}")
+                for raw_idx in range(lo, hi):
+                    op = ops[raw_idx]
+                    mark = 'ATTN' if raw_idx == anchor_op_idx else ''
+                    print(f"      {raw_idx + 1:<6} {op['offset_us']:<12.1f} {op['dur_us']:<10.1f} {mark:<5} {op['short_name']}")
 
 
 def print_top_ops(ops_dict, title, top_n=20):
@@ -969,6 +1158,14 @@ def main():
                         help='Directory containing generate_*.json trace files (default: ./traces)')
     parser.add_argument('--top', type=int, default=30,
                         help='Number of top ops to display (default: 30)')
+    parser.add_argument('--step-samples', type=int, default=3,
+                        help='Number of decode-step timeline samples to print for graph traces (default: 3)')
+    parser.add_argument('--step-op-limit', type=int, default=80,
+                        help='Max collapsed sequence groups to print per sampled decode step (default: 80)')
+    parser.add_argument('--layer-samples', type=int, default=3,
+                        help='Number of layer-local neighborhoods to print per sampled decode step (default: 3)')
+    parser.add_argument('--layer-neighborhood', type=int, default=12,
+                        help='Raw ops to show before/after each attention anchor in layer-local view (default: 12)')
     args = parser.parse_args()
 
     trace_dir = Path(args.trace_dir)
@@ -1005,6 +1202,13 @@ def main():
     # Phase breakdown (TTFT vs Decode)
     analyze_phase_breakdown(all_stats)
     analyze_steady_state_decode(all_stats)
+    print_decode_step_samples(
+        all_stats,
+        step_samples=args.step_samples,
+        step_op_limit=args.step_op_limit,
+        layer_samples=args.layer_samples,
+        layer_neighborhood=args.layer_neighborhood,
+    )
 
     # Merge all stats for global analysis
     merged = merge_stats(all_stats)
