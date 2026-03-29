@@ -1,0 +1,559 @@
+{
+  "system_info": {
+    "python_version": "3.12.3",
+    "torch_version": "2.8.0+cu128",
+    "cuda_version": "12.8",
+    "cudnn_version": "91002",
+    "gpu_name": "NVIDIA A800 80GB PCIe",
+    "gpu_compute_capability": "8.0"
+  },
+  "metadata": {
+    "sample_idx": 0,
+    "layer_idx": 14,
+    "decode_step": 36,
+    "bucketed": true,
+    "bench_mode": "graph",
+    "prompt_length": 690,
+    "max_cache_len": 832,
+    "captured_decode_step": 36,
+    "qkv_input_shape": [
+      1,
+      1,
+      2048
+    ],
+    "qkv_weight_shape": [
+      4096,
+      2048
+    ],
+    "qkv_weight_is_contiguous": true,
+    "gate_up_input_shape": [
+      1,
+      1,
+      2048
+    ],
+    "gate_up_weight_shape": [
+      12288,
+      2048
+    ],
+    "gate_up_weight_is_contiguous": true,
+    "o_proj_input_shape": [
+      1,
+      1,
+      2048
+    ],
+    "o_proj_weight_shape": [
+      2048,
+      2048
+    ],
+    "o_proj_weight_is_contiguous": true,
+    "down_proj_input_shape": [
+      1,
+      1,
+      6144
+    ],
+    "down_proj_weight_shape": [
+      2048,
+      6144
+    ],
+    "down_proj_weight_is_contiguous": true,
+    "lm_head_input_shape": [
+      1,
+      1,
+      2048
+    ],
+    "lm_head_weight_shape": [
+      151936,
+      2048
+    ],
+    "lm_head_weight_is_contiguous": true,
+    "dtype": "torch.float16",
+    "device": "cuda:0",
+    "timer": "cuda_event",
+    "graph_capture_repeats": 64
+  },
+  "qkv_benchmarks": {
+    "f_linear": {
+      "time_ms": 0.010950399935245514,
+      "status": "ok"
+    },
+    "f_linear_contiguous_weight": {
+      "time_ms": 0.010949599742889404,
+      "status": "ok",
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "speedup_vs_ref": 1.000073079598789
+    },
+    "matmul_weight_t": {
+      "time_ms": 0.010949599742889404,
+      "status": "ok",
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "speedup_vs_ref": 1.000073079598789
+    },
+    "triton_matvec": {
+      "time_ms": 0.024028800427913666,
+      "status": "ok",
+      "max_abs_diff": 0.001953125,
+      "mean_abs_diff": 8.947099559009075e-07,
+      "speedup_vs_ref": 0.45571979209268826
+    },
+    "triton_splitk4_matvec": {
+      "time_ms": 0.012142399698495865,
+      "status": "ok",
+      "max_abs_diff": 0.001953125,
+      "mean_abs_diff": 8.947099559009075e-07,
+      "speedup_vs_ref": 0.9018316154262317
+    },
+    "triton_splitk8_matvec": {
+      "time_ms": 0.010492800176143647,
+      "status": "ok",
+      "max_abs_diff": 0.001953125,
+      "mean_abs_diff": 1.3643293641507626e-06,
+      "speedup_vs_ref": 1.0436108332780665
+    },
+    "cuda_splitk8_matvec": {
+      "time_ms": 0.029812800884246825,
+      "status": "ok",
+      "max_abs_diff": 0.001953125,
+      "mean_abs_diff": 8.874339982867241e-07,
+      "speedup_vs_ref": 0.36730530545460216
+    },
+    "cuda_splitk16_matvec": {
+      "time_ms": 0.05421680212020874,
+      "status": "ok",
+      "max_abs_diff": 0.001953125,
+      "mean_abs_diff": 8.878996595740318e-07,
+      "speedup_vs_ref": 0.20197428669744186
+    },
+    "cuda_row4_splitk8_matvec": {
+      "time_ms": 0.019069600105285644,
+      "status": "ok",
+      "max_abs_diff": 0.001953125,
+      "mean_abs_diff": 8.874339982867241e-07,
+      "speedup_vs_ref": 0.5742333281656138
+    },
+    "cuda_row4_splitk16_matvec": {
+      "time_ms": 0.0224248006939888,
+      "status": "ok",
+      "max_abs_diff": 0.001953125,
+      "mean_abs_diff": 8.878996595740318e-07,
+      "speedup_vs_ref": 0.48831648872495365
+    },
+    "cuda_row8_shared_splitk8_matvec": {
+      "time_ms": 0.02114560008049011,
+      "status": "ok",
+      "max_abs_diff": 0.001953125,
+      "mean_abs_diff": 8.874339982867241e-07,
+      "speedup_vs_ref": 0.5178571378236199
+    },
+    "cuda_row8_shared_splitk16_matvec": {
+      "time_ms": 0.026578399538993835,
+      "status": "ok",
+      "max_abs_diff": 0.001953125,
+      "mean_abs_diff": 8.878996595740318e-07,
+      "speedup_vs_ref": 0.41200373706399845
+    },
+    "cuda_row4_shared_vec_half_splitk8_matvec": {
+      "time_ms": 0.016548000276088715,
+      "status": "ok",
+      "max_abs_diff": 0.001953125,
+      "mean_abs_diff": 1.1040247045457363e-06,
+      "speedup_vs_ref": 0.6617355422134276
+    },
+    "cuda_row4_shared_vec_half_splitk16_matvec": {
+      "time_ms": 0.02697120010852814,
+      "status": "ok",
+      "max_abs_diff": 0.001953125,
+      "mean_abs_diff": 8.651404641568661e-07,
+      "speedup_vs_ref": 0.40600343667255134
+    }
+  },
+  "gate_up_benchmarks": {
+    "f_linear": {
+      "time_ms": 0.03472479879856109,
+      "status": "ok"
+    },
+    "f_linear_contiguous_weight": {
+      "time_ms": 0.03474000096321106,
+      "status": "ok",
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "speedup_vs_ref": 0.9995624017205392
+    },
+    "matmul_weight_t": {
+      "time_ms": 0.034778401255607605,
+      "status": "ok",
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "speedup_vs_ref": 0.9984587429234439
+    },
+    "triton_matvec": {
+      "time_ms": 0.06048640012741089,
+      "status": "ok",
+      "max_abs_diff": 0.00390625,
+      "mean_abs_diff": 3.0353889997059014e-06,
+      "speedup_vs_ref": 0.5740926675321302
+    },
+    "triton_splitk4_matvec": {
+      "time_ms": 0.03690960109233856,
+      "status": "ok",
+      "max_abs_diff": 0.00390625,
+      "mean_abs_diff": 3.0204780614440097e-06,
+      "speedup_vs_ref": 0.9408066673949783
+    },
+    "triton_splitk8_matvec": {
+      "time_ms": 0.03704479932785034,
+      "status": "ok",
+      "max_abs_diff": 0.00390625,
+      "mean_abs_diff": 3.025411160706426e-06,
+      "speedup_vs_ref": 0.9373731111685341
+    },
+    "cuda_splitk8_matvec": {
+      "time_ms": 0.07863119840621949,
+      "status": "ok",
+      "max_abs_diff": 0.00390625,
+      "mean_abs_diff": 3.0249502742663026e-06,
+      "speedup_vs_ref": 0.4416160442979395
+    },
+    "cuda_splitk16_matvec": {
+      "time_ms": 0.15164799690246583,
+      "status": "ok",
+      "max_abs_diff": 0.00390625,
+      "mean_abs_diff": 3.0101996344455983e-06,
+      "speedup_vs_ref": 0.22898290454106526
+    },
+    "cuda_row4_splitk8_matvec": {
+      "time_ms": 0.05143359899520874,
+      "status": "ok",
+      "max_abs_diff": 0.00390625,
+      "mean_abs_diff": 3.0249502742663026e-06,
+      "speedup_vs_ref": 0.6751384207392498
+    },
+    "cuda_row4_splitk16_matvec": {
+      "time_ms": 0.061256802082061766,
+      "status": "ok",
+      "max_abs_diff": 0.00390625,
+      "mean_abs_diff": 3.0101996344455983e-06,
+      "speedup_vs_ref": 0.5668725368987191
+    },
+    "cuda_row8_shared_splitk8_matvec": {
+      "time_ms": 0.06278160214424133,
+      "status": "ok",
+      "max_abs_diff": 0.00390625,
+      "mean_abs_diff": 3.0249502742663026e-06,
+      "speedup_vs_ref": 0.5531046932950283
+    },
+    "cuda_row8_shared_splitk16_matvec": {
+      "time_ms": 0.07987359762191773,
+      "status": "ok",
+      "max_abs_diff": 0.00390625,
+      "mean_abs_diff": 3.0101996344455983e-06,
+      "speedup_vs_ref": 0.4347468980041589
+    },
+    "cuda_row4_shared_vec_half_splitk8_matvec": {
+      "time_ms": 0.04866720139980316,
+      "status": "ok",
+      "max_abs_diff": 0.00390625,
+      "mean_abs_diff": 3.0304170195449842e-06,
+      "speedup_vs_ref": 0.7135154231141292
+    },
+    "cuda_row4_shared_vec_half_splitk16_matvec": {
+      "time_ms": 0.07770479917526245,
+      "status": "ok",
+      "max_abs_diff": 0.00390625,
+      "mean_abs_diff": 3.025760406671907e-06,
+      "speedup_vs_ref": 0.4468810056408438
+    }
+  },
+  "o_proj_benchmarks": {
+    "f_linear": {
+      "time_ms": 0.010248800367116928,
+      "status": "ok"
+    },
+    "f_linear_contiguous_weight": {
+      "time_ms": 0.010248000174760819,
+      "status": "ok",
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "speedup_vs_ref": 1.0000780827812707
+    },
+    "matmul_weight_t": {
+      "time_ms": 0.0102463997900486,
+      "status": "ok",
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "speedup_vs_ref": 1.0002342849310506
+    },
+    "triton_matvec": {
+      "time_ms": 0.0237744003534317,
+      "status": "ok",
+      "max_abs_diff": 0.0001220703125,
+      "mean_abs_diff": 8.940696716308594e-08,
+      "speedup_vs_ref": 0.4310855464178961
+    },
+    "triton_splitk4_matvec": {
+      "time_ms": 0.010016000270843506,
+      "status": "ok",
+      "max_abs_diff": 0.0001220703125,
+      "mean_abs_diff": 8.940696716308594e-08,
+      "speedup_vs_ref": 1.0232428204850494
+    },
+    "triton_splitk8_matvec": {
+      "time_ms": 0.00860240012407303,
+      "status": "ok",
+      "max_abs_diff": 0.0001220703125,
+      "mean_abs_diff": 8.940696716308594e-08,
+      "speedup_vs_ref": 1.1913884752275818
+    },
+    "cuda_splitk8_matvec": {
+      "time_ms": 0.017715999484062196,
+      "status": "ok",
+      "max_abs_diff": 6.103515625e-05,
+      "mean_abs_diff": 2.9802322387695312e-08,
+      "speedup_vs_ref": 0.5785053435081116
+    },
+    "cuda_splitk16_matvec": {
+      "time_ms": 0.029812800884246825,
+      "status": "ok",
+      "max_abs_diff": 6.103515625e-05,
+      "mean_abs_diff": 2.991873770952225e-08,
+      "speedup_vs_ref": 0.34377180483342057
+    },
+    "cuda_row4_splitk8_matvec": {
+      "time_ms": 0.011847999691963196,
+      "status": "ok",
+      "max_abs_diff": 6.103515625e-05,
+      "mean_abs_diff": 2.9802322387695312e-08,
+      "speedup_vs_ref": 0.8650236861559807
+    },
+    "cuda_row4_splitk16_matvec": {
+      "time_ms": 0.013463999330997466,
+      "status": "ok",
+      "max_abs_diff": 6.103515625e-05,
+      "mean_abs_diff": 2.991873770952225e-08,
+      "speedup_vs_ref": 0.7612003027600905
+    },
+    "cuda_row8_shared_splitk8_matvec": {
+      "time_ms": 0.01321599930524826,
+      "status": "ok",
+      "max_abs_diff": 6.103515625e-05,
+      "mean_abs_diff": 2.9802322387695312e-08,
+      "speedup_vs_ref": 0.7754843300458547
+    },
+    "cuda_row8_shared_splitk16_matvec": {
+      "time_ms": 0.015569600462913512,
+      "status": "ok",
+      "max_abs_diff": 6.103515625e-05,
+      "mean_abs_diff": 2.991873770952225e-08,
+      "speedup_vs_ref": 0.6582571204398836
+    },
+    "cuda_row4_shared_vec_half_splitk8_matvec": {
+      "time_ms": 0.010735999792814255,
+      "status": "ok",
+      "max_abs_diff": 0.0001220703125,
+      "mean_abs_diff": 8.940696716308594e-08,
+      "speedup_vs_ref": 0.9546200228111577
+    },
+    "cuda_row4_shared_vec_half_splitk16_matvec": {
+      "time_ms": 0.015862399339675905,
+      "status": "ok",
+      "max_abs_diff": 0.0001220703125,
+      "mean_abs_diff": 8.940696716308594e-08,
+      "speedup_vs_ref": 0.6461065660780627
+    }
+  },
+  "down_proj_benchmarks": {
+    "f_linear": {
+      "time_ms": 0.025922399759292603,
+      "status": "ok"
+    },
+    "f_linear_contiguous_weight": {
+      "time_ms": 0.025920799374580382,
+      "status": "ok",
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "speedup_vs_ref": 1.0000617413332473
+    },
+    "matmul_weight_t": {
+      "time_ms": 0.025925600528717042,
+      "status": "ok",
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "speedup_vs_ref": 0.9998765402012234
+    },
+    "triton_matvec": {
+      "time_ms": 0.03658959865570068,
+      "status": "ok",
+      "max_abs_diff": 0.00048828125,
+      "mean_abs_diff": 2.403976395726204e-07,
+      "speedup_vs_ref": 0.7084636265955292
+    },
+    "triton_splitk4_matvec": {
+      "time_ms": 0.018356800079345703,
+      "status": "ok",
+      "max_abs_diff": 1.9073486328125e-06,
+      "mean_abs_diff": 2.939486876130104e-09,
+      "speedup_vs_ref": 1.412141530508871
+    },
+    "triton_splitk8_matvec": {
+      "time_ms": 0.014732800424098969,
+      "status": "ok",
+      "max_abs_diff": 1.9073486328125e-06,
+      "mean_abs_diff": 2.939486876130104e-09,
+      "speedup_vs_ref": 1.7595025394418842
+    },
+    "cuda_splitk8_matvec": {
+      "time_ms": 0.02492720037698746,
+      "status": "ok",
+      "max_abs_diff": 0.00048828125,
+      "mean_abs_diff": 6.064074113965034e-07,
+      "speedup_vs_ref": 1.0399242340597503
+    },
+    "cuda_splitk16_matvec": {
+      "time_ms": 0.030245599150657655,
+      "status": "ok",
+      "max_abs_diff": 0.00048828125,
+      "mean_abs_diff": 3.6798883229494095e-07,
+      "speedup_vs_ref": 0.8570635228672252
+    },
+    "cuda_row4_splitk8_matvec": {
+      "time_ms": 0.022971199452877046,
+      "status": "ok",
+      "max_abs_diff": 0.00048828125,
+      "mean_abs_diff": 6.064074113965034e-07,
+      "speedup_vs_ref": 1.128473931562417
+    },
+    "cuda_row4_splitk16_matvec": {
+      "time_ms": 0.02396959960460663,
+      "status": "ok",
+      "max_abs_diff": 0.00048828125,
+      "mean_abs_diff": 3.6798883229494095e-07,
+      "speedup_vs_ref": 1.0814698696222973
+    },
+    "cuda_row8_shared_splitk8_matvec": {
+      "time_ms": 0.02775520086288452,
+      "status": "ok",
+      "max_abs_diff": 0.00048828125,
+      "mean_abs_diff": 6.064074113965034e-07,
+      "speedup_vs_ref": 0.9339654894718193
+    },
+    "cuda_row8_shared_splitk16_matvec": {
+      "time_ms": 0.02909039855003357,
+      "status": "ok",
+      "max_abs_diff": 0.00048828125,
+      "mean_abs_diff": 3.6798883229494095e-07,
+      "speedup_vs_ref": 0.8910981303576087
+    },
+    "cuda_row4_shared_vec_half_splitk8_matvec": {
+      "time_ms": 0.020034399628639222,
+      "status": "ok",
+      "max_abs_diff": 0.0001220703125,
+      "mean_abs_diff": 1.3239332474768162e-07,
+      "speedup_vs_ref": 1.29389451342662
+    },
+    "cuda_row4_shared_vec_half_splitk16_matvec": {
+      "time_ms": 0.0242344006896019,
+      "status": "ok",
+      "max_abs_diff": 0.000244140625,
+      "mean_abs_diff": 3.7171412259340286e-07,
+      "speedup_vs_ref": 1.0696530147912824
+    }
+  },
+  "lm_head_benchmarks": {
+    "f_linear": {
+      "time_ms": 0.3557552099227905,
+      "status": "ok"
+    },
+    "f_linear_contiguous_weight": {
+      "time_ms": 0.3560960054397583,
+      "status": "ok",
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "speedup_vs_ref": 0.9990429673128546
+    },
+    "matmul_weight_t": {
+      "time_ms": 0.3557656049728394,
+      "status": "ok",
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "speedup_vs_ref": 0.9999707811831623
+    },
+    "triton_matvec": {
+      "time_ms": 0.38916959762573244,
+      "status": "ok",
+      "max_abs_diff": 0.015625,
+      "mean_abs_diff": 6.131738246040186e-06,
+      "speedup_vs_ref": 0.9141392649713691
+    },
+    "triton_splitk4_matvec": {
+      "time_ms": 0.3671024084091187,
+      "status": "ok",
+      "max_abs_diff": 0.015625,
+      "mean_abs_diff": 6.015453891450306e-06,
+      "speedup_vs_ref": 0.9690898282702569
+    },
+    "triton_splitk8_matvec": {
+      "time_ms": 0.3753423929214478,
+      "status": "ok",
+      "max_abs_diff": 0.015625,
+      "mean_abs_diff": 6.049395778973121e-06,
+      "speedup_vs_ref": 0.94781515925712
+    },
+    "cuda_splitk8_matvec": {
+      "time_ms": 0.9076184272766114,
+      "status": "ok",
+      "max_abs_diff": 0.015625,
+      "mean_abs_diff": 5.961823262623511e-06,
+      "speedup_vs_ref": 0.3919656093698596
+    },
+    "cuda_splitk16_matvec": {
+      "time_ms": 1.8076000213623047,
+      "status": "ok",
+      "max_abs_diff": 0.015625,
+      "mean_abs_diff": 6.038982519385172e-06,
+      "speedup_vs_ref": 0.1968108020128669
+    },
+    "cuda_row4_splitk8_matvec": {
+      "time_ms": 0.62079758644104,
+      "status": "ok",
+      "max_abs_diff": 0.015625,
+      "mean_abs_diff": 5.961823262623511e-06,
+      "speedup_vs_ref": 0.5730615222947202
+    },
+    "cuda_row4_splitk16_matvec": {
+      "time_ms": 0.7407671928405761,
+      "status": "ok",
+      "max_abs_diff": 0.015625,
+      "mean_abs_diff": 6.038982519385172e-06,
+      "speedup_vs_ref": 0.48025238342237736
+    },
+    "cuda_row8_shared_splitk8_matvec": {
+      "time_ms": 0.7292776107788086,
+      "status": "ok",
+      "max_abs_diff": 0.015625,
+      "mean_abs_diff": 5.961823262623511e-06,
+      "speedup_vs_ref": 0.48781863677793863
+    },
+    "cuda_row8_shared_splitk16_matvec": {
+      "time_ms": 0.9175687789916992,
+      "status": "ok",
+      "max_abs_diff": 0.015625,
+      "mean_abs_diff": 6.038982519385172e-06,
+      "speedup_vs_ref": 0.3877150335408359
+    },
+    "cuda_row4_shared_vec_half_splitk8_matvec": {
+      "time_ms": 0.5148399829864502,
+      "status": "ok",
+      "max_abs_diff": 0.015625,
+      "mean_abs_diff": 6.0179645515745506e-06,
+      "speedup_vs_ref": 0.6910015182953525
+    },
+    "cuda_row4_shared_vec_half_splitk16_matvec": {
+      "time_ms": 0.8859840393066406,
+      "status": "ok",
+      "max_abs_diff": 0.015625,
+      "mean_abs_diff": 6.01716919845785e-06,
+      "speedup_vs_ref": 0.4015368157209693
+    }
+  }
+}

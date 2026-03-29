@@ -1,0 +1,51 @@
+{
+  "metadata": {
+    "sample_idx": 0,
+    "layer_idx": 14,
+    "decode_step": 36,
+    "valid_len": 727,
+    "max_cache_len": 832,
+    "dtype": "torch.float16",
+    "bench_mode": "graph"
+  },
+  "triton_grouped_cachepos_splitkv": {
+    "time_ms": 0.014430160323778788
+  },
+  "cuda_splitk_sweep": {
+    "4": {
+      "time_ms": 0.07748150577147801,
+      "max_abs_diff_vs_triton": 0.0625,
+      "mean_abs_diff_vs_triton": 0.0020720767788589
+    },
+    "8": {
+      "time_ms": 0.041916780173778534,
+      "max_abs_diff_vs_triton": 0.0625,
+      "mean_abs_diff_vs_triton": 0.0020720767788589
+    },
+    "16": {
+      "time_ms": 0.02551755557457606,
+      "max_abs_diff_vs_triton": 0.0625,
+      "mean_abs_diff_vs_triton": 0.0020720767788589
+    },
+    "24": {
+      "time_ms": 0.02103627969821294,
+      "max_abs_diff_vs_triton": 0.0625,
+      "mean_abs_diff_vs_triton": 0.0020718383602797985
+    },
+    "32": {
+      "time_ms": 0.019350027044614155,
+      "max_abs_diff_vs_triton": 0.0625,
+      "mean_abs_diff_vs_triton": 0.0020720767788589
+    },
+    "48": {
+      "time_ms": 0.019114774962266285,
+      "max_abs_diff_vs_triton": 0.0625,
+      "mean_abs_diff_vs_triton": 0.0020720767788589
+    },
+    "64": {
+      "time_ms": 0.020317484935124714,
+      "max_abs_diff_vs_triton": 0.0625,
+      "mean_abs_diff_vs_triton": 0.0020720767788589
+    }
+  }
+}

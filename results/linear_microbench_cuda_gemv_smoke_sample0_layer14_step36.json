@@ -1,0 +1,349 @@
+{
+  "system_info": {
+    "python_version": "3.12.3",
+    "torch_version": "2.8.0+cu128",
+    "cuda_version": "12.8",
+    "cudnn_version": "91002",
+    "gpu_name": "NVIDIA A800 80GB PCIe",
+    "gpu_compute_capability": "8.0"
+  },
+  "metadata": {
+    "sample_idx": 0,
+    "layer_idx": 14,
+    "decode_step": 36,
+    "bucketed": true,
+    "bench_mode": "graph",
+    "prompt_length": 690,
+    "max_cache_len": 832,
+    "captured_decode_step": 36,
+    "qkv_input_shape": [
+      1,
+      1,
+      2048
+    ],
+    "qkv_weight_shape": [
+      4096,
+      2048
+    ],
+    "qkv_weight_is_contiguous": true,
+    "gate_up_input_shape": [
+      1,
+      1,
+      2048
+    ],
+    "gate_up_weight_shape": [
+      12288,
+      2048
+    ],
+    "gate_up_weight_is_contiguous": true,
+    "o_proj_input_shape": [
+      1,
+      1,
+      2048
+    ],
+    "o_proj_weight_shape": [
+      2048,
+      2048
+    ],
+    "o_proj_weight_is_contiguous": true,
+    "down_proj_input_shape": [
+      1,
+      1,
+      6144
+    ],
+    "down_proj_weight_shape": [
+      2048,
+      6144
+    ],
+    "down_proj_weight_is_contiguous": true,
+    "lm_head_input_shape": [
+      1,
+      1,
+      2048
+    ],
+    "lm_head_weight_shape": [
+      151936,
+      2048
+    ],
+    "lm_head_weight_is_contiguous": true,
+    "dtype": "torch.float16",
+    "device": "cuda:0",
+    "timer": "cuda_event",
+    "graph_capture_repeats": 64
+  },
+  "qkv_benchmarks": {
+    "f_linear": {
+      "time_ms": 0.010951200127601623,
+      "status": "ok"
+    },
+    "f_linear_contiguous_weight": {
+      "time_ms": 0.010951200127601623,
+      "status": "ok",
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "speedup_vs_ref": 1.0
+    },
+    "matmul_weight_t": {
+      "time_ms": 0.010950399935245514,
+      "status": "ok",
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "speedup_vs_ref": 1.0000730742585513
+    },
+    "triton_matvec": {
+      "time_ms": 0.024033600091934205,
+      "status": "ok",
+      "max_abs_diff": 0.001953125,
+      "mean_abs_diff": 8.947099559009075e-07,
+      "speedup_vs_ref": 0.4556620766639493
+    },
+    "triton_splitk4_matvec": {
+      "time_ms": 0.012143199890851974,
+      "status": "ok",
+      "max_abs_diff": 0.001953125,
+      "mean_abs_diff": 8.947099559009075e-07,
+      "speedup_vs_ref": 0.9018380843628919
+    },
+    "triton_splitk8_matvec": {
+      "time_ms": 0.010504800081253051,
+      "status": "ok",
+      "max_abs_diff": 0.001953125,
+      "mean_abs_diff": 1.1259107850492e-06,
+      "speedup_vs_ref": 1.0424948635762445
+    },
+    "cuda_splitk8_matvec": {
+      "time_ms": 0.02978079915046692,
+      "status": "ok",
+      "max_abs_diff": 0.001953125,
+      "mean_abs_diff": 8.874339982867241e-07,
+      "speedup_vs_ref": 0.36772687234720913
+    },
+    "cuda_splitk16_matvec": {
+      "time_ms": 0.05417839884757995,
+      "status": "ok",
+      "max_abs_diff": 0.001953125,
+      "mean_abs_diff": 8.878996595740318e-07,
+      "speedup_vs_ref": 0.20213222170722736
+    }
+  },
+  "gate_up_benchmarks": {
+    "f_linear": {
+      "time_ms": 0.034720799326896666,
+      "status": "ok"
+    },
+    "f_linear_contiguous_weight": {
+      "time_ms": 0.03473919928073883,
+      "status": "ok",
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "speedup_vs_ref": 0.9994703403007804
+    },
+    "matmul_weight_t": {
+      "time_ms": 0.034753599762916566,
+      "status": "ok",
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "speedup_vs_ref": 0.9990562003290693
+    },
+    "triton_matvec": {
+      "time_ms": 0.060596799850463866,
+      "status": "ok",
+      "max_abs_diff": 0.00390625,
+      "mean_abs_diff": 3.0353889997059014e-06,
+      "speedup_vs_ref": 0.5729807417648786
+    },
+    "triton_splitk4_matvec": {
+      "time_ms": 0.03694399893283844,
+      "status": "ok",
+      "max_abs_diff": 0.00390625,
+      "mean_abs_diff": 3.0152393719617976e-06,
+      "speedup_vs_ref": 0.9398224428821744
+    },
+    "triton_splitk8_matvec": {
+      "time_ms": 0.03705039918422699,
+      "status": "ok",
+      "max_abs_diff": 0.00390625,
+      "mean_abs_diff": 3.0256246645876672e-06,
+      "speedup_vs_ref": 0.9371234883125881
+    },
+    "cuda_splitk8_matvec": {
+      "time_ms": 0.07872080206871032,
+      "status": "ok",
+      "max_abs_diff": 0.00390625,
+      "mean_abs_diff": 3.0249502742663026e-06,
+      "speedup_vs_ref": 0.44106257068609533
+    },
+    "cuda_splitk16_matvec": {
+      "time_ms": 0.15164560079574585,
+      "status": "ok",
+      "max_abs_diff": 0.00390625,
+      "mean_abs_diff": 3.0101996344455983e-06,
+      "speedup_vs_ref": 0.22896014882530438
+    }
+  },
+  "o_proj_benchmarks": {
+    "f_linear": {
+      "time_ms": 0.009967199712991714,
+      "status": "ok"
+    },
+    "f_linear_contiguous_weight": {
+      "time_ms": 0.009944800287485123,
+      "status": "ok",
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "speedup_vs_ref": 1.0022523755992143
+    },
+    "matmul_weight_t": {
+      "time_ms": 0.009937600046396256,
+      "status": "ok",
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "speedup_vs_ref": 1.002978552815294
+    },
+    "triton_matvec": {
+      "time_ms": 0.02378000020980835,
+      "status": "ok",
+      "max_abs_diff": 0.0001220703125,
+      "mean_abs_diff": 8.940696716308594e-08,
+      "speedup_vs_ref": 0.41914212048158944
+    },
+    "triton_splitk4_matvec": {
+      "time_ms": 0.01000560000538826,
+      "status": "ok",
+      "max_abs_diff": 0.0001220703125,
+      "mean_abs_diff": 8.940696716308594e-08,
+      "speedup_vs_ref": 0.9961621199752273
+    },
+    "triton_splitk8_matvec": {
+      "time_ms": 0.008606400340795517,
+      "status": "ok",
+      "max_abs_diff": 0.0001220703125,
+      "mean_abs_diff": 8.940696716308594e-08,
+      "speedup_vs_ref": 1.1581148120365516
+    },
+    "cuda_splitk8_matvec": {
+      "time_ms": 0.017708800733089447,
+      "status": "ok",
+      "max_abs_diff": 6.103515625e-05,
+      "mean_abs_diff": 2.9802322387695312e-08,
+      "speedup_vs_ref": 0.5628387750937697
+    },
+    "cuda_splitk16_matvec": {
+      "time_ms": 0.029791200160980226,
+      "status": "ok",
+      "max_abs_diff": 6.103515625e-05,
+      "mean_abs_diff": 2.991873770952225e-08,
+      "speedup_vs_ref": 0.3345685859962938
+    }
+  },
+  "down_proj_benchmarks": {
+    "f_linear": {
+      "time_ms": 0.02595280110836029,
+      "status": "ok"
+    },
+    "f_linear_contiguous_weight": {
+      "time_ms": 0.02595280110836029,
+      "status": "ok",
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "speedup_vs_ref": 1.0
+    },
+    "matmul_weight_t": {
+      "time_ms": 0.025950399041175843,
+      "status": "ok",
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "speedup_vs_ref": 1.000092563786038
+    },
+    "triton_matvec": {
+      "time_ms": 0.036582401394844054,
+      "status": "ok",
+      "max_abs_diff": 0.00048828125,
+      "mean_abs_diff": 2.403976395726204e-07,
+      "speedup_vs_ref": 0.7094340480343123
+    },
+    "triton_splitk4_matvec": {
+      "time_ms": 0.018310399353504182,
+      "status": "ok",
+      "max_abs_diff": 1.9073486328125e-06,
+      "mean_abs_diff": 2.939486876130104e-09,
+      "speedup_vs_ref": 1.4173803971890724
+    },
+    "triton_splitk8_matvec": {
+      "time_ms": 0.014669600129127502,
+      "status": "ok",
+      "max_abs_diff": 0.0001220703125,
+      "mean_abs_diff": 6.254413165152073e-08,
+      "speedup_vs_ref": 1.7691553198392378
+    },
+    "cuda_splitk8_matvec": {
+      "time_ms": 0.024899999797344207,
+      "status": "ok",
+      "max_abs_diff": 0.00048828125,
+      "mean_abs_diff": 6.064074113965034e-07,
+      "speedup_vs_ref": 1.0422811774933578
+    },
+    "cuda_splitk16_matvec": {
+      "time_ms": 0.03020240068435669,
+      "status": "ok",
+      "max_abs_diff": 0.00048828125,
+      "mean_abs_diff": 3.6798883229494095e-07,
+      "speedup_vs_ref": 0.8592959672176829
+    }
+  },
+  "lm_head_benchmarks": {
+    "f_linear": {
+      "time_ms": 0.3561023950576782,
+      "status": "ok"
+    },
+    "f_linear_contiguous_weight": {
+      "time_ms": 0.35640079975128175,
+      "status": "ok",
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "speedup_vs_ref": 0.9991627272054053
+    },
+    "matmul_weight_t": {
+      "time_ms": 0.35612480640411376,
+      "status": "ok",
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "speedup_vs_ref": 0.9999370688420673
+    },
+    "triton_matvec": {
+      "time_ms": 0.38921520709991453,
+      "status": "ok",
+      "max_abs_diff": 0.015625,
+      "mean_abs_diff": 6.131738246040186e-06,
+      "speedup_vs_ref": 0.9149241565123739
+    },
+    "triton_splitk4_matvec": {
+      "time_ms": 0.36708478927612304,
+      "status": "ok",
+      "max_abs_diff": 0.015625,
+      "mean_abs_diff": 6.015453891450306e-06,
+      "speedup_vs_ref": 0.9700821321414552
+    },
+    "triton_splitk8_matvec": {
+      "time_ms": 0.37538559436798097,
+      "status": "ok",
+      "max_abs_diff": 0.015625,
+      "mean_abs_diff": 6.049395778973121e-06,
+      "speedup_vs_ref": 0.9486309554772101
+    },
+    "cuda_splitk8_matvec": {
+      "time_ms": 0.9073111534118652,
+      "status": "ok",
+      "max_abs_diff": 0.015625,
+      "mean_abs_diff": 5.961823262623511e-06,
+      "speedup_vs_ref": 0.39248100689447707
+    },
+    "cuda_splitk16_matvec": {
+      "time_ms": 1.807650375366211,
+      "status": "ok",
+      "max_abs_diff": 0.015625,
+      "mean_abs_diff": 6.038982519385172e-06,
+      "speedup_vs_ref": 0.19699738395791033
+    }
+  }
+}

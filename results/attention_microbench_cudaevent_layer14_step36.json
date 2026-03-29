@@ -1,0 +1,127 @@
+{
+  "system_info": {
+    "python_version": "3.12.3",
+    "torch_version": "2.8.0+cu128",
+    "cuda_version": "12.8",
+    "cudnn_version": "91002",
+    "gpu_name": "NVIDIA A800 80GB PCIe",
+    "gpu_compute_capability": "8.0"
+  },
+  "metadata": {
+    "sample_idx": 0,
+    "layer_idx": 14,
+    "decode_step": 36,
+    "bucketed": true,
+    "q_shape": [
+      1,
+      16,
+      1,
+      128
+    ],
+    "k_shape": [
+      1,
+      8,
+      832,
+      128
+    ],
+    "v_shape": [
+      1,
+      8,
+      832,
+      128
+    ],
+    "attention_mask_shape": [
+      1,
+      1,
+      1,
+      832
+    ],
+    "dtype": "torch.float16",
+    "device": "cuda:0",
+    "valid_len": 727,
+    "prefix_mask": true,
+    "scaling": 0.08838834764831845,
+    "num_key_value_groups": 2,
+    "prompt_length": 690,
+    "max_cache_len": 832,
+    "captured_decode_step": 36,
+    "cache_position": 726,
+    "bench_mode": "graph",
+    "timer": "cuda_event",
+    "graph_capture_repeats": 64
+  },
+  "benchmarks": {
+    "hf_repeat_kv_sdpa": {
+      "time_ms": 0.06579679965972901,
+      "status": "ok"
+    },
+    "triton_per_q_head": {
+      "time_ms": 0.036347200870513914,
+      "status": "ok",
+      "max_abs_diff": 0.0009765625,
+      "mean_abs_diff": 3.7183985114097595e-05,
+      "speedup_vs_hf": 1.8102301713446554
+    },
+    "triton_grouped_gqa": {
+      "time_ms": 0.04919295787811279,
+      "status": "ok",
+      "max_abs_diff": 0.0009765625,
+      "mean_abs_diff": 3.7183985114097595e-05,
+      "speedup_vs_hf": 1.337524769759854
+    },
+    "triton_grouped_cachepos_prefix": {
+      "time_ms": 0.028714559078216552,
+      "status": "ok",
+      "max_abs_diff": 0.0078125,
+      "mean_abs_diff": 0.00031324848532676697,
+      "speedup_vs_hf": 2.291409019393364
+    },
+    "triton_grouped_cachepos_prefix_dot": {
+      "time_ms": 0.018819199800491335,
+      "status": "ok",
+      "max_abs_diff": 6.103515625e-05,
+      "mean_abs_diff": 2.9802322387695312e-08,
+      "speedup_vs_hf": 3.496259158586072
+    },
+    "triton_grouped_cachepos_splitkv": {
+      "time_ms": 0.012906240224838257,
+      "status": "ok",
+      "max_abs_diff": 0.0625,
+      "mean_abs_diff": 0.002086035441607237,
+      "speedup_vs_hf": 5.098060977751062
+    },
+    "cuda_grouped_cachepos_splitkv": {
+      "time_ms": 0.040743041038513186,
+      "status": "ok",
+      "max_abs_diff": 0.0009765625,
+      "mean_abs_diff": 3.742612898349762e-05,
+      "speedup_vs_hf": 1.614921173840049
+    },
+    "cuda_qhead_grouped_cachepos_splitkv": {
+      "time_ms": 0.01800480008125305,
+      "status": "ok",
+      "max_abs_diff": 0.0009765625,
+      "mean_abs_diff": 3.742612898349762e-05,
+      "speedup_vs_hf": 3.6544032348483513
+    },
+    "triton_current": {
+      "time_ms": 0.012980799674987793,
+      "status": "ok",
+      "max_abs_diff": 0.0625,
+      "mean_abs_diff": 0.002086035441607237,
+      "speedup_vs_hf": 5.068778604334397
+    },
+    "sdpa_enable_gqa_mask": {
+      "time_ms": 0.08290623664855958,
+      "status": "ok",
+      "max_abs_diff": 0.0009765625,
+      "mean_abs_diff": 3.724370617419481e-05,
+      "speedup_vs_hf": 0.7936290720641723
+    },
+    "sdpa_enable_gqa_valid_prefix": {
+      "status": "error",
+      "error_type": "AcceleratorError",
+      "error": "CUDA error: operation failed due to a previous error during capture\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n"
+    }
+  }
+}

@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import time
 from pathlib import Path
 
 os.environ.setdefault("TQDM_DISABLE", "1")
@@ -28,6 +27,7 @@ from transformers.cache_utils import StaticCache
 
 from benchmark import get_system_info
 from bench_decode_attention import _prepare_inputs
+import cuda_decode_gemv
 from evaluation_wrapper import VLMModel
 from optimized_layer import set_small_decode_triton_enabled
 
@@ -373,21 +373,56 @@ def _triton_splitk8_matvec(x, weight, bias):
     return _triton_splitk_matvec_impl(x, weight, bias, split_k=8, block_m=128, block_k=block_k)
 
 
+def _cuda_splitk8_matvec(x, weight, bias):
+    return cuda_decode_gemv.splitk_matvec(x, weight, bias, split_k=8)
+
+
+def _cuda_splitk16_matvec(x, weight, bias):
+    return cuda_decode_gemv.splitk_matvec(x, weight, bias, split_k=16)
+
+
+def _cuda_row4_splitk8_matvec(x, weight, bias):
+    return cuda_decode_gemv.splitk_matvec_row4(x, weight, bias, split_k=8)
+
+
+def _cuda_row4_splitk16_matvec(x, weight, bias):
+    return cuda_decode_gemv.splitk_matvec_row4(x, weight, bias, split_k=16)
+
+
+def _cuda_row8_shared_splitk8_matvec(x, weight, bias):
+    return cuda_decode_gemv.splitk_matvec_row8_shared(x, weight, bias, split_k=8)
+
+
+def _cuda_row8_shared_splitk16_matvec(x, weight, bias):
+    return cuda_decode_gemv.splitk_matvec_row8_shared(x, weight, bias, split_k=16)
+
+
+def _cuda_row4_shared_vec_half_splitk8_matvec(x, weight, bias):
+    return cuda_decode_gemv.splitk_matvec_row4_shared_vec_half(x, weight, bias, split_k=8)
+
+
+def _cuda_row4_shared_vec_half_splitk16_matvec(x, weight, bias):
+    return cuda_decode_gemv.splitk_matvec_row4_shared_vec_half(x, weight, bias, split_k=16)
+
+
 def _bench_impl(fn, x, weight, bias, warmup: int, iters: int):
     for _ in range(warmup):
         fn(x, weight, bias)
     torch.cuda.synchronize()
-    t0 = time.perf_counter()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
     out = None
+    start.record()
     for _ in range(iters):
         out = fn(x, weight, bias)
-    torch.cuda.synchronize()
-    elapsed_ms = (time.perf_counter() - t0) * 1000.0 / iters
+    end.record()
+    end.synchronize()
+    elapsed_ms = start.elapsed_time(end) / iters
     return out, elapsed_ms
 
 
-def _bench_impl_graph(fn, x, weight, bias, warmup: int, iters: int):
-    """Benchmark using CUDAGraph replay to eliminate Python dispatch overhead."""
+def _bench_impl_graph(fn, x, weight, bias, warmup: int, iters: int, capture_repeats: int):
+    """Benchmark using CUDAGraph replay and GPU-side timing."""
     # Eager warmup to JIT-compile Triton kernels
     for _ in range(warmup):
         fn(x, weight, bias)
@@ -399,7 +434,8 @@ def _bench_impl_graph(fn, x, weight, bias, warmup: int, iters: int):
     with torch.cuda.stream(s):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            out = fn(x, weight, bias)
+            for _ in range(capture_repeats):
+                out = fn(x, weight, bias)
     torch.cuda.current_stream().wait_stream(s)
     torch.cuda.synchronize()
 
@@ -408,16 +444,19 @@ def _bench_impl_graph(fn, x, weight, bias, warmup: int, iters: int):
         graph.replay()
     torch.cuda.synchronize()
 
-    # Timed replays
-    t0 = time.perf_counter()
+    # Timed replays using GPU events
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
     for _ in range(iters):
         graph.replay()
-    torch.cuda.synchronize()
-    elapsed_ms = (time.perf_counter() - t0) * 1000.0 / iters
+    end.record()
+    end.synchronize()
+    elapsed_ms = start.elapsed_time(end) / (iters * capture_repeats)
     return out, elapsed_ms
 
 
-def _run_benchmarks(payload, warmup: int, iters: int, use_graph: bool = False):
+def _run_benchmarks(payload, warmup: int, iters: int, use_graph: bool = False, graph_capture_repeats: int = 1):
     variants = {
         "f_linear": _module_linear,
         "f_linear_contiguous_weight": _f_linear_contig,
@@ -425,8 +464,27 @@ def _run_benchmarks(payload, warmup: int, iters: int, use_graph: bool = False):
         "triton_matvec": _triton_matvec,
         "triton_splitk4_matvec": _triton_splitk4_matvec,
         "triton_splitk8_matvec": _triton_splitk8_matvec,
+        "cuda_splitk8_matvec": _cuda_splitk8_matvec,
+        "cuda_splitk16_matvec": _cuda_splitk16_matvec,
+        "cuda_row4_splitk8_matvec": _cuda_row4_splitk8_matvec,
+        "cuda_row4_splitk16_matvec": _cuda_row4_splitk16_matvec,
+        "cuda_row8_shared_splitk8_matvec": _cuda_row8_shared_splitk8_matvec,
+        "cuda_row8_shared_splitk16_matvec": _cuda_row8_shared_splitk16_matvec,
+        "cuda_row4_shared_vec_half_splitk8_matvec": _cuda_row4_shared_vec_half_splitk8_matvec,
+        "cuda_row4_shared_vec_half_splitk16_matvec": _cuda_row4_shared_vec_half_splitk16_matvec,
     }
-    bench_fn = _bench_impl_graph if use_graph else _bench_impl
+    if use_graph:
+        bench_fn = lambda fn, x, weight, bias, warmup, iters: _bench_impl_graph(
+            fn,
+            x,
+            weight,
+            bias,
+            warmup=warmup,
+            iters=iters,
+            capture_repeats=graph_capture_repeats,
+        )
+    else:
+        bench_fn = _bench_impl
     results = {}
     ref_out, ref_ms = bench_fn(
         variants["f_linear"],
@@ -479,6 +537,12 @@ def main():
     parser.add_argument("--no-bucketed", dest="bucketed", action="store_false")
     parser.add_argument("--graph", action="store_true", default=True, help="Use CUDAGraph replay to eliminate dispatch overhead (default)")
     parser.add_argument("--no-graph", dest="graph", action="store_false", help="Use eager mode (includes Python dispatch overhead)")
+    parser.add_argument(
+        "--graph-capture-repeats",
+        type=int,
+        default=64,
+        help="Number of identical ops batched into one graph replay when --graph is enabled (default: 64)",
+    )
     parser.add_argument("--output", type=str, default=None)
     args = parser.parse_args()
 
@@ -542,12 +606,14 @@ def main():
             "lm_head_weight_is_contiguous": bool(payloads["lm_head"]["weight"].is_contiguous()),
             "dtype": str(payloads["o_proj"]["x"].dtype),
             "device": str(payloads["o_proj"]["x"].device),
+            "timer": "cuda_event",
+            "graph_capture_repeats": int(args.graph_capture_repeats if args.graph else 1),
         },
-        "qkv_benchmarks": _run_benchmarks(payloads["qkv"], warmup=args.warmup, iters=args.iters, use_graph=args.graph),
-        "gate_up_benchmarks": _run_benchmarks(payloads["gate_up"], warmup=args.warmup, iters=args.iters, use_graph=args.graph),
-        "o_proj_benchmarks": _run_benchmarks(payloads["o_proj"], warmup=args.warmup, iters=args.iters, use_graph=args.graph),
-        "down_proj_benchmarks": _run_benchmarks(payloads["down_proj"], warmup=args.warmup, iters=args.iters, use_graph=args.graph),
-        "lm_head_benchmarks": _run_benchmarks(payloads["lm_head"], warmup=args.warmup, iters=args.iters, use_graph=args.graph),
+        "qkv_benchmarks": _run_benchmarks(payloads["qkv"], warmup=args.warmup, iters=args.iters, use_graph=args.graph, graph_capture_repeats=args.graph_capture_repeats),
+        "gate_up_benchmarks": _run_benchmarks(payloads["gate_up"], warmup=args.warmup, iters=args.iters, use_graph=args.graph, graph_capture_repeats=args.graph_capture_repeats),
+        "o_proj_benchmarks": _run_benchmarks(payloads["o_proj"], warmup=args.warmup, iters=args.iters, use_graph=args.graph, graph_capture_repeats=args.graph_capture_repeats),
+        "down_proj_benchmarks": _run_benchmarks(payloads["down_proj"], warmup=args.warmup, iters=args.iters, use_graph=args.graph, graph_capture_repeats=args.graph_capture_repeats),
+        "lm_head_benchmarks": _run_benchmarks(payloads["lm_head"], warmup=args.warmup, iters=args.iters, use_graph=args.graph, graph_capture_repeats=args.graph_capture_repeats),
     }
 
     output_path = Path(args.output)
