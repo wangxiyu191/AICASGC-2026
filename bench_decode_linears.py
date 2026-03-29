@@ -121,7 +121,7 @@ def _run_capture(
     d_handle = target_layer.down_proj.register_forward_pre_hook(capture.maybe_capture_down_proj)
     l_handle = model.lm_head.register_forward_pre_hook(capture.maybe_capture_lm_head)
 
-    previous_small_decode_triton = set_small_decode_triton_enabled(model, True)
+    previous_small_decode_triton = set_small_decode_triton_enabled(model, False)
     try:
         with torch.no_grad():
             outputs = model(
@@ -351,7 +351,38 @@ def _bench_impl(fn, x, weight, bias, warmup: int, iters: int):
     return out, elapsed_ms
 
 
-def _run_benchmarks(payload, warmup: int, iters: int):
+def _bench_impl_graph(fn, x, weight, bias, warmup: int, iters: int):
+    """Benchmark using CUDAGraph replay to eliminate Python dispatch overhead."""
+    # Eager warmup to JIT-compile Triton kernels
+    for _ in range(warmup):
+        fn(x, weight, bias)
+    torch.cuda.synchronize()
+
+    # Capture CUDAGraph
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = fn(x, weight, bias)
+    torch.cuda.current_stream().wait_stream(s)
+    torch.cuda.synchronize()
+
+    # Warmup replays
+    for _ in range(warmup):
+        graph.replay()
+    torch.cuda.synchronize()
+
+    # Timed replays
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        graph.replay()
+    torch.cuda.synchronize()
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0 / iters
+    return out, elapsed_ms
+
+
+def _run_benchmarks(payload, warmup: int, iters: int, use_graph: bool = False):
     variants = {
         "f_linear": _module_linear,
         "f_linear_contiguous_weight": _f_linear_contig,
@@ -360,8 +391,9 @@ def _run_benchmarks(payload, warmup: int, iters: int):
         "triton_splitk4_matvec": _triton_splitk4_matvec,
         "triton_splitk8_matvec": _triton_splitk8_matvec,
     }
+    bench_fn = _bench_impl_graph if use_graph else _bench_impl
     results = {}
-    ref_out, ref_ms = _bench_impl(
+    ref_out, ref_ms = bench_fn(
         variants["f_linear"],
         payload["x"],
         payload["weight"],
@@ -374,7 +406,7 @@ def _run_benchmarks(payload, warmup: int, iters: int):
         if name == "f_linear":
             continue
         try:
-            out, ms = _bench_impl(
+            out, ms = bench_fn(
                 fn,
                 payload["x"],
                 payload["weight"],
@@ -410,6 +442,8 @@ def main():
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--bucketed", action="store_true", default=True)
     parser.add_argument("--no-bucketed", dest="bucketed", action="store_false")
+    parser.add_argument("--graph", action="store_true", default=True, help="Use CUDAGraph replay to eliminate dispatch overhead (default)")
+    parser.add_argument("--no-graph", dest="graph", action="store_false", help="Use eager mode (includes Python dispatch overhead)")
     parser.add_argument("--output", type=str, default=None)
     args = parser.parse_args()
 
@@ -439,6 +473,11 @@ def main():
         layer_idx=args.layer_idx,
     )
 
+    bench_mode = "graph" if args.graph else "eager"
+    print(
+        f"[LinearBench] Benchmarking implementations (mode={bench_mode})..."
+    )
+
     output = {
         "system_info": get_system_info(),
         "metadata": {
@@ -447,6 +486,7 @@ def main():
             "layer_idx": int(args.layer_idx),
             "decode_step": int(args.decode_step),
             "bucketed": bool(args.bucketed),
+            "bench_mode": bench_mode,
             "prompt_length": capture_meta["prompt_length"],
             "max_cache_len": capture_meta["max_cache_len"],
             "captured_decode_step": capture_meta["captured_decode_step"],
@@ -462,9 +502,9 @@ def main():
             "dtype": str(payloads["o_proj"]["x"].dtype),
             "device": str(payloads["o_proj"]["x"].device),
         },
-        "o_proj_benchmarks": _run_benchmarks(payloads["o_proj"], warmup=args.warmup, iters=args.iters),
-        "down_proj_benchmarks": _run_benchmarks(payloads["down_proj"], warmup=args.warmup, iters=args.iters),
-        "lm_head_benchmarks": _run_benchmarks(payloads["lm_head"], warmup=args.warmup, iters=args.iters),
+        "o_proj_benchmarks": _run_benchmarks(payloads["o_proj"], warmup=args.warmup, iters=args.iters, use_graph=args.graph),
+        "down_proj_benchmarks": _run_benchmarks(payloads["down_proj"], warmup=args.warmup, iters=args.iters, use_graph=args.graph),
+        "lm_head_benchmarks": _run_benchmarks(payloads["lm_head"], warmup=args.warmup, iters=args.iters, use_graph=args.graph),
     }
 
     output_path = Path(args.output)

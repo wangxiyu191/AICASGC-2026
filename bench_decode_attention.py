@@ -394,7 +394,49 @@ def _bench_impl(
     return out, elapsed_ms
 
 
-def _run_benchmarks(payload, warmup: int, iters: int):
+def _bench_impl_graph(
+    fn,
+    q,
+    k,
+    v,
+    attention_mask,
+    scaling,
+    num_key_value_groups,
+    cache_position,
+    warmup: int,
+    iters: int,
+):
+    """Benchmark using CUDAGraph replay to eliminate Python dispatch overhead."""
+    # Eager warmup to JIT-compile Triton kernels
+    for _ in range(warmup):
+        fn(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position)
+    torch.cuda.synchronize()
+
+    # Capture CUDAGraph
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = fn(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position)
+    torch.cuda.current_stream().wait_stream(s)
+    torch.cuda.synchronize()
+
+    # Warmup replays
+    for _ in range(warmup):
+        graph.replay()
+    torch.cuda.synchronize()
+
+    # Timed replays
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        graph.replay()
+    torch.cuda.synchronize()
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0 / iters
+    return out, elapsed_ms
+
+
+def _run_benchmarks(payload, warmup: int, iters: int, use_graph: bool = False):
     q = payload["q"]
     k = payload["k"]
     v = payload["v"]
@@ -415,8 +457,9 @@ def _run_benchmarks(payload, warmup: int, iters: int):
         "sdpa_enable_gqa_valid_prefix": lambda q, k, v, attention_mask, scaling, num_key_value_groups, _cache_position: _sdpa_gqa_valid_only(q, k, v, attention_mask, scaling, num_key_value_groups),
     }
 
+    bench_fn = _bench_impl_graph if use_graph else _bench_impl
     results = {}
-    ref_out, ref_ms = _bench_impl(
+    ref_out, ref_ms = bench_fn(
         variants["hf_repeat_kv_sdpa"],
         q, k, v, attention_mask, scaling, num_key_value_groups, cache_position,
         warmup=warmup,
@@ -431,7 +474,7 @@ def _run_benchmarks(payload, warmup: int, iters: int):
         if name == "hf_repeat_kv_sdpa":
             continue
         try:
-            out, ms = _bench_impl(
+            out, ms = bench_fn(
                 fn,
                 q, k, v, attention_mask, scaling, num_key_value_groups, cache_position,
                 warmup=warmup,
@@ -467,6 +510,8 @@ def main():
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--bucketed", action="store_true", default=True, help="Use graph-style bucketed max_cache_len")
     parser.add_argument("--no-bucketed", dest="bucketed", action="store_false")
+    parser.add_argument("--graph", action="store_true", default=True, help="Use CUDAGraph replay to eliminate dispatch overhead (default)")
+    parser.add_argument("--no-graph", dest="graph", action="store_false", help="Use eager mode (includes Python dispatch overhead)")
     parser.add_argument("--output", type=str, default=None, help="Output JSON path (default: results/...)")
     args = parser.parse_args()
 
@@ -517,6 +562,7 @@ def main():
         "max_cache_len": capture_meta["max_cache_len"],
         "captured_decode_step": capture_meta["captured_decode_step"],
         "cache_position": int(payload["cache_position"].item()) if payload["cache_position"] is not None else None,
+        "bench_mode": "graph" if args.graph else "eager",
     }
 
     print(
@@ -524,8 +570,9 @@ def main():
         f"valid_len={metadata['valid_len']}, max_cache_len={metadata['max_cache_len']}, "
         f"q={tuple(metadata['q_shape'])}, k={tuple(metadata['k_shape'])}"
     )
-    print("[AttentionBench] Benchmarking implementations...")
-    benchmarks = _run_benchmarks(payload, warmup=args.warmup, iters=args.iters)
+    bench_mode = "graph" if args.graph else "eager"
+    print(f"[AttentionBench] Benchmarking implementations (mode={bench_mode})...")
+    benchmarks = _run_benchmarks(payload, warmup=args.warmup, iters=args.iters, use_graph=args.graph)
 
     print("\n[AttentionBench] Summary")
     print(f"{'Implementation':<28} {'Time(ms)':>10} {'Speedup':>10} {'Status':>10}")
