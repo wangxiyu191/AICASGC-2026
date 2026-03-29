@@ -1,0 +1,257 @@
+{
+  "o_proj": {
+    "cublas_baseline_us": 23.90558272600174,
+    "configs": [
+      {
+        "block_m": 1,
+        "block_k": 128,
+        "num_warps": 2,
+        "num_stages": 2,
+        "grid_size": 2048,
+        "time_us": 45.06582394242287,
+        "speedup": 0.5304592401670957,
+        "max_abs_diff": 0.015625
+      },
+      {
+        "block_m": 1,
+        "block_k": 256,
+        "num_warps": 2,
+        "num_stages": 2,
+        "grid_size": 2048,
+        "time_us": 45.94754055142403,
+        "speedup": 0.5202799200807462,
+        "max_abs_diff": 0.015625
+      },
+      {
+        "block_m": 1,
+        "block_k": 256,
+        "num_warps": 4,
+        "num_stages": 2,
+        "grid_size": 2048,
+        "time_us": 44.715359807014465,
+        "speedup": 0.5346168034692117,
+        "max_abs_diff": 0.015625
+      },
+      {
+        "block_m": 1,
+        "block_k": 512,
+        "num_warps": 4,
+        "num_stages": 2,
+        "grid_size": 2048,
+        "time_us": 44.69531029462814,
+        "speedup": 0.5348566229525632,
+        "max_abs_diff": 0.015625
+      },
+      {
+        "block_m": 2,
+        "block_k": 128,
+        "num_warps": 2,
+        "num_stages": 2,
+        "grid_size": 1024,
+        "time_us": 46.124715358018875,
+        "speedup": 0.5182814146482468,
+        "max_abs_diff": 0.015625
+      },
+      {
+        "block_m": 2,
+        "block_k": 256,
+        "num_warps": 2,
+        "num_stages": 2,
+        "grid_size": 1024,
+        "time_us": 44.862933456897736,
+        "speedup": 0.5328582168834131,
+        "max_abs_diff": 0.015625
+      },
+      {
+        "block_m": 2,
+        "block_k": 256,
+        "num_warps": 4,
+        "num_stages": 2,
+        "grid_size": 1024,
+        "time_us": 44.97777670621872,
+        "speedup": 0.5314976523216298,
+        "max_abs_diff": 0.015625
+      },
+      {
+        "block_m": 2,
+        "block_k": 512,
+        "num_warps": 4,
+        "num_stages": 2,
+        "grid_size": 1024,
+        "time_us": 44.92509737610817,
+        "speedup": 0.5321208883726334,
+        "max_abs_diff": 0.015625
+      },
+      {
+        "block_m": 4,
+        "block_k": 128,
+        "num_warps": 2,
+        "num_stages": 2,
+        "grid_size": 512,
+        "time_us": 44.29150000214577,
+        "speedup": 0.5397329673829877,
+        "max_abs_diff": 0.015625
+      },
+      {
+        "block_m": 4,
+        "block_k": 128,
+        "num_warps": 4,
+        "num_stages": 2,
+        "grid_size": 512,
+        "time_us": 44.9356734752655,
+        "speedup": 0.5319956479379436,
+        "max_abs_diff": 0.015625
+      },
+      {
+        "block_m": 4,
+        "block_k": 256,
+        "num_warps": 2,
+        "num_stages": 2,
+        "grid_size": 512,
+        "time_us": 45.54570093750954,
+        "speedup": 0.524870234378457,
+        "max_abs_diff": 0.015625
+      },
+      {
+        "block_m": 4,
+        "block_k": 256,
+        "num_warps": 4,
+        "num_stages": 2,
+        "grid_size": 512,
+        "time_us": 44.895630329847336,
+        "speedup": 0.5324701435388673,
+        "max_abs_diff": 0.015625
+      },
+      {
+        "block_m": 4,
+        "block_k": 512,
+        "num_warps": 4,
+        "num_stages": 2,
+        "grid_size": 512,
+        "time_us": 46.08780890703201,
+        "speedup": 0.5186964469112407,
+        "max_abs_diff": 0.015625
+      },
+      {
+        "block_m": 8,
+        "block_k": 128,
+        "num_warps": 4,
+        "num_stages": 2,
+        "grid_size": 256,
+        "time_us": 45.30005902051926,
+        "speedup": 0.527716370417385,
+        "max_abs_diff": 0.015625
+      },
+      {
+        "block_m": 8,
+        "block_k": 256,
+        "num_warps": 4,
+        "num_stages": 2,
+        "grid_size": 256,
+        "time_us": 44.82940211892128,
+        "speedup": 0.5332567822918128,
+        "max_abs_diff": 0.015625
+      },
+      {
+        "block_m": 8,
+        "block_k": 512,
+        "num_warps": 4,
+        "num_stages": 2,
+        "grid_size": 256,
+        "time_us": 44.84376311302185,
+        "speedup": 0.533086009435724,
+        "max_abs_diff": 0.015625
+      },
+      {
+        "block_m": 16,
+        "block_k": 128,
+        "num_warps": 4,
+        "num_stages": 2,
+        "grid_size": 128,
+        "time_us": 45.84381356835365,
+        "speedup": 0.5214571141721934,
+        "max_abs_diff": 0.015625
+      },
+      {
+        "block_m": 16,
+        "block_k": 256,
+        "num_warps": 4,
+        "num_stages": 2,
+        "grid_size": 128,
+        "time_us": 44.81141269207001,
+        "speedup": 0.5334708568612513,
+        "max_abs_diff": 0.015625
+      },
+      {
+        "block_m": 32,
+        "block_k": 128,
+        "num_warps": 4,
+        "num_stages": 2,
+        "grid_size": 64,
+        "time_us": 44.82655227184296,
+        "speedup": 0.533290684080061,
+        "max_abs_diff": 0.015625
+      },
+      {
+        "block_m": 32,
+        "block_k": 256,
+        "num_warps": 4,
+        "num_stages": 2,
+        "grid_size": 64,
+        "time_us": 45.03383859992027,
+        "speedup": 0.5308359995331169,
+        "max_abs_diff": 0.015625
+      },
+      {
+        "block_m": 4,
+        "block_k": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "grid_size": 512,
+        "time_us": 63.071880489587784,
+        "speedup": 0.37902124592508685,
+        "max_abs_diff": 0.015625
+      },
+      {
+        "block_m": 4,
+        "block_k": 256,
+        "num_warps": 4,
+        "num_stages": 3,
+        "grid_size": 512,
+        "time_us": 45.13794556260109,
+        "speedup": 0.529611669916334,
+        "max_abs_diff": 0.015625
+      },
+      {
+        "block_m": 4,
+        "block_k": 256,
+        "num_warps": 4,
+        "num_stages": 4,
+        "grid_size": 512,
+        "time_us": 45.52480950951576,
+        "speedup": 0.5251110984002011,
+        "max_abs_diff": 0.015625
+      },
+      {
+        "block_m": 4,
+        "block_k": 256,
+        "num_warps": 8,
+        "num_stages": 2,
+        "grid_size": 512,
+        "time_us": 55.484820157289505,
+        "speedup": 0.43084906210804513,
+        "max_abs_diff": 0.015625
+      },
+      {
+        "block_m": 8,
+        "block_k": 256,
+        "num_warps": 8,
+        "num_stages": 2,
+        "grid_size": 256,
+        "time_us": 45.371782034635544,
+        "speedup": 0.5268821645081714,
+        "max_abs_diff": 0.015625
+      }
+    ]
+  }
+}
