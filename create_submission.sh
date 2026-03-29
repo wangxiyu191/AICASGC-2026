@@ -9,6 +9,11 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMMIT_ID="$(git -C "$SCRIPT_DIR" rev-parse --short HEAD)"
 BASE_OUTPUT_NAME="${1:-submission.zip}"
+PYTHON_BIN="${PYTHON_BIN:-$SCRIPT_DIR/venv/bin/python}"
+
+if [ ! -x "$PYTHON_BIN" ]; then
+    PYTHON_BIN="python3"
+fi
 
 if [[ "$BASE_OUTPUT_NAME" == *.zip ]]; then
     OUTPUT_NAME="${BASE_OUTPUT_NAME%.zip}_${COMMIT_ID}.zip"
@@ -25,6 +30,26 @@ if [ ! -f "$SCRIPT_DIR/$WRAPPER_FILE" ]; then
     echo "Error: $WRAPPER_FILE not found!"
     exit 1
 fi
+
+build_cuda_extension() {
+    local setup_script="$1"
+    local output_pattern="$2"
+
+    echo "Building CUDA extension via cuda_extensions/$setup_script"
+    (
+        cd "$SCRIPT_DIR/cuda_extensions"
+        TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.0}" \
+            "$PYTHON_BIN" "$setup_script" build_ext --inplace
+    )
+
+    if ! compgen -G "$SCRIPT_DIR/cuda_extensions/$output_pattern" > /dev/null; then
+        echo "Error: expected CUDA extension output matching $output_pattern not found"
+        exit 1
+    fi
+}
+
+build_cuda_extension "setup.py" "cuda_decode_attention_ext*.so"
+build_cuda_extension "setup_decode_gemv.py" "cuda_decode_gemv_ext*.so"
 
 # Create temporary directory for staging
 TEMP_DIR=$(mktemp -d)
