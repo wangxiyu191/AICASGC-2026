@@ -36,6 +36,29 @@ torch::Tensor splitk_matvec_row4_shared_vec_half_cuda(
     const torch::Tensor& out,
     bool has_bias);
 
+torch::Tensor splitk_matvec_row4_shared_vec_half_v2_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    int64_t split_k,
+    const torch::Tensor& scratch,
+    const torch::Tensor& out,
+    bool has_bias);
+
+torch::Tensor persistent_matvec_half_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& out,
+    bool has_bias);
+
+torch::Tensor nosplit_matvec_half_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& out,
+    bool has_bias);
+
 torch::Tensor splitk_matvec(
     const torch::Tensor& x,
     const torch::Tensor& weight,
@@ -80,9 +103,41 @@ torch::Tensor splitk_matvec_row4_shared_vec_half(
     return splitk_matvec_row4_shared_vec_half_cuda(x, weight, bias, split_k, scratch, out, has_bias);
 }
 
+torch::Tensor splitk_matvec_row4_shared_vec_half_v2(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    int64_t split_k,
+    const torch::Tensor& scratch,
+    const torch::Tensor& out,
+    bool has_bias) {
+    return splitk_matvec_row4_shared_vec_half_v2_cuda(x, weight, bias, split_k, scratch, out, has_bias);
+}
+
+torch::Tensor persistent_matvec_half(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& out,
+    bool has_bias) {
+    return persistent_matvec_half_cuda(x, weight, bias, out, has_bias);
+}
+
+torch::Tensor nosplit_matvec_half(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& out,
+    bool has_bias) {
+    return nosplit_matvec_half_cuda(x, weight, bias, out, has_bias);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("splitk_matvec", &splitk_matvec);
     m.def("splitk_matvec_row4", &splitk_matvec_row4);
     m.def("splitk_matvec_row8_shared", &splitk_matvec_row8_shared);
     m.def("splitk_matvec_row4_shared_vec_half", &splitk_matvec_row4_shared_vec_half);
+    m.def("splitk_matvec_row4_shared_vec_half_v2", &splitk_matvec_row4_shared_vec_half_v2);
+    m.def("persistent_matvec_half", &persistent_matvec_half);
+    m.def("nosplit_matvec_half", &nosplit_matvec_half);
 }

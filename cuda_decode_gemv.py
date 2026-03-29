@@ -228,3 +228,129 @@ def splitk_matvec_row4_shared_vec_half(
         bias is not None,
     )
     return out_vec.view(*x.shape[:-1], n)
+
+
+def splitk_matvec_row4_shared_vec_half_v2(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    split_k: int,
+    workspace: dict | None = None,
+) -> torch.Tensor:
+    if (
+        x.device.type != "cuda"
+        or weight.device.type != "cuda"
+        or x.dtype != torch.float16
+        or weight.dtype != torch.float16
+        or x.ndim < 2
+        or x.shape[-2] != 1
+        or split_k <= 0
+    ):
+        raise RuntimeError("splitk_matvec_row4_shared_vec_half_v2 expects fp16 CUDA single-token decode tensors")
+
+    x_vec = x.reshape(-1).contiguous()
+    n, _k = weight.shape
+    if (
+        workspace is not None
+        and workspace.get("split_k") == split_k
+        and tuple(workspace["scratch"].shape) == (n,)
+        and workspace["scratch"].device == x.device
+        and workspace["out"].dtype == x.dtype
+    ):
+        scratch = workspace["scratch"]
+        out_vec = workspace["out"]
+    else:
+        scratch = torch.empty((n,), dtype=torch.float32, device=x.device)
+        out_vec = torch.empty((n,), dtype=x.dtype, device=x.device)
+
+    ext = _load_ext()
+    ext.splitk_matvec_row4_shared_vec_half_v2(
+        x_vec,
+        weight,
+        bias if bias is not None else torch.empty(0, device=x.device, dtype=x.dtype),
+        split_k,
+        scratch,
+        out_vec,
+        bias is not None,
+    )
+    return out_vec.view(*x.shape[:-1], n)
+
+
+def persistent_matvec_half(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    workspace: dict | None = None,
+) -> torch.Tensor:
+    if (
+        x.device.type != "cuda"
+        or weight.device.type != "cuda"
+        or x.dtype != torch.float16
+        or weight.dtype != torch.float16
+        or x.ndim < 2
+        or x.shape[-2] != 1
+    ):
+        raise RuntimeError("persistent_matvec_half expects fp16 CUDA single-token decode tensors")
+
+    x_vec = x.reshape(-1).contiguous()
+    n, _k = weight.shape
+    if (
+        workspace is not None
+        and workspace.get("type") == "persistent"
+        and tuple(workspace["out"].shape) == (n,)
+        and workspace["out"].device == x.device
+        and workspace["out"].dtype == x.dtype
+    ):
+        out_vec = workspace["out"]
+    else:
+        out_vec = torch.empty((n,), dtype=x.dtype, device=x.device)
+
+    ext = _load_ext()
+    ext.persistent_matvec_half(
+        x_vec,
+        weight,
+        bias if bias is not None else torch.empty(0, device=x.device, dtype=x.dtype),
+        out_vec,
+        bias is not None,
+    )
+    return out_vec.view(*x.shape[:-1], n)
+
+
+def nosplit_matvec_half(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    workspace: dict | None = None,
+) -> torch.Tensor:
+    if (
+        x.device.type != "cuda"
+        or weight.device.type != "cuda"
+        or x.dtype != torch.float16
+        or weight.dtype != torch.float16
+        or x.ndim < 2
+        or x.shape[-2] != 1
+    ):
+        raise RuntimeError("nosplit_matvec_half expects fp16 CUDA single-token decode tensors")
+
+    x_vec = x.reshape(-1).contiguous()
+    n, _k = weight.shape
+    if (
+        workspace is not None
+        and workspace.get("type") == "nosplit"
+        and tuple(workspace["out"].shape) == (n,)
+        and workspace["out"].device == x.device
+        and workspace["out"].dtype == x.dtype
+    ):
+        out_vec = workspace["out"]
+    else:
+        out_vec = torch.empty((n,), dtype=x.dtype, device=x.device)
+
+    ext = _load_ext()
+    ext.nosplit_matvec_half(
+        x_vec,
+        weight,
+        bias if bias is not None else torch.empty(0, device=x.device, dtype=x.dtype),
+        out_vec,
+        bias is not None,
+    )
+    return out_vec.view(*x.shape[:-1], n)

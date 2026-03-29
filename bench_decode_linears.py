@@ -405,6 +405,34 @@ def _cuda_row4_shared_vec_half_splitk16_matvec(x, weight, bias):
     return cuda_decode_gemv.splitk_matvec_row4_shared_vec_half(x, weight, bias, split_k=16)
 
 
+def _cuda_row4_shared_vec_half_v2_splitk8_matvec(x, weight, bias):
+    return cuda_decode_gemv.splitk_matvec_row4_shared_vec_half_v2(x, weight, bias, split_k=8)
+
+
+def _cuda_row4_shared_vec_half_v2_splitk4_matvec(x, weight, bias):
+    return cuda_decode_gemv.splitk_matvec_row4_shared_vec_half_v2(x, weight, bias, split_k=4)
+
+
+def _cuda_row4_shared_vec_half_v2_splitk2_matvec(x, weight, bias):
+    return cuda_decode_gemv.splitk_matvec_row4_shared_vec_half_v2(x, weight, bias, split_k=2)
+
+
+def _cuda_row4_shared_vec_half_v2_splitk1_matvec(x, weight, bias):
+    return cuda_decode_gemv.splitk_matvec_row4_shared_vec_half_v2(x, weight, bias, split_k=1)
+
+
+def _cuda_row4_shared_vec_half_v2_splitk16_matvec(x, weight, bias):
+    return cuda_decode_gemv.splitk_matvec_row4_shared_vec_half_v2(x, weight, bias, split_k=16)
+
+
+def _cuda_persistent_matvec(x, weight, bias):
+    return cuda_decode_gemv.persistent_matvec_half(x, weight, bias)
+
+
+def _cuda_nosplit_matvec(x, weight, bias):
+    return cuda_decode_gemv.nosplit_matvec_half(x, weight, bias)
+
+
 def _bench_impl(fn, x, weight, bias, warmup: int, iters: int):
     for _ in range(warmup):
         fn(x, weight, bias)
@@ -472,6 +500,13 @@ def _run_benchmarks(payload, warmup: int, iters: int, use_graph: bool = False, g
         "cuda_row8_shared_splitk16_matvec": _cuda_row8_shared_splitk16_matvec,
         "cuda_row4_shared_vec_half_splitk8_matvec": _cuda_row4_shared_vec_half_splitk8_matvec,
         "cuda_row4_shared_vec_half_splitk16_matvec": _cuda_row4_shared_vec_half_splitk16_matvec,
+        "cuda_row4_shared_vec_half_v2_splitk1_matvec": _cuda_row4_shared_vec_half_v2_splitk1_matvec,
+        "cuda_row4_shared_vec_half_v2_splitk2_matvec": _cuda_row4_shared_vec_half_v2_splitk2_matvec,
+        "cuda_row4_shared_vec_half_v2_splitk4_matvec": _cuda_row4_shared_vec_half_v2_splitk4_matvec,
+        "cuda_row4_shared_vec_half_v2_splitk8_matvec": _cuda_row4_shared_vec_half_v2_splitk8_matvec,
+        "cuda_row4_shared_vec_half_v2_splitk16_matvec": _cuda_row4_shared_vec_half_v2_splitk16_matvec,
+        "cuda_persistent_matvec": _cuda_persistent_matvec,
+        "cuda_nosplit_matvec": _cuda_nosplit_matvec,
     }
     if use_graph:
         bench_fn = lambda fn, x, weight, bias, warmup, iters: _bench_impl_graph(

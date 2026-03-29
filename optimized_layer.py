@@ -119,7 +119,9 @@ class OptimizedDecoderLayer(nn.Module):
 
         # 2. Fused QKV (1 GEMM instead of 3)
         with _nvtx_range("decode.qkv_proj", enable_decode_nvtx):
-            qkv = F.linear(hidden_states, self.qkv_weight)
+            qkv = _cuda_nosplit_gemv(hidden_states, self.qkv_weight, None)
+            if qkv is None:
+                qkv = F.linear(hidden_states, self.qkv_weight)
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # 3. QK-Norm + RoPE (before transpose — natural layout for cos/sin broadcast)
@@ -184,10 +186,12 @@ class OptimizedDecoderLayer(nn.Module):
             attn_output = attn_output.reshape(*input_shape, -1)
             if not attn_output.is_contiguous():
                 attn_output = attn_output.contiguous()
-            gemv_out = _triton_decode_gemv(
-                attn_output, self.o_proj_weight, self.o_proj_bias,
-                prefer_small_triton=prefer_small_decode_triton,
-            )
+            gemv_out = _cuda_nosplit_gemv(attn_output, self.o_proj_weight, self.o_proj_bias)
+            if gemv_out is None:
+                gemv_out = _triton_decode_gemv(
+                    attn_output, self.o_proj_weight, self.o_proj_bias,
+                    prefer_small_triton=prefer_small_decode_triton,
+                )
             attn_output = gemv_out if gemv_out is not None else self.o_proj(attn_output)
 
         # 6. Residual + Post-attention LayerNorm
@@ -202,7 +206,9 @@ class OptimizedDecoderLayer(nn.Module):
 
         # 7. Fused gate+up (1 GEMM instead of 2) + SiLU activation
         with _nvtx_range("decode.gate_up_silu", enable_decode_nvtx):
-            gate_up = F.linear(hidden_states, self.gate_up_weight)
+            gate_up = _cuda_nosplit_gemv(hidden_states, self.gate_up_weight, None)
+            if gate_up is None:
+                gate_up = F.linear(hidden_states, self.gate_up_weight)
             gate, up = gate_up.chunk(2, dim=-1)
             hidden_states = _fused_silu_mul(
                 gate,
@@ -210,10 +216,12 @@ class OptimizedDecoderLayer(nn.Module):
                 prefer_small_triton=prefer_small_decode_triton,
             )
         with _nvtx_range("decode.down_proj", enable_decode_nvtx):
-            gemv_out = _triton_decode_gemv(
-                hidden_states, self.down_proj_weight, self.down_proj_bias,
-                prefer_small_triton=prefer_small_decode_triton,
-            )
+            gemv_out = _cuda_nosplit_gemv(hidden_states, self.down_proj_weight, self.down_proj_bias)
+            if gemv_out is None:
+                gemv_out = _triton_decode_gemv(
+                    hidden_states, self.down_proj_weight, self.down_proj_bias,
+                    prefer_small_triton=prefer_small_decode_triton,
+                )
             hidden_states = gemv_out if gemv_out is not None else self.down_proj(hidden_states)
 
         # 8. Residual
@@ -268,6 +276,7 @@ _TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_NUM_WARPS = int(os.environ.get("TRITON_S
 _TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_NUM_STAGES = int(os.environ.get("TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_NUM_STAGES", "0"))
 _ENABLE_TRITON_SMALL_DECODE_STATIC_KV = os.environ.get("ENABLE_TRITON_SMALL_DECODE_STATIC_KV", "1") == "1"
 _ENABLE_TRITON_SMALL_DECODE_GEMV = os.environ.get("ENABLE_TRITON_SMALL_DECODE_GEMV", "1") == "1"
+_ENABLE_CUDA_NOSPLIT_GEMV = os.environ.get("ENABLE_CUDA_NOSPLIT_GEMV", "0") == "1"
 _ENABLE_DECODE_NVTX = os.environ.get("ENABLE_DECODE_NVTX", "0") == "1"
 
 
@@ -536,6 +545,30 @@ def _triton_decode_gemv(
     if bias is not None:
         out = out + bias
     return out
+
+
+def _cuda_nosplit_gemv(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Replace F.linear for decode-phase GEMV (M=1) using CUDA nosplit kernel.
+
+    Returns None if conditions not met (caller falls back).
+    """
+    if (
+        not _ENABLE_CUDA_NOSPLIT_GEMV
+        or x.device.type != "cuda"
+        or weight.device.type != "cuda"
+        or x.dtype != torch.float16
+        or weight.dtype != torch.float16
+        or x.ndim < 2
+        or x.shape[-2] != 1
+    ):
+        return None
+
+    import cuda_decode_gemv
+    return cuda_decode_gemv.nosplit_matvec_half(x, weight, bias)
 
 
 def _static_cache_single_token_update(
