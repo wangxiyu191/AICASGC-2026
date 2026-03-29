@@ -215,27 +215,20 @@ class OptimizedDecoderLayer(nn.Module):
         if self.qkv_weight.device.type != "cuda":
             self._splitkv_workspace = None
             return
+        layout = _splitkv_workspace_layout(
+            num_kv_heads=self.num_kv_heads,
+            num_key_value_groups=self.num_key_value_groups,
+            head_dim=self.head_dim,
+            split_k=split_k,
+        )
         if (
             self._splitkv_workspace is not None
             and self._splitkv_workspace["split_k"] == split_k
             and self._splitkv_workspace["partial_acc"].device == self.qkv_weight.device
         ):
             return
-        partial_acc = torch.empty(
-            (self.num_kv_heads, split_k, self.num_key_value_groups, self.head_dim),
-            dtype=torch.float32,
-            device=self.qkv_weight.device,
-        )
-        partial_l = torch.empty(
-            (self.num_kv_heads, split_k, self.num_key_value_groups),
-            dtype=torch.float32,
-            device=self.qkv_weight.device,
-        )
-        partial_m = torch.empty(
-            (self.num_kv_heads, split_k, self.num_key_value_groups),
-            dtype=torch.float32,
-            device=self.qkv_weight.device,
-        )
+        partial_acc = torch.empty(layout["partial_acc_shape"], dtype=torch.float32, device=self.qkv_weight.device)
+        partial_stats = torch.empty(layout["partial_stats_shape"], dtype=torch.float32, device=self.qkv_weight.device)
         out = torch.empty(
             (1, self.num_heads, self.head_dim),
             dtype=self.qkv_weight.dtype,
@@ -244,8 +237,7 @@ class OptimizedDecoderLayer(nn.Module):
         self._splitkv_workspace = {
             "split_k": split_k,
             "partial_acc": partial_acc,
-            "partial_l": partial_l,
-            "partial_m": partial_m,
+            "partial_stats": partial_stats,
             "out": out,
         }
 
@@ -938,6 +930,12 @@ def _small_decode_attention_grouped_prefix_cachepos_splitkv(
     split_k, block_n, num_warps, num_stages = _small_decode_attention_grouped_prefix_cachepos_splitkv_launch_config(seq_len)
     if split_k <= 1:
         return None
+    layout = _splitkv_workspace_layout(
+        num_kv_heads=k.shape[1],
+        num_key_value_groups=num_key_value_groups,
+        head_dim=head_dim,
+        split_k=split_k,
+    )
 
     if (
         workspace is not None
@@ -946,13 +944,11 @@ def _small_decode_attention_grouped_prefix_cachepos_splitkv(
         and workspace["out"].dtype == q.dtype
     ):
         partial_acc = workspace["partial_acc"]
-        partial_l = workspace["partial_l"]
-        partial_m = workspace["partial_m"]
+        partial_stats = workspace["partial_stats"]
         out = workspace["out"]
     else:
-        partial_acc = torch.empty((k.shape[1], split_k, 2, head_dim), dtype=torch.float32, device=q.device)
-        partial_l = torch.empty((k.shape[1], split_k, 2), dtype=torch.float32, device=q.device)
-        partial_m = torch.empty((k.shape[1], split_k, 2), dtype=torch.float32, device=q.device)
+        partial_acc = torch.empty(layout["partial_acc_shape"], dtype=torch.float32, device=q.device)
+        partial_stats = torch.empty(layout["partial_stats_shape"], dtype=torch.float32, device=q.device)
         out = torch.empty((1, q.shape[1], head_dim), dtype=q.dtype, device=q.device)
 
     _small_decode_attention_grouped_prefix_cachepos_splitkv_fwd_kernel[(k.shape[1], split_k)](
@@ -961,8 +957,7 @@ def _small_decode_attention_grouped_prefix_cachepos_splitkv(
         v,
         cache_position,
         partial_acc,
-        partial_l,
-        partial_m,
+        partial_stats,
         q.stride(0),
         q.stride(1),
         k.stride(0),
@@ -974,12 +969,10 @@ def _small_decode_attention_grouped_prefix_cachepos_splitkv(
         partial_acc.stride(0),
         partial_acc.stride(1),
         partial_acc.stride(2),
-        partial_l.stride(0),
-        partial_l.stride(1),
-        partial_l.stride(2),
-        partial_m.stride(0),
-        partial_m.stride(1),
-        partial_m.stride(2),
+        partial_stats.stride(0),
+        partial_stats.stride(1),
+        partial_stats.stride(2),
+        partial_stats.stride(3),
         scaling,
         HEAD_DIM=head_dim,
         MAX_SEQ_LEN=seq_len,
@@ -990,18 +983,15 @@ def _small_decode_attention_grouped_prefix_cachepos_splitkv(
     )
     _small_decode_attention_grouped_prefix_cachepos_splitkv_merge_kernel[(k.shape[1],)](
         partial_acc,
-        partial_l,
-        partial_m,
+        partial_stats,
         out,
         partial_acc.stride(0),
         partial_acc.stride(1),
         partial_acc.stride(2),
-        partial_l.stride(0),
-        partial_l.stride(1),
-        partial_l.stride(2),
-        partial_m.stride(0),
-        partial_m.stride(1),
-        partial_m.stride(2),
+        partial_stats.stride(0),
+        partial_stats.stride(1),
+        partial_stats.stride(2),
+        partial_stats.stride(3),
         out.stride(0),
         out.stride(1),
         HEAD_DIM=head_dim,
@@ -1042,6 +1032,19 @@ def _default_splitkv_workspace_split_k() -> int:
     if _TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_SPLIT_K > 0:
         return _TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_SPLIT_K
     return 4
+
+
+def _splitkv_workspace_layout(
+    *,
+    num_kv_heads: int,
+    num_key_value_groups: int,
+    head_dim: int,
+    split_k: int,
+) -> dict:
+    return {
+        "partial_acc_shape": (num_kv_heads, split_k, num_key_value_groups, head_dim),
+        "partial_stats_shape": (num_kv_heads, split_k, num_key_value_groups, 2),
+    }
 
 
 @triton.jit
@@ -1439,8 +1442,7 @@ def _small_decode_attention_grouped_prefix_cachepos_splitkv_fwd_kernel(
     V,
     CACHE_POSITION,
     PARTIAL_ACC,
-    PARTIAL_L,
-    PARTIAL_M,
+    PARTIAL_STATS,
     stride_q_b,
     stride_q_h,
     stride_k_b,
@@ -1452,12 +1454,10 @@ def _small_decode_attention_grouped_prefix_cachepos_splitkv_fwd_kernel(
     stride_pa_kh,
     stride_pa_split,
     stride_pa_head,
-    stride_pl_kh,
-    stride_pl_split,
-    stride_pl_head,
-    stride_pm_kh,
-    stride_pm_split,
-    stride_pm_head,
+    stride_ps_kh,
+    stride_ps_split,
+    stride_ps_head,
+    stride_ps_stat,
     scale,
     HEAD_DIM: tl.constexpr,
     MAX_SEQ_LEN: tl.constexpr,
@@ -1477,7 +1477,6 @@ def _small_decode_attention_grouped_prefix_cachepos_splitkv_fwd_kernel(
     q_head_idx1 = q_head_idx0 + 1
     q0 = tl.load(Q + q_head_idx0 * stride_q_h + offs_d, mask=offs_d < HEAD_DIM, other=0.0).to(tl.float32)
     q1 = tl.load(Q + q_head_idx1 * stride_q_h + offs_d, mask=offs_d < HEAD_DIM, other=0.0).to(tl.float32)
-
     m0 = -float("inf")
     m1 = -float("inf")
     l0 = 0.0
@@ -1489,56 +1488,48 @@ def _small_decode_attention_grouped_prefix_cachepos_splitkv_fwd_kernel(
     while start_n < chunk_end:
         offs_n = start_n + tl.arange(0, BLOCK_N)
         token_mask = offs_n < chunk_end
-
         k_ptrs = K + kv_head_idx * stride_k_h + offs_n[:, None] * stride_k_s + offs_d[None, :]
-        k = tl.load(k_ptrs, mask=token_mask[:, None], other=0.0).to(tl.float32)
+        k = tl.load(k_ptrs, mask=token_mask[:, None] & (offs_d[None, :] < HEAD_DIM), other=0.0).to(tl.float32)
         qk0 = tl.sum(k * q0[None, :], axis=1) * scale
         qk1 = tl.sum(k * q1[None, :], axis=1) * scale
 
-        m0_new = tl.maximum(m0, tl.max(qk0, axis=0))
-        m1_new = tl.maximum(m1, tl.max(qk1, axis=0))
-        p0 = tl.exp(qk0 - m0_new)
-        p1 = tl.exp(qk1 - m1_new)
-        alpha0 = tl.exp(m0 - m0_new)
-        alpha1 = tl.exp(m1 - m1_new)
-
+        next_m0 = tl.maximum(m0, tl.max(qk0, axis=0))
+        next_m1 = tl.maximum(m1, tl.max(qk1, axis=0))
+        alpha0 = tl.exp(m0 - next_m0)
+        alpha1 = tl.exp(m1 - next_m1)
+        p0 = tl.exp(qk0 - next_m0)
+        p1 = tl.exp(qk1 - next_m1)
         v_ptrs = V + kv_head_idx * stride_v_h + offs_n[:, None] * stride_v_s + offs_d[None, :]
-        v = tl.load(v_ptrs, mask=token_mask[:, None], other=0.0).to(tl.float32)
+        v = tl.load(v_ptrs, mask=token_mask[:, None] & (offs_d[None, :] < HEAD_DIM), other=0.0).to(tl.float32)
         acc0 = acc0 * alpha0 + tl.sum(p0[:, None] * v, axis=0)
         acc1 = acc1 * alpha1 + tl.sum(p1[:, None] * v, axis=0)
         l0 = l0 * alpha0 + tl.sum(p0, axis=0)
         l1 = l1 * alpha1 + tl.sum(p1, axis=0)
-        m0 = m0_new
-        m1 = m1_new
+        m0 = next_m0
+        m1 = next_m1
         start_n += BLOCK_N
 
     partial_acc_base = PARTIAL_ACC + kv_head_idx * stride_pa_kh + split_idx * stride_pa_split
     tl.store(partial_acc_base + 0 * stride_pa_head + offs_d, acc0, mask=offs_d < HEAD_DIM)
     tl.store(partial_acc_base + 1 * stride_pa_head + offs_d, acc1, mask=offs_d < HEAD_DIM)
 
-    partial_l_base = PARTIAL_L + kv_head_idx * stride_pl_kh + split_idx * stride_pl_split
-    partial_m_base = PARTIAL_M + kv_head_idx * stride_pm_kh + split_idx * stride_pm_split
-    tl.store(partial_l_base + 0 * stride_pl_head, l0)
-    tl.store(partial_l_base + 1 * stride_pl_head, l1)
-    tl.store(partial_m_base + 0 * stride_pm_head, m0)
-    tl.store(partial_m_base + 1 * stride_pm_head, m1)
-
-
+    partial_stats_base = PARTIAL_STATS + kv_head_idx * stride_ps_kh + split_idx * stride_ps_split
+    tl.store(partial_stats_base + 0 * stride_ps_head + 0 * stride_ps_stat, l0)
+    tl.store(partial_stats_base + 1 * stride_ps_head + 0 * stride_ps_stat, l1)
+    tl.store(partial_stats_base + 0 * stride_ps_head + 1 * stride_ps_stat, m0)
+    tl.store(partial_stats_base + 1 * stride_ps_head + 1 * stride_ps_stat, m1)
 @triton.jit
 def _small_decode_attention_grouped_prefix_cachepos_splitkv_merge_kernel(
     PARTIAL_ACC,
-    PARTIAL_L,
-    PARTIAL_M,
+    PARTIAL_STATS,
     OUT,
     stride_pa_kh,
     stride_pa_split,
     stride_pa_head,
-    stride_pl_kh,
-    stride_pl_split,
-    stride_pl_head,
-    stride_pm_kh,
-    stride_pm_split,
-    stride_pm_head,
+    stride_ps_kh,
+    stride_ps_split,
+    stride_ps_head,
+    stride_ps_stat,
     stride_out_b,
     stride_out_h,
     HEAD_DIM: tl.constexpr,
@@ -1546,31 +1537,36 @@ def _small_decode_attention_grouped_prefix_cachepos_splitkv_merge_kernel(
 ):
     kv_head_idx = tl.program_id(0)
     offs_d = tl.arange(0, HEAD_DIM)
-
     max0 = -float("inf")
     max1 = -float("inf")
-    for split_idx in range(SPLIT_K):
-        m_base = PARTIAL_M + kv_head_idx * stride_pm_kh + split_idx * stride_pm_split
-        max0 = tl.maximum(max0, tl.load(m_base + 0 * stride_pm_head))
-        max1 = tl.maximum(max1, tl.load(m_base + 1 * stride_pm_head))
-
     sum0 = 0.0
     sum1 = 0.0
     acc0 = tl.zeros((HEAD_DIM,), dtype=tl.float32)
     acc1 = tl.zeros((HEAD_DIM,), dtype=tl.float32)
     for split_idx in range(SPLIT_K):
-        l_base = PARTIAL_L + kv_head_idx * stride_pl_kh + split_idx * stride_pl_split
-        m_base = PARTIAL_M + kv_head_idx * stride_pm_kh + split_idx * stride_pm_split
+        stats_base = PARTIAL_STATS + kv_head_idx * stride_ps_kh + split_idx * stride_ps_split
         acc_base = PARTIAL_ACC + kv_head_idx * stride_pa_kh + split_idx * stride_pa_split
 
-        m0 = tl.load(m_base + 0 * stride_pm_head)
-        m1 = tl.load(m_base + 1 * stride_pm_head)
-        scale0 = tl.exp(m0 - max0)
-        scale1 = tl.exp(m1 - max1)
-        sum0 += tl.load(l_base + 0 * stride_pl_head) * scale0
-        sum1 += tl.load(l_base + 1 * stride_pl_head) * scale1
-        acc0 += tl.load(acc_base + 0 * stride_pa_head + offs_d, mask=offs_d < HEAD_DIM, other=0.0) * scale0
-        acc1 += tl.load(acc_base + 1 * stride_pa_head + offs_d, mask=offs_d < HEAD_DIM, other=0.0) * scale1
+        m0 = tl.load(stats_base + 0 * stride_ps_head + 1 * stride_ps_stat)
+        m1 = tl.load(stats_base + 1 * stride_ps_head + 1 * stride_ps_stat)
+        l0 = tl.load(stats_base + 0 * stride_ps_head + 0 * stride_ps_stat)
+        l1 = tl.load(stats_base + 1 * stride_ps_head + 0 * stride_ps_stat)
+        part_acc0 = tl.load(acc_base + 0 * stride_pa_head + offs_d, mask=offs_d < HEAD_DIM, other=0.0)
+        part_acc1 = tl.load(acc_base + 1 * stride_pa_head + offs_d, mask=offs_d < HEAD_DIM, other=0.0)
+
+        next_max0 = tl.maximum(max0, m0)
+        next_max1 = tl.maximum(max1, m1)
+        prev_scale0 = tl.exp(max0 - next_max0)
+        prev_scale1 = tl.exp(max1 - next_max1)
+        part_scale0 = tl.exp(m0 - next_max0)
+        part_scale1 = tl.exp(m1 - next_max1)
+
+        acc0 = acc0 * prev_scale0 + part_acc0 * part_scale0
+        acc1 = acc1 * prev_scale1 + part_acc1 * part_scale1
+        sum0 = sum0 * prev_scale0 + l0 * part_scale0
+        sum1 = sum1 * prev_scale1 + l1 * part_scale1
+        max0 = next_max0
+        max1 = next_max1
 
     out0 = acc0 / sum0
     out1 = acc1 / sum1
