@@ -14,7 +14,9 @@ setup(
             ],
             extra_compile_args={
                 "cxx": ["-O3"],
-                "nvcc": ["-O3", "--use_fast_math"],
+                # Keep optimized build, but add lineinfo so Nsight Compute can
+                # correlate SASS/metrics back to CUDA source with low overhead.
+                "nvcc": ["-O3", "--use_fast_math", "-lineinfo"],
             },
         )
     ],

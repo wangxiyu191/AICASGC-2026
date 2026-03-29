@@ -17,6 +17,7 @@ os.environ.setdefault("TQDM_DISABLE", "1")
 os.environ.setdefault("ENABLE_CUSTOM_DECODE", "1")
 os.environ.setdefault("ENABLE_CUDAGRAPH", "0")
 os.environ.setdefault("CUDAGRAPH_PREBUILD_MAX_CACHE_LEN", "0")
+os.environ.setdefault("ENABLE_CUDA_NOSPLIT_GEMV", "0")
 
 import torch
 import torch.nn.functional as F

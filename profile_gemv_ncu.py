@@ -23,6 +23,7 @@ os.environ.setdefault("TQDM_DISABLE", "1")
 os.environ.setdefault("ENABLE_CUSTOM_DECODE", "1")
 os.environ.setdefault("ENABLE_CUDAGRAPH", "0")
 os.environ.setdefault("CUDAGRAPH_PREBUILD_MAX_CACHE_LEN", "0")
+os.environ.setdefault("ENABLE_CUDA_NOSPLIT_GEMV", "0")
 
 import torch
 import torch.nn.functional as F
@@ -32,6 +33,8 @@ from bench_decode_attention import _prepare_inputs
 from bench_decode_linears import (
     LinearCapture,
     _run_capture,
+    _cuda_nosplit_hfma2_matvec,
+    _cuda_nosplit_matvec,
     _triton_matvec,
     _triton_splitk4_matvec,
     _triton_splitk8_matvec,
@@ -55,6 +58,8 @@ def _triton_gemv_v2(x, weight, bias):
 
 VARIANTS = {
     "f_linear": _f_linear,
+    "cuda_nosplit_matvec": _cuda_nosplit_matvec,
+    "cuda_nosplit_hfma2_matvec": _cuda_nosplit_hfma2_matvec,
     "triton_matvec": _triton_matvec,
     "triton_gemv_v2": _triton_gemv_v2,
     "triton_splitk4": _triton_splitk4_matvec,
@@ -105,7 +110,7 @@ def main():
         "--target",
         type=str,
         default="o_proj",
-        choices=["o_proj", "down_proj", "lm_head"],
+        choices=["qkv", "gate_up", "o_proj", "down_proj", "lm_head"],
         help="Which GEMV target to profile",
     )
     parser.add_argument(
