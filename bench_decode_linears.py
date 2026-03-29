@@ -573,10 +573,22 @@ def main():
     parser.add_argument("--graph", action="store_true", default=True, help="Use CUDAGraph replay to eliminate dispatch overhead (default)")
     parser.add_argument("--no-graph", dest="graph", action="store_false", help="Use eager mode (includes Python dispatch overhead)")
     parser.add_argument(
+        "--timing-profile",
+        choices=("realistic", "idealized"),
+        default="realistic",
+        help=(
+            "realistic: one op per graph replay, closer to actual benchmark decode; "
+            "idealized: batch repeated identical ops inside one replay to isolate kernel time"
+        ),
+    )
+    parser.add_argument(
         "--graph-capture-repeats",
         type=int,
-        default=64,
-        help="Number of identical ops batched into one graph replay when --graph is enabled (default: 64)",
+        default=None,
+        help=(
+            "Number of identical ops batched into one graph replay when --graph is enabled. "
+            "Default: 1 for realistic, 64 for idealized"
+        ),
     )
     parser.add_argument("--output", type=str, default=None)
     args = parser.parse_args()
@@ -586,6 +598,8 @@ def main():
             f"results/linear_microbench_sample{args.sample_idx}_"
             f"layer{args.layer_idx}_step{args.decode_step}.json"
         )
+    if args.graph_capture_repeats is None:
+        args.graph_capture_repeats = 1 if args.timing_profile == "realistic" else 64
 
     print("[LinearBench] Loading model...")
     vlm = VLMModel(args.model_path)
@@ -609,7 +623,8 @@ def main():
 
     bench_mode = "graph" if args.graph else "eager"
     print(
-        f"[LinearBench] Benchmarking implementations (mode={bench_mode})..."
+        f"[LinearBench] Benchmarking implementations (mode={bench_mode}, "
+        f"profile={args.timing_profile}, capture_repeats={args.graph_capture_repeats})..."
     )
 
     output = {
@@ -642,6 +657,7 @@ def main():
             "dtype": str(payloads["o_proj"]["x"].dtype),
             "device": str(payloads["o_proj"]["x"].device),
             "timer": "cuda_event",
+            "timing_profile": args.timing_profile,
             "graph_capture_repeats": int(args.graph_capture_repeats if args.graph else 1),
         },
         "qkv_benchmarks": _run_benchmarks(payloads["qkv"], warmup=args.warmup, iters=args.iters, use_graph=args.graph, graph_capture_repeats=args.graph_capture_repeats),

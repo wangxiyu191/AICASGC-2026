@@ -580,10 +580,22 @@ def main():
     parser.add_argument("--graph", action="store_true", default=True, help="Use CUDAGraph replay to eliminate dispatch overhead (default)")
     parser.add_argument("--no-graph", dest="graph", action="store_false", help="Use eager mode (includes Python dispatch overhead)")
     parser.add_argument(
+        "--timing-profile",
+        choices=("realistic", "idealized"),
+        default="realistic",
+        help=(
+            "realistic: one op per graph replay, closer to actual benchmark decode; "
+            "idealized: batch repeated identical ops inside one replay to isolate kernel time"
+        ),
+    )
+    parser.add_argument(
         "--graph-capture-repeats",
         type=int,
-        default=64,
-        help="Number of identical ops batched into one graph replay when --graph is enabled (default: 64)",
+        default=None,
+        help=(
+            "Number of identical ops batched into one graph replay when --graph is enabled. "
+            "Default: 1 for realistic, 64 for idealized"
+        ),
     )
     parser.add_argument("--output", type=str, default=None, help="Output JSON path (default: results/...)")
     args = parser.parse_args()
@@ -593,6 +605,8 @@ def main():
             f"results/attention_microbench_sample{args.sample_idx}_"
             f"layer{args.layer_idx}_step{args.decode_step}.json"
         )
+    if args.graph_capture_repeats is None:
+        args.graph_capture_repeats = 1 if args.timing_profile == "realistic" else 64
 
     print("[AttentionBench] Loading model...")
     vlm = VLMModel(args.model_path)
@@ -637,6 +651,7 @@ def main():
         "cache_position": int(payload["cache_position"].item()) if payload["cache_position"] is not None else None,
         "bench_mode": "graph" if args.graph else "eager",
         "timer": "cuda_event",
+        "timing_profile": args.timing_profile,
         "graph_capture_repeats": int(args.graph_capture_repeats if args.graph else 1),
     }
 
@@ -646,7 +661,10 @@ def main():
         f"q={tuple(metadata['q_shape'])}, k={tuple(metadata['k_shape'])}"
     )
     bench_mode = "graph" if args.graph else "eager"
-    print(f"[AttentionBench] Benchmarking implementations (mode={bench_mode})...")
+    print(
+        f"[AttentionBench] Benchmarking implementations (mode={bench_mode}, "
+        f"profile={args.timing_profile}, capture_repeats={args.graph_capture_repeats})..."
+    )
     benchmarks = _run_benchmarks(
         payload,
         warmup=args.warmup,

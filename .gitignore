@@ -5,5 +5,9 @@ Qwen3-VL-2B-Instruct/
 traces/
 result.json
 submission.zip
+submission_*.zip
 .qoder/repowiki/
+cuda_extensions/build/
+cuda_extensions/*.so
+results/*.json
 results/ncu/
