@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import importlib.util
+import importlib.machinery
 from functools import lru_cache
 from pathlib import Path
 
@@ -15,20 +16,22 @@ import torch
 
 _ROOT = Path(__file__).resolve().parent
 _SRC_DIR = _ROOT / "cuda_extensions"
+_MODULE_NAME = "cuda_decode_attention_ext"
+
+
+def _find_prebuilt_ext() -> Path | None:
+    for suffix in importlib.machinery.EXTENSION_SUFFIXES:
+        candidate = _SRC_DIR / f"{_MODULE_NAME}{suffix}"
+        if candidate.exists():
+            return candidate
+    return None
 
 
 @lru_cache(maxsize=1)
 def _load_ext():
     os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.0")
-    ext_suffix = next(iter(__import__("importlib.machinery").machinery.EXTENSION_SUFFIXES))
-    so_candidates = sorted(_SRC_DIR.glob(f"cuda_decode_attention_ext*{ext_suffix}"))
-    latest_src_mtime = max(
-        (_SRC_DIR / "decode_attention_ext.cpp").stat().st_mtime,
-        (_SRC_DIR / "decode_attention_kernel.cu").stat().st_mtime,
-        (_SRC_DIR / "setup.py").stat().st_mtime,
-    )
-    needs_build = (not so_candidates) or so_candidates[0].stat().st_mtime < latest_src_mtime
-    if needs_build:
+    prebuilt_ext = _find_prebuilt_ext()
+    if prebuilt_ext is None:
         env = dict(os.environ)
         env.setdefault("TORCH_CUDA_ARCH_LIST", "8.0")
         env["PATH"] = f"/usr/local/cuda/bin:{env.get('PATH', '')}"
@@ -40,16 +43,16 @@ def _load_ext():
             stdout=subprocess.DEVNULL,
             stderr=subprocess.STDOUT,
         )
-        so_candidates = sorted(_SRC_DIR.glob(f"cuda_decode_attention_ext*{ext_suffix}"))
-    if not so_candidates:
+        prebuilt_ext = _find_prebuilt_ext()
+    if prebuilt_ext is None:
         raise RuntimeError("failed to build cuda_decode_attention_ext")
 
     spec = importlib.util.spec_from_file_location(
-        "cuda_decode_attention_ext",
-        so_candidates[0],
+        _MODULE_NAME,
+        prebuilt_ext,
     )
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"failed to load extension spec from {so_candidates[0]}")
+        raise RuntimeError(f"failed to load extension spec from {prebuilt_ext}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

@@ -51,6 +51,40 @@ if [ -f "$SCRIPT_DIR/optimized_layer.py" ]; then
     echo "Including optimized_layer.py"
 fi
 
+# Include CUDA Python wrappers if they exist
+for py_file in cuda_decode_gemv.py cuda_decode_attention.py; do
+    if [ -f "$SCRIPT_DIR/$py_file" ]; then
+        cp "$SCRIPT_DIR/$py_file" "$TEMP_DIR/"
+        echo "Including $py_file"
+    fi
+done
+
+# Include selected CUDA extension sources / setup files / prebuilt shared libraries
+if [ -d "$SCRIPT_DIR/cuda_extensions" ]; then
+    mkdir -p "$TEMP_DIR/cuda_extensions"
+    for ext_file in \
+        README.md \
+        setup.py \
+        setup_decode_gemv.py \
+        decode_attention_ext.cpp \
+        decode_attention_kernel.cu \
+        decode_gemv_ext.cpp \
+        decode_gemv_kernel.cu
+    do
+        if [ -f "$SCRIPT_DIR/cuda_extensions/$ext_file" ]; then
+            cp "$SCRIPT_DIR/cuda_extensions/$ext_file" "$TEMP_DIR/cuda_extensions/"
+            echo "Including cuda_extensions/$ext_file"
+        fi
+    done
+
+    for so_file in "$SCRIPT_DIR"/cuda_extensions/cuda_decode_*_ext*.so; do
+        if [ -f "$so_file" ]; then
+            cp "$so_file" "$TEMP_DIR/cuda_extensions/"
+            echo "Including cuda_extensions/$(basename "$so_file")"
+        fi
+    done
+fi
+
 # Create the ZIP file
 cd "$TEMP_DIR"
 zip -r "$SCRIPT_DIR/$OUTPUT_NAME" ./*

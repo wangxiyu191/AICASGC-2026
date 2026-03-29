@@ -22,6 +22,8 @@ import torch
 from transformers import AutoModelForImageTextToText, AutoProcessor
 from transformers.cache_utils import StaticCache
 
+os.environ.setdefault("ENABLE_CUDA_NOSPLIT_GEMV", "1")
+
 from optimized_layer import replace_decoder_layers, set_small_decode_triton_enabled
 
 
