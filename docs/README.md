@@ -9,6 +9,7 @@ Qwen3-VL-2B-Instruct 推理优化过程中的分析报告与记录文档。
 | 文档 | 说明 |
 |------|------|
 | [decode_bottleneck_analysis.md](./decode_bottleneck_analysis.md) | **当前重点** CUDAGraph decode 阶段的 GPU kernel 级瓶颈分析与优化方向，基于最新 viztracer trace |
+| [decode_fusion_plan.md](./decode_fusion_plan.md) | decode 深融合下一阶段计划：优先级、实施顺序、改动文件、验证口径与止损条件 |
 | [decode_attention_optimization.md](./decode_attention_optimization.md) | decode attention / split-KV 路线的优化过程、`ncu` 结论、保留实现与已证伪实验汇总 |
 | [decode_compute_memory_budget.md](./decode_compute_memory_budget.md) | decode 阶段每 token 的算力/访存预算、HBM 理论上限与当前利用率估算 |
 | [decode_gemv_analysis.md](./decode_gemv_analysis.md) | decode 阶段 `o_proj / down_proj / lm_head` 的 GEMV 性能分析、失败尝试与后续 CUDA/fusion 判断 |

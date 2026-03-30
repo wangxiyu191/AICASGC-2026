@@ -9,7 +9,7 @@
 ./reference/sglang/
 ./reference/llama.cpp/
 开发环境：所有开发完全在./venv环境中进行。
-优化习惯：将每一步的优化动作和测试结果记录在result.csv中。
+优化习惯：将每一步的优化动作和测试结果按类型分文件记录：result.csv（里程碑）、result_experiments.csv（实验/消融）、result_tooling.csv（工具/分析）。
 官方信息更新：
 1. 评测环境机器没有配置连接外网。安装受限。（但是本地已经安装了flash-attn2.8.3了）。
 工作建议：
@@ -18,3 +18,4 @@
 3. benchmark的JSON测试结果统一存放在results/目录中，便于管理和追踪。
 4. viztrace/trace 文件统一存放在traces/目录下；如需分类，对比实验请在traces/下面新建子目录，不要再在仓库根目录新建独立trace目录。
 优化文档：docs/README.md（包含优化计划、日志、踩坑记录、Trace分析、推理引擎分析等文档索引）
+项目文件索引：FILES.md（核心文件、CUDA extensions、工具脚本、数据结果、文档的完整索引）
