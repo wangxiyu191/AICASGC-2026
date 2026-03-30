@@ -7,10 +7,26 @@
 namespace {
 
 constexpr int kThreads = 32;
+constexpr int kRow2Threads = 64;
 constexpr int kRow4Threads = 128;
 constexpr int kRow8Threads = 256;
 constexpr int kSharedTileK = 256;
 constexpr int kVecTileK = 256;
+constexpr int kNosplitSpecializedK2048 = 2048;
+constexpr int kNosplitSpecializedTileK6144 = 2048;
+constexpr int kHalfPerVec128 = 8;
+constexpr int kNosplitProfileSlots = 8;
+
+enum NosplitProfileSlot : int {
+    kProfileKernelStart = 0,
+    kProfileTile0LoadDone = 1,
+    kProfileTile0ComputeDone = 2,
+    kProfileTile1LoadDone = 3,
+    kProfileTile1ComputeDone = 4,
+    kProfileTile2LoadDone = 5,
+    kProfileTile2ComputeDone = 6,
+    kProfileKernelDone = 7,
+};
 
 template <typename scalar_t>
 __device__ inline float to_float(scalar_t v) {
@@ -22,6 +38,33 @@ __device__ inline float warp_sum(float v) {
         v += __shfl_down_sync(0xffffffff, v, offset);
     }
     return v;
+}
+
+__device__ inline void accumulate_hfma2_uint4(
+    const uint4& x_vec,
+    const uint4& w_vec,
+    __half2& acc) {
+    const __half2* x2 = reinterpret_cast<const __half2*>(&x_vec);
+    const __half2* w2 = reinterpret_cast<const __half2*>(&w_vec);
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        acc = __hfma2(x2[i], w2[i], acc);
+    }
+}
+
+__device__ inline uint64_t read_globaltimer() {
+    unsigned long long ts;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(ts));
+    return static_cast<uint64_t>(ts);
+}
+
+template <bool kProfile>
+__device__ inline void maybe_record_profile(uint64_t* profile, int slot) {
+    if constexpr (kProfile) {
+        if (threadIdx.x == 0 && profile != nullptr) {
+            profile[static_cast<int64_t>(blockIdx.x) * kNosplitProfileSlots + slot] = read_globaltimer();
+        }
+    }
 }
 
 template <typename scalar_t>
@@ -231,6 +274,222 @@ __global__ void splitk_matvec_row4_shared_vec_half_fwd_kernel(
 }
 
 constexpr int kVecTileK_v2 = 1024;
+
+template <bool kProfile>
+__global__ void nosplit_matvec_k2048_hfma2_fwd_kernel(
+    const at::Half* __restrict__ x,
+    const at::Half* __restrict__ weight,
+    const at::Half* __restrict__ bias,
+    at::Half* __restrict__ out,
+    uint64_t* __restrict__ profile,
+    int64_t stride_wn,
+    int n,
+    bool has_bias) {
+    __shared__ __half x_sh[kNosplitSpecializedK2048];
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row_base = blockIdx.x * 4;
+    const int row = row_base + warp;
+
+    const __half* x_half = reinterpret_cast<const __half*>(x);
+    const __half* w_half = reinterpret_cast<const __half*>(weight);
+
+    const uint4* x_global_vec = reinterpret_cast<const uint4*>(x_half);
+    uint4* x_sh_vec = reinterpret_cast<uint4*>(x_sh);
+
+    const int vecs_k2048 = kNosplitSpecializedK2048 / kHalfPerVec128;
+    maybe_record_profile<kProfile>(profile, kProfileKernelStart);
+    if (threadIdx.x < vecs_k2048 / 2) {
+        x_sh_vec[threadIdx.x] = x_global_vec[threadIdx.x];
+        x_sh_vec[threadIdx.x + vecs_k2048 / 2] = x_global_vec[threadIdx.x + vecs_k2048 / 2];
+    }
+    __syncthreads();
+    maybe_record_profile<kProfile>(profile, kProfileTile0LoadDone);
+
+    if (row < n) {
+        const uint4* w_row_vec = reinterpret_cast<const uint4*>(w_half + row * stride_wn);
+        __half2 h2_acc0 = __float2half2_rn(0.0f);
+        __half2 h2_acc1 = __float2half2_rn(0.0f);
+
+        #pragma unroll
+        for (int vec_idx = lane; vec_idx < vecs_k2048; vec_idx += 64) {
+            const uint4 x_vec0 = x_sh_vec[vec_idx];
+            const uint4 w_vec0 = w_row_vec[vec_idx];
+            const uint4 x_vec1 = x_sh_vec[vec_idx + 32];
+            const uint4 w_vec1 = w_row_vec[vec_idx + 32];
+            accumulate_hfma2_uint4(x_vec0, w_vec0, h2_acc0);
+            accumulate_hfma2_uint4(x_vec1, w_vec1, h2_acc1);
+        }
+
+        const float2 f2_0 = __half22float2(h2_acc0);
+        const float2 f2_1 = __half22float2(h2_acc1);
+        float sum = f2_0.x + f2_0.y + f2_1.x + f2_1.y;
+        sum = warp_sum(sum);
+        if (lane == 0) {
+            float result = sum;
+            if (has_bias) {
+                result += __half2float(reinterpret_cast<const __half*>(bias)[row]);
+            }
+            reinterpret_cast<__half*>(out)[row] = __float2half(result);
+        }
+    }
+    if constexpr (kProfile) {
+        __syncthreads();
+        maybe_record_profile<kProfile>(profile, kProfileTile0ComputeDone);
+        __syncthreads();
+        maybe_record_profile<kProfile>(profile, kProfileKernelDone);
+    }
+}
+
+template <bool kProfile>
+__global__ void nosplit_matvec_k2048_row2_hfma2_fwd_kernel(
+    const at::Half* __restrict__ x,
+    const at::Half* __restrict__ weight,
+    const at::Half* __restrict__ bias,
+    at::Half* __restrict__ out,
+    uint64_t* __restrict__ profile,
+    int64_t stride_wn,
+    int n,
+    bool has_bias) {
+    __shared__ __half x_sh[kNosplitSpecializedK2048];
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row_base = blockIdx.x * 2;
+    const int row = row_base + warp;
+
+    const __half* x_half = reinterpret_cast<const __half*>(x);
+    const __half* w_half = reinterpret_cast<const __half*>(weight);
+
+    const uint4* x_global_vec = reinterpret_cast<const uint4*>(x_half);
+    uint4* x_sh_vec = reinterpret_cast<uint4*>(x_sh);
+
+    constexpr int vecs_k2048 = kNosplitSpecializedK2048 / kHalfPerVec128;
+    maybe_record_profile<kProfile>(profile, kProfileKernelStart);
+    if (threadIdx.x < vecs_k2048 / 4) {
+        x_sh_vec[threadIdx.x] = x_global_vec[threadIdx.x];
+        x_sh_vec[threadIdx.x + vecs_k2048 / 4] = x_global_vec[threadIdx.x + vecs_k2048 / 4];
+        x_sh_vec[threadIdx.x + vecs_k2048 / 2] = x_global_vec[threadIdx.x + vecs_k2048 / 2];
+        x_sh_vec[threadIdx.x + (vecs_k2048 * 3) / 4] = x_global_vec[threadIdx.x + (vecs_k2048 * 3) / 4];
+    }
+    __syncthreads();
+    maybe_record_profile<kProfile>(profile, kProfileTile0LoadDone);
+
+    if (row < n) {
+        const uint4* w_row_vec = reinterpret_cast<const uint4*>(w_half + row * stride_wn);
+        __half2 h2_acc0 = __float2half2_rn(0.0f);
+        __half2 h2_acc1 = __float2half2_rn(0.0f);
+
+        #pragma unroll
+        for (int vec_idx = lane; vec_idx < vecs_k2048; vec_idx += 64) {
+            const uint4 x_vec0 = x_sh_vec[vec_idx];
+            const uint4 w_vec0 = w_row_vec[vec_idx];
+            const uint4 x_vec1 = x_sh_vec[vec_idx + 32];
+            const uint4 w_vec1 = w_row_vec[vec_idx + 32];
+            accumulate_hfma2_uint4(x_vec0, w_vec0, h2_acc0);
+            accumulate_hfma2_uint4(x_vec1, w_vec1, h2_acc1);
+        }
+
+        const float2 f2_0 = __half22float2(h2_acc0);
+        const float2 f2_1 = __half22float2(h2_acc1);
+        float sum = f2_0.x + f2_0.y + f2_1.x + f2_1.y;
+        sum = warp_sum(sum);
+        if (lane == 0) {
+            float result = sum;
+            if (has_bias) {
+                result += __half2float(reinterpret_cast<const __half*>(bias)[row]);
+            }
+            reinterpret_cast<__half*>(out)[row] = __float2half(result);
+        }
+    }
+    if constexpr (kProfile) {
+        __syncthreads();
+        maybe_record_profile<kProfile>(profile, kProfileTile0ComputeDone);
+        __syncthreads();
+        maybe_record_profile<kProfile>(profile, kProfileKernelDone);
+    }
+}
+
+template <bool kProfile>
+__global__ void nosplit_matvec_k6144_hfma2_fwd_kernel(
+    const at::Half* __restrict__ x,
+    const at::Half* __restrict__ weight,
+    const at::Half* __restrict__ bias,
+    at::Half* __restrict__ out,
+    uint64_t* __restrict__ profile,
+    int64_t stride_wn,
+    int n,
+    bool has_bias) {
+    __shared__ __half x_sh[kNosplitSpecializedTileK6144];
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row_base = blockIdx.x * 4;
+    const int row = row_base + warp;
+
+    const __half* x_half = reinterpret_cast<const __half*>(x);
+    const __half* w_half = reinterpret_cast<const __half*>(weight);
+    uint4* x_sh_vec = reinterpret_cast<uint4*>(x_sh);
+
+    const int vecs_per_tile = kNosplitSpecializedTileK6144 / kHalfPerVec128;
+    float sum = 0.0f;
+    maybe_record_profile<kProfile>(profile, kProfileKernelStart);
+
+    #pragma unroll
+    for (int tile_idx = 0; tile_idx < 3; ++tile_idx) {
+        const int tile_start = tile_idx * kNosplitSpecializedTileK6144;
+        const uint4* x_tile_vec = reinterpret_cast<const uint4*>(x_half + tile_start);
+
+        if (threadIdx.x < vecs_per_tile / 2) {
+            x_sh_vec[threadIdx.x] = x_tile_vec[threadIdx.x];
+            x_sh_vec[threadIdx.x + vecs_per_tile / 2] = x_tile_vec[threadIdx.x + vecs_per_tile / 2];
+        }
+        __syncthreads();
+        if constexpr (kProfile) {
+            maybe_record_profile<kProfile>(profile, kProfileTile0LoadDone + tile_idx * 2);
+        }
+
+        if (row < n) {
+            const uint4* w_row_vec = reinterpret_cast<const uint4*>(w_half + row * stride_wn + tile_start);
+            __half2 h2_acc0 = __float2half2_rn(0.0f);
+            __half2 h2_acc1 = __float2half2_rn(0.0f);
+
+            #pragma unroll
+            for (int vec_idx = lane; vec_idx < vecs_per_tile; vec_idx += 64) {
+                const uint4 x_vec0 = x_sh_vec[vec_idx];
+                const uint4 w_vec0 = w_row_vec[vec_idx];
+                const uint4 x_vec1 = x_sh_vec[vec_idx + 32];
+                const uint4 w_vec1 = w_row_vec[vec_idx + 32];
+                accumulate_hfma2_uint4(x_vec0, w_vec0, h2_acc0);
+                accumulate_hfma2_uint4(x_vec1, w_vec1, h2_acc1);
+            }
+
+            const float2 f2_0 = __half22float2(h2_acc0);
+            const float2 f2_1 = __half22float2(h2_acc1);
+            sum += f2_0.x + f2_0.y + f2_1.x + f2_1.y;
+        }
+        __syncthreads();
+        if constexpr (kProfile) {
+            maybe_record_profile<kProfile>(profile, kProfileTile0ComputeDone + tile_idx * 2);
+        }
+    }
+
+    if (row < n) {
+        sum = warp_sum(sum);
+        if (lane == 0) {
+            float result = sum;
+            if (has_bias) {
+                result += __half2float(reinterpret_cast<const __half*>(bias)[row]);
+            }
+            reinterpret_cast<__half*>(out)[row] = __float2half(result);
+        }
+    }
+    if constexpr (kProfile) {
+        __syncthreads();
+        maybe_record_profile<kProfile>(profile, kProfileKernelDone);
+    }
+}
 
 __global__ void splitk_matvec_row4_shared_vec_half_v2_fwd_kernel(
     const at::Half* __restrict__ x,
@@ -869,18 +1128,54 @@ torch::Tensor nosplit_matvec_half_cuda(
     auto stream = at::cuda::getCurrentCUDAStream();
 
     // 1 block per 4 rows — no split-K, no scratch, no atomicAdd, no finalize
-    const int grid_blocks = (n + 3) / 4;
+    const bool use_row2_k2048 = (k == kNosplitSpecializedK2048 && n <= 2048);
+    const int grid_blocks = use_row2_k2048 ? ((n + 1) / 2) : ((n + 3) / 4);
 
-    persistent_matvec_half_fwd_kernel<<<grid_blocks, kRow4Threads, 0, stream>>>(
-        x.data_ptr<at::Half>(),
-        weight.data_ptr<at::Half>(),
-        has_bias ? bias.data_ptr<at::Half>() : nullptr,
-        out.data_ptr<at::Half>(),
-        weight.stride(0),
-        n,
-        k,
-        has_bias
-    );
+    if (use_row2_k2048) {
+        nosplit_matvec_k2048_row2_hfma2_fwd_kernel<false><<<grid_blocks, kRow2Threads, 0, stream>>>(
+            x.data_ptr<at::Half>(),
+            weight.data_ptr<at::Half>(),
+            has_bias ? bias.data_ptr<at::Half>() : nullptr,
+            out.data_ptr<at::Half>(),
+            nullptr,
+            weight.stride(0),
+            n,
+            has_bias
+        );
+    } else if (k == kNosplitSpecializedK2048) {
+        nosplit_matvec_k2048_hfma2_fwd_kernel<false><<<grid_blocks, kRow4Threads, 0, stream>>>(
+            x.data_ptr<at::Half>(),
+            weight.data_ptr<at::Half>(),
+            has_bias ? bias.data_ptr<at::Half>() : nullptr,
+            out.data_ptr<at::Half>(),
+            nullptr,
+            weight.stride(0),
+            n,
+            has_bias
+        );
+    } else if (k == 6144) {
+        nosplit_matvec_k6144_hfma2_fwd_kernel<false><<<grid_blocks, kRow4Threads, 0, stream>>>(
+            x.data_ptr<at::Half>(),
+            weight.data_ptr<at::Half>(),
+            has_bias ? bias.data_ptr<at::Half>() : nullptr,
+            out.data_ptr<at::Half>(),
+            nullptr,
+            weight.stride(0),
+            n,
+            has_bias
+        );
+    } else {
+        persistent_matvec_half_fwd_kernel<<<grid_blocks, kRow4Threads, 0, stream>>>(
+            x.data_ptr<at::Half>(),
+            weight.data_ptr<at::Half>(),
+            has_bias ? bias.data_ptr<at::Half>() : nullptr,
+            out.data_ptr<at::Half>(),
+            weight.stride(0),
+            n,
+            k,
+            has_bias
+        );
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     return out;
@@ -912,18 +1207,133 @@ torch::Tensor nosplit_hfma2_matvec_half_cuda(
     c10::cuda::CUDAGuard device_guard(x.device());
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    const int grid_blocks = (n + 3) / 4;
+    const bool use_row2_k2048 = (k == kNosplitSpecializedK2048 && n <= 2048);
+    const int grid_blocks = use_row2_k2048 ? ((n + 1) / 2) : ((n + 3) / 4);
 
-    persistent_matvec_hfma2_fwd_kernel<<<grid_blocks, kRow4Threads, 0, stream>>>(
-        x.data_ptr<at::Half>(),
-        weight.data_ptr<at::Half>(),
-        has_bias ? bias.data_ptr<at::Half>() : nullptr,
-        out.data_ptr<at::Half>(),
-        weight.stride(0),
-        n,
-        k,
-        has_bias
-    );
+    if (use_row2_k2048) {
+        nosplit_matvec_k2048_row2_hfma2_fwd_kernel<false><<<grid_blocks, kRow2Threads, 0, stream>>>(
+            x.data_ptr<at::Half>(),
+            weight.data_ptr<at::Half>(),
+            has_bias ? bias.data_ptr<at::Half>() : nullptr,
+            out.data_ptr<at::Half>(),
+            nullptr,
+            weight.stride(0),
+            n,
+            has_bias
+        );
+    } else if (k == kNosplitSpecializedK2048) {
+        nosplit_matvec_k2048_hfma2_fwd_kernel<false><<<grid_blocks, kRow4Threads, 0, stream>>>(
+            x.data_ptr<at::Half>(),
+            weight.data_ptr<at::Half>(),
+            has_bias ? bias.data_ptr<at::Half>() : nullptr,
+            out.data_ptr<at::Half>(),
+            nullptr,
+            weight.stride(0),
+            n,
+            has_bias
+        );
+    } else if (k == 6144) {
+        nosplit_matvec_k6144_hfma2_fwd_kernel<false><<<grid_blocks, kRow4Threads, 0, stream>>>(
+            x.data_ptr<at::Half>(),
+            weight.data_ptr<at::Half>(),
+            has_bias ? bias.data_ptr<at::Half>() : nullptr,
+            out.data_ptr<at::Half>(),
+            nullptr,
+            weight.stride(0),
+            n,
+            has_bias
+        );
+    } else {
+        persistent_matvec_hfma2_fwd_kernel<<<grid_blocks, kRow4Threads, 0, stream>>>(
+            x.data_ptr<at::Half>(),
+            weight.data_ptr<at::Half>(),
+            has_bias ? bias.data_ptr<at::Half>() : nullptr,
+            out.data_ptr<at::Half>(),
+            weight.stride(0),
+            n,
+            k,
+            has_bias
+        );
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    return out;
+}
+
+torch::Tensor nosplit_matvec_half_profile_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& out,
+    const torch::Tensor& profile,
+    bool has_bias) {
+    TORCH_CHECK(x.is_cuda(), "x must be CUDA");
+    TORCH_CHECK(weight.is_cuda(), "weight must be CUDA");
+    TORCH_CHECK(out.is_cuda(), "out must be CUDA");
+    TORCH_CHECK(profile.is_cuda(), "profile must be CUDA");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat16, "nosplit profile only supports fp16");
+    TORCH_CHECK(weight.scalar_type() == torch::kFloat16, "nosplit profile only supports fp16");
+    TORCH_CHECK(weight.stride(1) == 1, "nosplit profile requires contiguous weight");
+    TORCH_CHECK(x.dim() == 1, "x must be flattened [K]");
+    TORCH_CHECK(weight.dim() == 2, "weight must be [N, K]");
+    TORCH_CHECK(weight.size(1) == x.size(0), "weight/x shape mismatch");
+    TORCH_CHECK(out.scalar_type() == torch::kFloat16, "out must be fp16");
+    TORCH_CHECK(profile.scalar_type() == torch::kInt64, "profile must be int64");
+    TORCH_CHECK(profile.is_contiguous(), "profile must be contiguous");
+    if (has_bias) {
+        TORCH_CHECK(bias.is_cuda(), "bias must be CUDA when present");
+        TORCH_CHECK(bias.numel() == weight.size(0), "bias size mismatch");
+    }
+
+    const int n = static_cast<int>(weight.size(0));
+    const int k = static_cast<int>(weight.size(1));
+    const bool use_row2_k2048 = (k == kNosplitSpecializedK2048 && n <= 2048);
+    const int grid_blocks = use_row2_k2048 ? ((n + 1) / 2) : ((n + 3) / 4);
+    TORCH_CHECK(
+        k == kNosplitSpecializedK2048 || k == 6144,
+        "nosplit internal profiling currently supports the active k=2048/6144 specialized kernels only");
+    TORCH_CHECK(
+        profile.numel() == static_cast<int64_t>(grid_blocks) * kNosplitProfileSlots,
+        "profile tensor shape mismatch");
+
+    c10::cuda::CUDAGuard device_guard(x.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+    profile.zero_();
+
+    if (use_row2_k2048) {
+        nosplit_matvec_k2048_row2_hfma2_fwd_kernel<true><<<grid_blocks, kRow2Threads, 0, stream>>>(
+            x.data_ptr<at::Half>(),
+            weight.data_ptr<at::Half>(),
+            has_bias ? bias.data_ptr<at::Half>() : nullptr,
+            out.data_ptr<at::Half>(),
+            reinterpret_cast<uint64_t*>(profile.data_ptr<int64_t>()),
+            weight.stride(0),
+            n,
+            has_bias
+        );
+    } else if (k == kNosplitSpecializedK2048) {
+        nosplit_matvec_k2048_hfma2_fwd_kernel<true><<<grid_blocks, kRow4Threads, 0, stream>>>(
+            x.data_ptr<at::Half>(),
+            weight.data_ptr<at::Half>(),
+            has_bias ? bias.data_ptr<at::Half>() : nullptr,
+            out.data_ptr<at::Half>(),
+            reinterpret_cast<uint64_t*>(profile.data_ptr<int64_t>()),
+            weight.stride(0),
+            n,
+            has_bias
+        );
+    } else {
+        nosplit_matvec_k6144_hfma2_fwd_kernel<true><<<grid_blocks, kRow4Threads, 0, stream>>>(
+            x.data_ptr<at::Half>(),
+            weight.data_ptr<at::Half>(),
+            has_bias ? bias.data_ptr<at::Half>() : nullptr,
+            out.data_ptr<at::Half>(),
+            reinterpret_cast<uint64_t*>(profile.data_ptr<int64_t>()),
+            weight.stride(0),
+            n,
+            has_bias
+        );
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     return out;

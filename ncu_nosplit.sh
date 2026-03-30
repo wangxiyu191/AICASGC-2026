@@ -80,7 +80,7 @@ run_target() {
         kernel_deep)
             suffix="kernel_deep"
             extra_args=(
-                -k regex:persistent_matvec_half_fwd_kernel
+                -k "regex:.*(persistent_matvec_half_fwd_kernel|nosplit_matvec_.*fwd_kernel).*"
                 -c 1
                 --section ComputeWorkloadAnalysis
                 --section LaunchStats

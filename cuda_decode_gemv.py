@@ -17,6 +17,16 @@ import torch
 _ROOT = Path(__file__).resolve().parent
 _SRC_DIR = _ROOT / "cuda_extensions"
 _MODULE_NAME = "cuda_decode_gemv_ext"
+NOSPLIT_PROFILE_SLOT_NAMES = (
+    "kernel_start",
+    "tile0_load_done",
+    "tile0_compute_done",
+    "tile1_load_done",
+    "tile1_compute_done",
+    "tile2_load_done",
+    "tile2_compute_done",
+    "kernel_done",
+)
 
 
 def _find_prebuilt_ext() -> Path | None:
@@ -53,6 +63,22 @@ def _load_ext():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _nosplit_grid_blocks(n: int, k: int) -> int:
+    if k == 2048 and n <= 2048:
+        return (n + 1) // 2
+    return (n + 3) // 4
+
+
+def _nosplit_profile_kernel_name(n: int, k: int) -> str:
+    if k == 2048 and n <= 2048:
+        return "nosplit_matvec_k2048_row2_hfma2_fwd_kernel"
+    if k == 2048:
+        return "nosplit_matvec_k2048_hfma2_fwd_kernel"
+    if k == 6144:
+        return "nosplit_matvec_k6144_hfma2_fwd_kernel"
+    raise RuntimeError("nosplit internal profiling currently supports only k=2048/6144 specialized kernels")
 
 
 def splitk_matvec(
@@ -397,3 +423,60 @@ def nosplit_hfma2_matvec_half(
         bias is not None,
     )
     return out_vec.view(*x.shape[:-1], n)
+
+
+def nosplit_matvec_half_profile(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    workspace: dict | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, dict]:
+    if (
+        x.device.type != "cuda"
+        or weight.device.type != "cuda"
+        or x.dtype != torch.float16
+        or weight.dtype != torch.float16
+        or x.ndim < 2
+        or x.shape[-2] != 1
+    ):
+        raise RuntimeError("nosplit_matvec_half_profile expects fp16 CUDA single-token decode tensors")
+
+    x_vec = x.reshape(-1).contiguous()
+    n, k = weight.shape
+    grid_blocks = _nosplit_grid_blocks(n, k)
+
+    if (
+        workspace is not None
+        and workspace.get("type") == "nosplit_profile"
+        and tuple(workspace["out"].shape) == (n,)
+        and tuple(workspace["profile"].shape) == (grid_blocks, len(NOSPLIT_PROFILE_SLOT_NAMES))
+        and workspace["out"].device == x.device
+        and workspace["profile"].device == x.device
+        and workspace["out"].dtype == x.dtype
+        and workspace["profile"].dtype == torch.int64
+    ):
+        out_vec = workspace["out"]
+        profile = workspace["profile"]
+    else:
+        out_vec = torch.empty((n,), dtype=x.dtype, device=x.device)
+        profile = torch.empty(
+            (grid_blocks, len(NOSPLIT_PROFILE_SLOT_NAMES)),
+            dtype=torch.int64,
+            device=x.device,
+        )
+
+    ext = _load_ext()
+    ext.nosplit_matvec_half_profile(
+        x_vec,
+        weight,
+        bias if bias is not None else torch.empty(0, device=x.device, dtype=x.dtype),
+        out_vec,
+        profile,
+        bias is not None,
+    )
+    meta = {
+        "kernel_name": _nosplit_profile_kernel_name(n, k),
+        "grid_blocks": grid_blocks,
+        "slot_names": list(NOSPLIT_PROFILE_SLOT_NAMES),
+    }
+    return out_vec.view(*x.shape[:-1], n), profile, meta
