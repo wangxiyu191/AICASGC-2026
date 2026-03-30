@@ -28,6 +28,15 @@ enum NosplitProfileSlot : int {
     kProfileKernelDone = 7,
 };
 
+enum NosplitVariant : int64_t {
+    kNosplitVariantAuto = 0,
+    kNosplitVariantK2048Row2 = 1,
+    kNosplitVariantK2048Row4 = 2,
+    kNosplitVariantK6144Row4 = 3,
+    kNosplitVariantPersistent = 4,
+    kNosplitVariantPersistentHfma2 = 5,
+};
+
 template <typename scalar_t>
 __device__ inline float to_float(scalar_t v) {
     return static_cast<float>(v);
@@ -733,6 +742,66 @@ __global__ void persistent_matvec_hfma2_fwd_kernel(
     }
 }
 
+void launch_nosplit_variant(
+    const at::Half* x,
+    const at::Half* weight,
+    const at::Half* bias,
+    at::Half* out,
+    int64_t stride_wn,
+    int n,
+    int k,
+    bool has_bias,
+    int64_t variant,
+    int num_sms,
+    cudaStream_t stream) {
+    const bool auto_use_row2_k2048 = (k == kNosplitSpecializedK2048 && n <= 2048);
+    const int row2_grid_blocks = (n + 1) / 2;
+    const int row4_grid_blocks = (n + 3) / 4;
+
+    switch (variant) {
+        case kNosplitVariantAuto:
+            if (auto_use_row2_k2048) {
+                nosplit_matvec_k2048_row2_hfma2_fwd_kernel<false><<<row2_grid_blocks, kRow2Threads, 0, stream>>>(
+                    x, weight, bias, out, nullptr, stride_wn, n, has_bias);
+            } else if (k == kNosplitSpecializedK2048) {
+                nosplit_matvec_k2048_hfma2_fwd_kernel<false><<<row4_grid_blocks, kRow4Threads, 0, stream>>>(
+                    x, weight, bias, out, nullptr, stride_wn, n, has_bias);
+            } else if (k == 6144) {
+                nosplit_matvec_k6144_hfma2_fwd_kernel<false><<<row4_grid_blocks, kRow4Threads, 0, stream>>>(
+                    x, weight, bias, out, nullptr, stride_wn, n, has_bias);
+            } else {
+                persistent_matvec_half_fwd_kernel<<<num_sms, kRow4Threads, 0, stream>>>(
+                    x, weight, bias, out, stride_wn, n, k, has_bias);
+            }
+            break;
+        case kNosplitVariantK2048Row2:
+            TORCH_CHECK(k == kNosplitSpecializedK2048, "k2048_row2 variant requires k=2048");
+            nosplit_matvec_k2048_row2_hfma2_fwd_kernel<false><<<row2_grid_blocks, kRow2Threads, 0, stream>>>(
+                x, weight, bias, out, nullptr, stride_wn, n, has_bias);
+            break;
+        case kNosplitVariantK2048Row4:
+            TORCH_CHECK(k == kNosplitSpecializedK2048, "k2048_row4 variant requires k=2048");
+            nosplit_matvec_k2048_hfma2_fwd_kernel<false><<<row4_grid_blocks, kRow4Threads, 0, stream>>>(
+                x, weight, bias, out, nullptr, stride_wn, n, has_bias);
+            break;
+        case kNosplitVariantK6144Row4:
+            TORCH_CHECK(k == 6144, "k6144_row4 variant requires k=6144");
+            nosplit_matvec_k6144_hfma2_fwd_kernel<false><<<row4_grid_blocks, kRow4Threads, 0, stream>>>(
+                x, weight, bias, out, nullptr, stride_wn, n, has_bias);
+            break;
+        case kNosplitVariantPersistent:
+            persistent_matvec_half_fwd_kernel<<<num_sms, kRow4Threads, 0, stream>>>(
+                x, weight, bias, out, stride_wn, n, k, has_bias);
+            break;
+        case kNosplitVariantPersistentHfma2:
+            persistent_matvec_hfma2_fwd_kernel<<<num_sms, kRow4Threads, 0, stream>>>(
+                x, weight, bias, out, stride_wn, n, k, has_bias);
+            break;
+        default:
+            TORCH_CHECK(false, "unknown nosplit variant: ", variant);
+    }
+}
+
 }  // namespace
 
 torch::Tensor splitk_matvec_cuda(
@@ -1255,6 +1324,52 @@ torch::Tensor nosplit_hfma2_matvec_half_cuda(
             has_bias
         );
     }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    return out;
+}
+
+torch::Tensor nosplit_matvec_half_variant_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& out,
+    bool has_bias,
+    int64_t variant) {
+    TORCH_CHECK(x.is_cuda(), "x must be CUDA");
+    TORCH_CHECK(weight.is_cuda(), "weight must be CUDA");
+    TORCH_CHECK(out.is_cuda(), "out must be CUDA");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat16, "nosplit variant only supports fp16");
+    TORCH_CHECK(weight.scalar_type() == torch::kFloat16, "nosplit variant only supports fp16");
+    TORCH_CHECK(weight.stride(1) == 1, "nosplit variant requires contiguous weight");
+    TORCH_CHECK(x.dim() == 1, "x must be flattened [K]");
+    TORCH_CHECK(weight.dim() == 2, "weight must be [N, K]");
+    TORCH_CHECK(weight.size(1) == x.size(0), "weight/x shape mismatch");
+    TORCH_CHECK(out.scalar_type() == torch::kFloat16, "out must be fp16");
+    if (has_bias) {
+        TORCH_CHECK(bias.is_cuda(), "bias must be CUDA when present");
+        TORCH_CHECK(bias.numel() == weight.size(0), "bias size mismatch");
+    }
+
+    const int n = static_cast<int>(weight.size(0));
+    const int k = static_cast<int>(weight.size(1));
+    c10::cuda::CUDAGuard device_guard(x.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    int num_sms = 0;
+    cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, x.device().index());
+    launch_nosplit_variant(
+        x.data_ptr<at::Half>(),
+        weight.data_ptr<at::Half>(),
+        has_bias ? bias.data_ptr<at::Half>() : nullptr,
+        out.data_ptr<at::Half>(),
+        weight.stride(0),
+        n,
+        k,
+        has_bias,
+        variant,
+        num_sms,
+        stream);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     return out;

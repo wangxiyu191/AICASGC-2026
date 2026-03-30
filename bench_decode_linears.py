@@ -438,6 +438,26 @@ def _cuda_nosplit_hfma2_matvec(x, weight, bias):
     return cuda_decode_gemv.nosplit_hfma2_matvec_half(x, weight, bias)
 
 
+def _cuda_nosplit_k2048_row2_matvec(x, weight, bias):
+    return cuda_decode_gemv.nosplit_matvec_half_variant(x, weight, bias, "k2048_row2")
+
+
+def _cuda_nosplit_k2048_row4_matvec(x, weight, bias):
+    return cuda_decode_gemv.nosplit_matvec_half_variant(x, weight, bias, "k2048_row4")
+
+
+def _cuda_nosplit_k6144_row4_matvec(x, weight, bias):
+    return cuda_decode_gemv.nosplit_matvec_half_variant(x, weight, bias, "k6144_row4")
+
+
+def _cuda_nosplit_persistent_matvec(x, weight, bias):
+    return cuda_decode_gemv.nosplit_matvec_half_variant(x, weight, bias, "persistent")
+
+
+def _cuda_nosplit_persistent_hfma2_matvec(x, weight, bias):
+    return cuda_decode_gemv.nosplit_matvec_half_variant(x, weight, bias, "persistent_hfma2")
+
+
 def _bench_impl(fn, x, weight, bias, warmup: int, iters: int):
     for _ in range(warmup):
         fn(x, weight, bias)
@@ -513,6 +533,11 @@ def _run_benchmarks(payload, warmup: int, iters: int, use_graph: bool = False, g
         "cuda_persistent_matvec": _cuda_persistent_matvec,
         "cuda_nosplit_matvec": _cuda_nosplit_matvec,
         "cuda_nosplit_hfma2_matvec": _cuda_nosplit_hfma2_matvec,
+        "cuda_nosplit_k2048_row2_matvec": _cuda_nosplit_k2048_row2_matvec,
+        "cuda_nosplit_k2048_row4_matvec": _cuda_nosplit_k2048_row4_matvec,
+        "cuda_nosplit_k6144_row4_matvec": _cuda_nosplit_k6144_row4_matvec,
+        "cuda_nosplit_persistent_matvec": _cuda_nosplit_persistent_matvec,
+        "cuda_nosplit_persistent_hfma2_matvec": _cuda_nosplit_persistent_hfma2_matvec,
     }
     if use_graph:
         bench_fn = lambda fn, x, weight, bias, warmup, iters: _bench_impl_graph(

@@ -27,6 +27,14 @@ NOSPLIT_PROFILE_SLOT_NAMES = (
     "tile2_compute_done",
     "kernel_done",
 )
+NOSPLIT_VARIANTS = {
+    "auto": 0,
+    "k2048_row2": 1,
+    "k2048_row4": 2,
+    "k6144_row4": 3,
+    "persistent": 4,
+    "persistent_hfma2": 5,
+}
 
 
 def _find_prebuilt_ext() -> Path | None:
@@ -421,6 +429,50 @@ def nosplit_hfma2_matvec_half(
         bias if bias is not None else torch.empty(0, device=x.device, dtype=x.dtype),
         out_vec,
         bias is not None,
+    )
+    return out_vec.view(*x.shape[:-1], n)
+
+
+def nosplit_matvec_half_variant(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    variant: str,
+    workspace: dict | None = None,
+) -> torch.Tensor:
+    if variant not in NOSPLIT_VARIANTS:
+        raise ValueError(f"unknown nosplit variant: {variant}")
+    if (
+        x.device.type != "cuda"
+        or weight.device.type != "cuda"
+        or x.dtype != torch.float16
+        or weight.dtype != torch.float16
+        or x.ndim < 2
+        or x.shape[-2] != 1
+    ):
+        raise RuntimeError("nosplit_matvec_half_variant expects fp16 CUDA single-token decode tensors")
+
+    x_vec = x.reshape(-1).contiguous()
+    n, _k = weight.shape
+    if (
+        workspace is not None
+        and workspace.get("type") == f"nosplit_variant:{variant}"
+        and tuple(workspace["out"].shape) == (n,)
+        and workspace["out"].device == x.device
+        and workspace["out"].dtype == x.dtype
+    ):
+        out_vec = workspace["out"]
+    else:
+        out_vec = torch.empty((n,), dtype=x.dtype, device=x.device)
+
+    ext = _load_ext()
+    ext.nosplit_matvec_half_variant(
+        x_vec,
+        weight,
+        bias if bias is not None else torch.empty(0, device=x.device, dtype=x.dtype),
+        out_vec,
+        bias is not None,
+        NOSPLIT_VARIANTS[variant],
     )
     return out_vec.view(*x.shape[:-1], n)
 

@@ -66,6 +66,14 @@ torch::Tensor nosplit_hfma2_matvec_half_cuda(
     const torch::Tensor& out,
     bool has_bias);
 
+torch::Tensor nosplit_matvec_half_variant_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& out,
+    bool has_bias,
+    int64_t variant);
+
 torch::Tensor nosplit_matvec_half_profile_cuda(
     const torch::Tensor& x,
     const torch::Tensor& weight,
@@ -156,6 +164,16 @@ torch::Tensor nosplit_hfma2_matvec_half(
     return nosplit_hfma2_matvec_half_cuda(x, weight, bias, out, has_bias);
 }
 
+torch::Tensor nosplit_matvec_half_variant(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& out,
+    bool has_bias,
+    int64_t variant) {
+    return nosplit_matvec_half_variant_cuda(x, weight, bias, out, has_bias, variant);
+}
+
 torch::Tensor nosplit_matvec_half_profile(
     const torch::Tensor& x,
     const torch::Tensor& weight,
@@ -175,5 +193,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("persistent_matvec_half", &persistent_matvec_half);
     m.def("nosplit_matvec_half", &nosplit_matvec_half);
     m.def("nosplit_hfma2_matvec_half", &nosplit_hfma2_matvec_half);
+    m.def("nosplit_matvec_half_variant", &nosplit_matvec_half_variant);
     m.def("nosplit_matvec_half_profile", &nosplit_matvec_half_profile);
 }
