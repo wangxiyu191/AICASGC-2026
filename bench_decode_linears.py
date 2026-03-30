@@ -474,6 +474,11 @@ def _bench_impl(fn, x, weight, bias, warmup: int, iters: int):
     return out, elapsed_ms
 
 
+def _benchmark_style_cuda_reset():
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+
+
 def _bench_impl_graph(fn, x, weight, bias, warmup: int, iters: int, capture_repeats: int):
     """Benchmark using CUDAGraph replay and GPU-side timing."""
     # Eager warmup to JIT-compile Triton kernels
@@ -482,6 +487,7 @@ def _bench_impl_graph(fn, x, weight, bias, warmup: int, iters: int, capture_repe
     torch.cuda.synchronize()
 
     # Capture CUDAGraph
+    _benchmark_style_cuda_reset()
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
@@ -493,6 +499,7 @@ def _bench_impl_graph(fn, x, weight, bias, warmup: int, iters: int, capture_repe
     torch.cuda.synchronize()
 
     # Warmup replays
+    _benchmark_style_cuda_reset()
     for _ in range(warmup):
         graph.replay()
     torch.cuda.synchronize()
@@ -500,6 +507,7 @@ def _bench_impl_graph(fn, x, weight, bias, warmup: int, iters: int, capture_repe
     # Timed replays using GPU events
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
+    _benchmark_style_cuda_reset()
     start.record()
     for _ in range(iters):
         graph.replay()
