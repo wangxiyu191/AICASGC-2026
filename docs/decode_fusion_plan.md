@@ -75,6 +75,12 @@ input_rmsnorm
 - 尽量消掉 `reshape/contiguous/handoff` 这一段
 - 复用 layer 生命周期内的 workspace
 
+开始前必须先确认的一点：
+
+- 当前代码里的 handoff 逻辑主要在 [optimized_layer.py](../optimized_layer.py) 的 `reshape + contiguous` 这一段
+- 需要先在真实 decode 下确认 `contiguous()` 是否真的触发
+- 如果 attention 输出本来就是连续的，那么这一方向的预期收益可能接近 0，应直接止损并跳到下一阶段
+
 预期收益：
 
 - 小到中等
@@ -232,7 +238,7 @@ fused_add_rmsnorm_gateup(residual, attn_output, gate_up_weight)
 |------|-------------|------------------|------|
 | attention 输出布局直连 `o_proj` | attention 输出 handoff | ~2-3 us | 需先用单层 viztrace 复核 contiguous/handoff 是否真实存在 |
 | `silu_mul + down_proj` | MLP 后半段 handoff | ~2-5 us | 上限可能不高，开始前必须先量化 gap |
-| `post_attn_add_rmsnorm + gate_up` | MLP 前半段 handoff | ~5-8 us | 实现难度最高，收益估计也最不确定 |
+| `post_attn_add_rmsnorm + gate_up` | MLP 前半段 handoff | ~5-8 us | 实现难度最高，收益估计也最不确定；开始前需先验证 `add_rmsnorm` 输出是否已被 L2 自然缓存，若是则 handoff 成本会明显低于该估计 |
 | `gate_up` kernel 本体优化 | `gate_up` GEMV | ~2-5 us | 作为备选支线，不是当前主线 |
 
 结论：
@@ -246,6 +252,8 @@ fused_add_rmsnorm_gateup(residual, attn_output, gate_up_weight)
 
 改动范围：
 
+- 第一阶段先只改 [optimized_layer.py](../optimized_layer.py)，做运行时诊断
+- 只有确认 `contiguous()` 在真实 decode 下确实触发后，才继续扩大到 attention extension：
 - [optimized_layer.py](../optimized_layer.py)
 - [cuda_extensions/decode_attention_kernel.cu](../cuda_extensions/decode_attention_kernel.cu)
 - [cuda_extensions/decode_attention_ext.cpp](../cuda_extensions/decode_attention_ext.cpp)
@@ -253,13 +261,15 @@ fused_add_rmsnorm_gateup(residual, attn_output, gate_up_weight)
 
 建议做法：
 
-- 先不改 attention 数学
-- 只改 attention 输出 layout / handoff 方式
-- 尽量让输出直接满足 `o_proj` 使用要求
-- 如果收益不明显，及时止损，不继续做更深 attention 融合
+1. 先在真实 decode 下诊断 `if not attn_output.is_contiguous()` 是否真的被触发
+2. 如果没有触发，直接停止这个方向，不继续改 attention kernel
+3. 如果确实触发，再去改 attention 输出 layout / handoff 方式
+4. 全程不改 attention 数学本体
+5. 如果收益不明显，及时止损，不继续做更深 attention 融合
 
 通过标准：
 
+- 先确认 `contiguous()` 在真实 decode 下存在真实触发
 - 单层 replay / viztrace 里 attention 到 `o_proj` 的 handoff 明显缩短
 - 输出与旧路径对齐
 - 10 sample benchmark 没有正确性回退
