@@ -25,7 +25,85 @@ NOSPLIT_PROFILE_SLOT_NAMES = (
     "tile1_compute_done",
     "tile2_load_done",
     "tile2_compute_done",
+    "tile3_load_done",
+    "tile3_compute_done",
+    "tile4_load_done",
+    "tile4_compute_done",
+    "tile5_load_done",
+    "tile5_compute_done",
     "kernel_done",
+)
+NOSPLIT_XWARP_DETAIL_SLOT_NAMES = (
+    "prologue_x_issue_start",
+    "prologue_x_issue_end",
+    "prologue_w_issue_start",
+    "prologue_w_issue_end",
+    "prologue_wait_start",
+    "prologue_wait_end",
+    "prologue_sync_start",
+    "prologue_sync_end",
+    "tile0_x_issue_start",
+    "tile0_x_issue_end",
+    "tile0_w_issue_start",
+    "tile0_w_issue_end",
+    "tile0_compute_start",
+    "tile0_compute_end",
+    "tile0_wait_start",
+    "tile0_wait_end",
+    "tile0_sync_start",
+    "tile0_sync_end",
+    "tile1_x_issue_start",
+    "tile1_x_issue_end",
+    "tile1_w_issue_start",
+    "tile1_w_issue_end",
+    "tile1_compute_start",
+    "tile1_compute_end",
+    "tile1_wait_start",
+    "tile1_wait_end",
+    "tile1_sync_start",
+    "tile1_sync_end",
+    "tile2_x_issue_start",
+    "tile2_x_issue_end",
+    "tile2_w_issue_start",
+    "tile2_w_issue_end",
+    "tile2_compute_start",
+    "tile2_compute_end",
+    "tile2_wait_start",
+    "tile2_wait_end",
+    "tile2_sync_start",
+    "tile2_sync_end",
+    "tile3_x_issue_start",
+    "tile3_x_issue_end",
+    "tile3_w_issue_start",
+    "tile3_w_issue_end",
+    "tile3_compute_start",
+    "tile3_compute_end",
+    "tile3_wait_start",
+    "tile3_wait_end",
+    "tile3_sync_start",
+    "tile3_sync_end",
+    "tile4_x_issue_start",
+    "tile4_x_issue_end",
+    "tile4_w_issue_start",
+    "tile4_w_issue_end",
+    "tile4_compute_start",
+    "tile4_compute_end",
+    "tile4_wait_start",
+    "tile4_wait_end",
+    "tile4_sync_start",
+    "tile4_sync_end",
+    "tile5_x_issue_start",
+    "tile5_x_issue_end",
+    "tile5_w_issue_start",
+    "tile5_w_issue_end",
+    "tile5_compute_start",
+    "tile5_compute_end",
+    "tile5_wait_start",
+    "tile5_wait_end",
+    "tile5_sync_start",
+    "tile5_sync_end",
+    "epilogue_start",
+    "epilogue_end",
 )
 NOSPLIT_VARIANTS = {
     "auto": 0,
@@ -34,6 +112,16 @@ NOSPLIT_VARIANTS = {
     "k6144_row4": 3,
     "persistent": 4,
     "persistent_hfma2": 5,
+    "k6144_weight_async": 6,
+    "k6144_n8k1024_async": 7,
+    "k6144_n8k1024_xw_async": 8,
+    "k6144_n8k512_s3_xw_async": 9,
+    "k6144_persistent_xfull_w2_async": 10,
+    "k6144_persistent_xfull_row1_warp8_async": 11,
+    "k6144_persistent_xfull_n8k1024_w_async": 12,
+    "k6144_n8k1024_xwarp_w_async": 13,
+    "k6144_n8k1024_xwarp_w_async_sms2": 14,
+    "k6144_n8k1024_xwarp_w_async_sms2_balanced": 15,
 }
 
 
@@ -79,6 +167,18 @@ def _nosplit_grid_blocks(n: int, k: int) -> int:
     return (n + 3) // 4
 
 
+def _nosplit_variant_grid_blocks(n: int, k: int, variant: str) -> int:
+    if variant in (
+        "k6144_n8k1024_async",
+        "k6144_n8k1024_xw_async",
+        "k6144_n8k1024_xwarp_w_async",
+        "k6144_n8k1024_xwarp_w_async_sms2",
+        "k6144_n8k1024_xwarp_w_async_sms2_balanced",
+    ):
+        return (n + 7) // 8
+    return _nosplit_grid_blocks(n, k)
+
+
 def _nosplit_profile_kernel_name(n: int, k: int) -> str:
     if k == 2048 and n <= 2048:
         return "nosplit_matvec_k2048_row2_hfma2_fwd_kernel"
@@ -87,6 +187,22 @@ def _nosplit_profile_kernel_name(n: int, k: int) -> str:
     if k == 6144:
         return "nosplit_matvec_k6144_hfma2_fwd_kernel"
     raise RuntimeError("nosplit internal profiling currently supports only k=2048/6144 specialized kernels")
+
+
+def _nosplit_profile_variant_kernel_name(variant: str) -> str:
+    mapping = {
+        "k6144_row4": "nosplit_matvec_k6144_hfma2_fwd_kernel",
+        "k6144_n8k1024_async": "nosplit_matvec_k6144_n8k1024_async_fwd_kernel",
+        "k6144_n8k1024_xw_async": "nosplit_matvec_k6144_n8k1024_xw_async_fwd_kernel",
+        "k6144_n8k1024_xwarp_w_async": "nosplit_matvec_k6144_n8k1024_xwarp_w_async_fwd_kernel",
+        "k6144_n8k1024_xwarp_w_async_sms2": "nosplit_matvec_k6144_n8k1024_xwarp_w_async_sms2_fwd_kernel",
+        "k6144_n8k1024_xwarp_w_async_sms2_balanced": "nosplit_matvec_k6144_n8k1024_xwarp_w_async_sms2_balanced_fwd_kernel",
+    }
+    try:
+        return mapping[variant]
+    except KeyError as exc:
+        available = ", ".join(sorted(mapping))
+        raise RuntimeError(f"nosplit profile variant currently supports only: {available}") from exc
 
 
 def splitk_matvec(
@@ -532,3 +648,388 @@ def nosplit_matvec_half_profile(
         "slot_names": list(NOSPLIT_PROFILE_SLOT_NAMES),
     }
     return out_vec.view(*x.shape[:-1], n), profile, meta
+
+
+def nosplit_matvec_half_profile_variant(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    variant: str,
+    workspace: dict | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, dict]:
+    if variant not in NOSPLIT_VARIANTS:
+        raise ValueError(f"unknown nosplit variant: {variant}")
+    if (
+        x.device.type != "cuda"
+        or weight.device.type != "cuda"
+        or x.dtype != torch.float16
+        or weight.dtype != torch.float16
+        or x.ndim < 2
+        or x.shape[-2] != 1
+    ):
+        raise RuntimeError("nosplit_matvec_half_profile_variant expects fp16 CUDA single-token decode tensors")
+
+    x_vec = x.reshape(-1).contiguous()
+    n, k = weight.shape
+    grid_blocks = _nosplit_variant_grid_blocks(n, k, variant)
+
+    if (
+        workspace is not None
+        and workspace.get("type") == f"nosplit_profile_variant:{variant}"
+        and tuple(workspace["out"].shape) == (n,)
+        and tuple(workspace["profile"].shape) == (grid_blocks, len(NOSPLIT_PROFILE_SLOT_NAMES))
+        and workspace["out"].device == x.device
+        and workspace["profile"].device == x.device
+        and workspace["out"].dtype == x.dtype
+        and workspace["profile"].dtype == torch.int64
+    ):
+        out_vec = workspace["out"]
+        profile = workspace["profile"]
+    else:
+        out_vec = torch.empty((n,), dtype=x.dtype, device=x.device)
+        profile = torch.empty(
+            (grid_blocks, len(NOSPLIT_PROFILE_SLOT_NAMES)),
+            dtype=torch.int64,
+            device=x.device,
+        )
+
+    ext = _load_ext()
+    ext.nosplit_matvec_half_profile_variant(
+        x_vec,
+        weight,
+        bias if bias is not None else torch.empty(0, device=x.device, dtype=x.dtype),
+        out_vec,
+        profile,
+        bias is not None,
+        NOSPLIT_VARIANTS[variant],
+    )
+    meta = {
+        "kernel_name": _nosplit_profile_variant_kernel_name(variant),
+        "grid_blocks": grid_blocks,
+        "slot_names": list(NOSPLIT_PROFILE_SLOT_NAMES),
+        "variant": variant,
+    }
+    return out_vec.view(*x.shape[:-1], n), profile, meta
+
+
+def nosplit_matvec_half_profile_xwarp_detail(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    workspace: dict | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, dict]:
+    if (
+        x.device.type != "cuda"
+        or weight.device.type != "cuda"
+        or x.dtype != torch.float16
+        or weight.dtype != torch.float16
+        or x.ndim < 2
+        or x.shape[-2] != 1
+    ):
+        raise RuntimeError("nosplit_matvec_half_profile_xwarp_detail expects fp16 CUDA single-token decode tensors")
+
+    x_vec = x.reshape(-1).contiguous()
+    n, k = weight.shape
+    if k != 6144:
+        raise RuntimeError("nosplit_matvec_half_profile_xwarp_detail currently supports only k=6144")
+    grid_blocks = (n + 7) // 8
+    warp_groups = 8
+
+    if (
+        workspace is not None
+        and workspace.get("type") == "nosplit_profile_xwarp_detail"
+        and tuple(workspace["out"].shape) == (n,)
+        and tuple(workspace["trace"].shape) == (grid_blocks, warp_groups, len(NOSPLIT_XWARP_DETAIL_SLOT_NAMES))
+        and workspace["out"].device == x.device
+        and workspace["trace"].device == x.device
+        and workspace["out"].dtype == x.dtype
+        and workspace["trace"].dtype == torch.int64
+    ):
+        out_vec = workspace["out"]
+        trace = workspace["trace"]
+    else:
+        out_vec = torch.empty((n,), dtype=x.dtype, device=x.device)
+        trace = torch.empty(
+            (grid_blocks, warp_groups, len(NOSPLIT_XWARP_DETAIL_SLOT_NAMES)),
+            dtype=torch.int64,
+            device=x.device,
+        )
+
+    ext = _load_ext()
+    ext.nosplit_matvec_half_profile_xwarp_detail(
+        x_vec,
+        weight,
+        bias if bias is not None else torch.empty(0, device=x.device, dtype=x.dtype),
+        out_vec,
+        trace,
+        bias is not None,
+    )
+    meta = {
+        "kernel_name": "nosplit_matvec_k6144_n8k1024_xwarp_w_async_trace_fwd_kernel",
+        "grid_blocks": grid_blocks,
+        "warp_groups": warp_groups,
+        "slot_names": list(NOSPLIT_XWARP_DETAIL_SLOT_NAMES),
+        "variant": "k6144_n8k1024_xwarp_w_async",
+    }
+    return out_vec.view(*x.shape[:-1], n), trace, meta
+
+
+def nosplit_xwarp_wait_sync_calibration(
+    grid_blocks: int,
+    workspace: dict | None = None,
+    device: torch.device | str = "cuda",
+) -> tuple[torch.Tensor, dict]:
+    if grid_blocks <= 0:
+        raise RuntimeError("nosplit_xwarp_wait_sync_calibration expects grid_blocks > 0")
+    device = torch.device(device)
+    if device.type != "cuda":
+        raise RuntimeError("nosplit_xwarp_wait_sync_calibration expects a CUDA device")
+    warp_groups = 8
+
+    if (
+        workspace is not None
+        and workspace.get("type") == "nosplit_xwarp_wait_sync_calibration"
+        and tuple(workspace["trace"].shape) == (grid_blocks, warp_groups, len(NOSPLIT_XWARP_DETAIL_SLOT_NAMES))
+        and workspace["trace"].device == device
+        and workspace["trace"].dtype == torch.int64
+    ):
+        trace = workspace["trace"]
+    else:
+        trace = torch.empty(
+            (grid_blocks, warp_groups, len(NOSPLIT_XWARP_DETAIL_SLOT_NAMES)),
+            dtype=torch.int64,
+            device=device,
+        )
+
+    ext = _load_ext()
+    ext.nosplit_xwarp_wait_sync_calibration(trace)
+    meta = {
+        "kernel_name": "nosplit_xwarp_wait_sync_calibration_kernel",
+        "grid_blocks": grid_blocks,
+        "warp_groups": warp_groups,
+        "slot_names": list(NOSPLIT_XWARP_DETAIL_SLOT_NAMES),
+    }
+    return trace, meta
+
+
+def nosplit_matvec_half_profile_xwarp_detail_with_smid(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    workspace: dict | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+    if (
+        x.device.type != "cuda"
+        or weight.device.type != "cuda"
+        or x.dtype != torch.float16
+        or weight.dtype != torch.float16
+        or x.ndim < 2
+        or x.shape[-2] != 1
+    ):
+        raise RuntimeError("nosplit_matvec_half_profile_xwarp_detail_with_smid expects fp16 CUDA single-token decode tensors")
+
+    x_vec = x.reshape(-1).contiguous()
+    n, k = weight.shape
+    if k != 6144:
+        raise RuntimeError("nosplit_matvec_half_profile_xwarp_detail_with_smid currently supports only k=6144")
+    grid_blocks = (n + 7) // 8
+    warp_groups = 8
+
+    if (
+        workspace is not None
+        and workspace.get("type") == "nosplit_profile_xwarp_detail_with_smid"
+        and tuple(workspace["out"].shape) == (n,)
+        and tuple(workspace["trace"].shape) == (grid_blocks, warp_groups, len(NOSPLIT_XWARP_DETAIL_SLOT_NAMES))
+        and tuple(workspace["smid"].shape) == (grid_blocks, warp_groups)
+        and workspace["out"].device == x.device
+        and workspace["trace"].device == x.device
+        and workspace["smid"].device == x.device
+        and workspace["out"].dtype == x.dtype
+        and workspace["trace"].dtype == torch.int64
+        and workspace["smid"].dtype == torch.int32
+    ):
+        out_vec = workspace["out"]
+        trace = workspace["trace"]
+        smid = workspace["smid"]
+    else:
+        out_vec = torch.empty((n,), dtype=x.dtype, device=x.device)
+        trace = torch.empty(
+            (grid_blocks, warp_groups, len(NOSPLIT_XWARP_DETAIL_SLOT_NAMES)),
+            dtype=torch.int64,
+            device=x.device,
+        )
+        smid = torch.empty(
+            (grid_blocks, warp_groups),
+            dtype=torch.int32,
+            device=x.device,
+        )
+
+    ext = _load_ext()
+    ext.nosplit_matvec_half_profile_xwarp_detail_with_smid(
+        x_vec,
+        weight,
+        bias if bias is not None else torch.empty(0, device=x.device, dtype=x.dtype),
+        out_vec,
+        trace,
+        smid,
+        bias is not None,
+    )
+    meta = {
+        "kernel_name": "nosplit_matvec_k6144_n8k1024_xwarp_w_async_trace_fwd_kernel",
+        "grid_blocks": grid_blocks,
+        "warp_groups": warp_groups,
+        "slot_names": list(NOSPLIT_XWARP_DETAIL_SLOT_NAMES),
+        "variant": "k6144_n8k1024_xwarp_w_async",
+    }
+    return out_vec.view(*x.shape[:-1], n), trace, smid, meta
+
+
+def nosplit_matvec_half_profile_xwarp_sms2_cta_trace(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    workspace: dict | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+    if (
+        x.device.type != "cuda"
+        or weight.device.type != "cuda"
+        or x.dtype != torch.float16
+        or weight.dtype != torch.float16
+        or x.ndim < 2
+        or x.shape[-2] != 1
+    ):
+        raise RuntimeError("nosplit_matvec_half_profile_xwarp_sms2_cta_trace expects fp16 CUDA single-token decode tensors")
+
+    x_vec = x.reshape(-1).contiguous()
+    n, k = weight.shape
+    if k != 6144:
+        raise RuntimeError("nosplit_matvec_half_profile_xwarp_sms2_cta_trace currently supports only k=6144")
+
+    props = torch.cuda.get_device_properties(x.device)
+    full_grid_blocks = (n + 7) // 8
+    launch_grid_blocks = min(full_grid_blocks, max(1, props.multi_processor_count * 2))
+    max_iters = (full_grid_blocks + launch_grid_blocks - 1) // launch_grid_blocks
+
+    if (
+        workspace is not None
+        and workspace.get("type") == "nosplit_profile_xwarp_sms2_cta_trace"
+        and tuple(workspace["out"].shape) == (n,)
+        and tuple(workspace["trace"].shape) == (launch_grid_blocks, max_iters, 2)
+        and tuple(workspace["smid"].shape) == (launch_grid_blocks,)
+        and tuple(workspace["row_base"].shape) == (launch_grid_blocks, max_iters)
+        and workspace["out"].device == x.device
+        and workspace["trace"].device == x.device
+        and workspace["smid"].device == x.device
+        and workspace["row_base"].device == x.device
+        and workspace["out"].dtype == x.dtype
+        and workspace["trace"].dtype == torch.int64
+        and workspace["smid"].dtype == torch.int32
+        and workspace["row_base"].dtype == torch.int32
+    ):
+        out_vec = workspace["out"]
+        trace = workspace["trace"]
+        smid = workspace["smid"]
+        row_base = workspace["row_base"]
+    else:
+        out_vec = torch.empty((n,), dtype=x.dtype, device=x.device)
+        trace = torch.empty((launch_grid_blocks, max_iters, 2), dtype=torch.int64, device=x.device)
+        smid = torch.empty((launch_grid_blocks,), dtype=torch.int32, device=x.device)
+        row_base = torch.empty((launch_grid_blocks, max_iters), dtype=torch.int32, device=x.device)
+
+    ext = _load_ext()
+    ext.nosplit_matvec_half_profile_xwarp_sms2_cta_trace(
+        x_vec,
+        weight,
+        bias if bias is not None else torch.empty(0, device=x.device, dtype=x.dtype),
+        out_vec,
+        trace,
+        smid,
+        row_base,
+        bias is not None,
+    )
+    meta = {
+        "kernel_name": "nosplit_matvec_k6144_n8k1024_xwarp_w_async_sms2_cta_trace_fwd_kernel",
+        "launch_grid_blocks": launch_grid_blocks,
+        "full_grid_blocks": full_grid_blocks,
+        "max_iters": max_iters,
+        "sms": int(props.multi_processor_count),
+        "slot_names": ["iter_start", "iter_end"],
+        "variant": "k6144_n8k1024_xwarp_w_async_sms2",
+    }
+    return out_vec.view(*x.shape[:-1], n), trace, smid, row_base, meta
+
+
+def nosplit_matvec_half_profile_xwarp_sms2_balanced_cta_trace(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    workspace: dict | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+    if (
+        x.device.type != "cuda"
+        or weight.device.type != "cuda"
+        or x.dtype != torch.float16
+        or weight.dtype != torch.float16
+        or x.ndim < 2
+        or x.shape[-2] != 1
+    ):
+        raise RuntimeError("nosplit_matvec_half_profile_xwarp_sms2_balanced_cta_trace expects fp16 CUDA single-token decode tensors")
+
+    x_vec = x.reshape(-1).contiguous()
+    n, k = weight.shape
+    if k != 6144:
+        raise RuntimeError("nosplit_matvec_half_profile_xwarp_sms2_balanced_cta_trace currently supports only k=6144")
+
+    props = torch.cuda.get_device_properties(x.device)
+    full_grid_blocks = (n + 7) // 8
+    launch_grid_blocks = min(full_grid_blocks, max(1, props.multi_processor_count * 2))
+    max_rows_per_block = (n + launch_grid_blocks - 1) // launch_grid_blocks
+    max_iters = (max_rows_per_block + 7) // 8
+
+    if (
+        workspace is not None
+        and workspace.get("type") == "nosplit_profile_xwarp_sms2_balanced_cta_trace"
+        and tuple(workspace["out"].shape) == (n,)
+        and tuple(workspace["trace"].shape) == (launch_grid_blocks, max_iters, 2)
+        and tuple(workspace["smid"].shape) == (launch_grid_blocks,)
+        and tuple(workspace["row_base"].shape) == (launch_grid_blocks, max_iters)
+        and workspace["out"].device == x.device
+        and workspace["trace"].device == x.device
+        and workspace["smid"].device == x.device
+        and workspace["row_base"].device == x.device
+        and workspace["out"].dtype == x.dtype
+        and workspace["trace"].dtype == torch.int64
+        and workspace["smid"].dtype == torch.int32
+        and workspace["row_base"].dtype == torch.int32
+    ):
+        out_vec = workspace["out"]
+        trace = workspace["trace"]
+        smid = workspace["smid"]
+        row_base = workspace["row_base"]
+    else:
+        out_vec = torch.empty((n,), dtype=x.dtype, device=x.device)
+        trace = torch.empty((launch_grid_blocks, max_iters, 2), dtype=torch.int64, device=x.device)
+        smid = torch.empty((launch_grid_blocks,), dtype=torch.int32, device=x.device)
+        row_base = torch.empty((launch_grid_blocks, max_iters), dtype=torch.int32, device=x.device)
+
+    ext = _load_ext()
+    ext.nosplit_matvec_half_profile_xwarp_sms2_balanced_cta_trace(
+        x_vec,
+        weight,
+        bias if bias is not None else torch.empty(0, device=x.device, dtype=x.dtype),
+        out_vec,
+        trace,
+        smid,
+        row_base,
+        bias is not None,
+    )
+    meta = {
+        "kernel_name": "nosplit_matvec_k6144_n8k1024_xwarp_w_async_sms2_balanced_cta_trace_fwd_kernel",
+        "launch_grid_blocks": launch_grid_blocks,
+        "full_grid_blocks": full_grid_blocks,
+        "max_iters": max_iters,
+        "sms": int(props.multi_processor_count),
+        "slot_names": ["iter_start", "iter_end"],
+        "variant": "k6144_n8k1024_xwarp_w_async_sms2_balanced",
+    }
+    return out_vec.view(*x.shape[:-1], n), trace, smid, row_base, meta

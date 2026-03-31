@@ -450,6 +450,46 @@ def _cuda_nosplit_k6144_row4_matvec(x, weight, bias):
     return cuda_decode_gemv.nosplit_matvec_half_variant(x, weight, bias, "k6144_row4")
 
 
+def _cuda_nosplit_k6144_weight_async_matvec(x, weight, bias):
+    return cuda_decode_gemv.nosplit_matvec_half_variant(x, weight, bias, "k6144_weight_async")
+
+
+def _cuda_nosplit_k6144_n8k1024_async_matvec(x, weight, bias):
+    return cuda_decode_gemv.nosplit_matvec_half_variant(x, weight, bias, "k6144_n8k1024_async")
+
+
+def _cuda_nosplit_k6144_n8k1024_xw_async_matvec(x, weight, bias):
+    return cuda_decode_gemv.nosplit_matvec_half_variant(x, weight, bias, "k6144_n8k1024_xw_async")
+
+
+def _cuda_nosplit_k6144_n8k512_s3_xw_async_matvec(x, weight, bias):
+    return cuda_decode_gemv.nosplit_matvec_half_variant(x, weight, bias, "k6144_n8k512_s3_xw_async")
+
+
+def _cuda_nosplit_k6144_persistent_xfull_w2_async_matvec(x, weight, bias):
+    return cuda_decode_gemv.nosplit_matvec_half_variant(x, weight, bias, "k6144_persistent_xfull_w2_async")
+
+
+def _cuda_nosplit_k6144_persistent_xfull_row1_warp8_async_matvec(x, weight, bias):
+    return cuda_decode_gemv.nosplit_matvec_half_variant(x, weight, bias, "k6144_persistent_xfull_row1_warp8_async")
+
+
+def _cuda_nosplit_k6144_persistent_xfull_n8k1024_w_async_matvec(x, weight, bias):
+    return cuda_decode_gemv.nosplit_matvec_half_variant(x, weight, bias, "k6144_persistent_xfull_n8k1024_w_async")
+
+
+def _cuda_nosplit_k6144_n8k1024_xwarp_w_async_matvec(x, weight, bias):
+    return cuda_decode_gemv.nosplit_matvec_half_variant(x, weight, bias, "k6144_n8k1024_xwarp_w_async")
+
+
+def _cuda_nosplit_k6144_n8k1024_xwarp_w_async_sms2_matvec(x, weight, bias):
+    return cuda_decode_gemv.nosplit_matvec_half_variant(x, weight, bias, "k6144_n8k1024_xwarp_w_async_sms2")
+
+
+def _cuda_nosplit_k6144_n8k1024_xwarp_w_async_sms2_balanced_matvec(x, weight, bias):
+    return cuda_decode_gemv.nosplit_matvec_half_variant(x, weight, bias, "k6144_n8k1024_xwarp_w_async_sms2_balanced")
+
+
 def _cuda_nosplit_persistent_matvec(x, weight, bias):
     return cuda_decode_gemv.nosplit_matvec_half_variant(x, weight, bias, "persistent")
 
@@ -544,6 +584,16 @@ def _run_benchmarks(payload, warmup: int, iters: int, use_graph: bool = False, g
         "cuda_nosplit_k2048_row2_matvec": _cuda_nosplit_k2048_row2_matvec,
         "cuda_nosplit_k2048_row4_matvec": _cuda_nosplit_k2048_row4_matvec,
         "cuda_nosplit_k6144_row4_matvec": _cuda_nosplit_k6144_row4_matvec,
+        "cuda_nosplit_k6144_weight_async_matvec": _cuda_nosplit_k6144_weight_async_matvec,
+        "cuda_nosplit_k6144_n8k1024_async_matvec": _cuda_nosplit_k6144_n8k1024_async_matvec,
+        "cuda_nosplit_k6144_n8k1024_xw_async_matvec": _cuda_nosplit_k6144_n8k1024_xw_async_matvec,
+        "cuda_nosplit_k6144_n8k512_s3_xw_async_matvec": _cuda_nosplit_k6144_n8k512_s3_xw_async_matvec,
+        "cuda_nosplit_k6144_persistent_xfull_w2_async_matvec": _cuda_nosplit_k6144_persistent_xfull_w2_async_matvec,
+        "cuda_nosplit_k6144_persistent_xfull_row1_warp8_async_matvec": _cuda_nosplit_k6144_persistent_xfull_row1_warp8_async_matvec,
+        "cuda_nosplit_k6144_persistent_xfull_n8k1024_w_async_matvec": _cuda_nosplit_k6144_persistent_xfull_n8k1024_w_async_matvec,
+        "cuda_nosplit_k6144_n8k1024_xwarp_w_async_matvec": _cuda_nosplit_k6144_n8k1024_xwarp_w_async_matvec,
+        "cuda_nosplit_k6144_n8k1024_xwarp_w_async_sms2_matvec": _cuda_nosplit_k6144_n8k1024_xwarp_w_async_sms2_matvec,
+        "cuda_nosplit_k6144_n8k1024_xwarp_w_async_sms2_balanced_matvec": _cuda_nosplit_k6144_n8k1024_xwarp_w_async_sms2_balanced_matvec,
         "cuda_nosplit_persistent_matvec": _cuda_nosplit_persistent_matvec,
         "cuda_nosplit_persistent_hfma2_matvec": _cuda_nosplit_persistent_hfma2_matvec,
     }

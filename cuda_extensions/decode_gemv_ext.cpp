@@ -82,6 +82,55 @@ torch::Tensor nosplit_matvec_half_profile_cuda(
     const torch::Tensor& profile,
     bool has_bias);
 
+torch::Tensor nosplit_matvec_half_profile_variant_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& out,
+    const torch::Tensor& profile,
+    bool has_bias,
+    int64_t variant);
+
+torch::Tensor nosplit_matvec_half_profile_xwarp_detail_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& out,
+    const torch::Tensor& trace,
+    bool has_bias);
+
+torch::Tensor nosplit_matvec_half_profile_xwarp_detail_with_smid_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& out,
+    const torch::Tensor& trace,
+    const torch::Tensor& smid,
+    bool has_bias);
+
+torch::Tensor nosplit_matvec_half_profile_xwarp_sms2_cta_trace_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& out,
+    const torch::Tensor& trace,
+    const torch::Tensor& smid,
+    const torch::Tensor& row_base,
+    bool has_bias);
+
+torch::Tensor nosplit_matvec_half_profile_xwarp_sms2_balanced_cta_trace_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& out,
+    const torch::Tensor& trace,
+    const torch::Tensor& smid,
+    const torch::Tensor& row_base,
+    bool has_bias);
+
+torch::Tensor nosplit_xwarp_wait_sync_calibration_cuda(
+    const torch::Tensor& trace);
+
 torch::Tensor splitk_matvec(
     const torch::Tensor& x,
     const torch::Tensor& weight,
@@ -184,6 +233,69 @@ torch::Tensor nosplit_matvec_half_profile(
     return nosplit_matvec_half_profile_cuda(x, weight, bias, out, profile, has_bias);
 }
 
+torch::Tensor nosplit_matvec_half_profile_variant(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& out,
+    const torch::Tensor& profile,
+    bool has_bias,
+    int64_t variant) {
+    return nosplit_matvec_half_profile_variant_cuda(x, weight, bias, out, profile, has_bias, variant);
+}
+
+torch::Tensor nosplit_matvec_half_profile_xwarp_detail(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& out,
+    const torch::Tensor& trace,
+    bool has_bias) {
+    return nosplit_matvec_half_profile_xwarp_detail_cuda(x, weight, bias, out, trace, has_bias);
+}
+
+torch::Tensor nosplit_matvec_half_profile_xwarp_detail_with_smid(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& out,
+    const torch::Tensor& trace,
+    const torch::Tensor& smid,
+    bool has_bias) {
+    return nosplit_matvec_half_profile_xwarp_detail_with_smid_cuda(x, weight, bias, out, trace, smid, has_bias);
+}
+
+torch::Tensor nosplit_matvec_half_profile_xwarp_sms2_cta_trace(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& out,
+    const torch::Tensor& trace,
+    const torch::Tensor& smid,
+    const torch::Tensor& row_base,
+    bool has_bias) {
+    return nosplit_matvec_half_profile_xwarp_sms2_cta_trace_cuda(
+        x, weight, bias, out, trace, smid, row_base, has_bias);
+}
+
+torch::Tensor nosplit_matvec_half_profile_xwarp_sms2_balanced_cta_trace(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& out,
+    const torch::Tensor& trace,
+    const torch::Tensor& smid,
+    const torch::Tensor& row_base,
+    bool has_bias) {
+    return nosplit_matvec_half_profile_xwarp_sms2_balanced_cta_trace_cuda(
+        x, weight, bias, out, trace, smid, row_base, has_bias);
+}
+
+torch::Tensor nosplit_xwarp_wait_sync_calibration(
+    const torch::Tensor& trace) {
+    return nosplit_xwarp_wait_sync_calibration_cuda(trace);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("splitk_matvec", &splitk_matvec);
     m.def("splitk_matvec_row4", &splitk_matvec_row4);
@@ -195,4 +307,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("nosplit_hfma2_matvec_half", &nosplit_hfma2_matvec_half);
     m.def("nosplit_matvec_half_variant", &nosplit_matvec_half_variant);
     m.def("nosplit_matvec_half_profile", &nosplit_matvec_half_profile);
+    m.def("nosplit_matvec_half_profile_variant", &nosplit_matvec_half_profile_variant);
+    m.def("nosplit_matvec_half_profile_xwarp_detail", &nosplit_matvec_half_profile_xwarp_detail);
+    m.def("nosplit_matvec_half_profile_xwarp_detail_with_smid", &nosplit_matvec_half_profile_xwarp_detail_with_smid);
+    m.def("nosplit_matvec_half_profile_xwarp_sms2_cta_trace", &nosplit_matvec_half_profile_xwarp_sms2_cta_trace);
+    m.def("nosplit_matvec_half_profile_xwarp_sms2_balanced_cta_trace", &nosplit_matvec_half_profile_xwarp_sms2_balanced_cta_trace);
+    m.def("nosplit_xwarp_wait_sync_calibration", &nosplit_xwarp_wait_sync_calibration);
 }

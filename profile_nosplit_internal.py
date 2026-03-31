@@ -30,24 +30,26 @@ def _compute_phase_durations_us(timestamps: torch.Tensor) -> dict[str, torch.Ten
     load_us = zeros.clone()
     compute_us = zeros.clone()
 
-    for load_slot, compute_slot in ((1, 2), (3, 4), (5, 6)):
+    for load_slot in range(1, ts.shape[1] - 1, 2):
+        compute_slot = load_slot + 1
         load_mask = (ts[:, load_slot] > 0) & (ts[:, load_slot - 1] > 0)
         compute_mask = (ts[:, compute_slot] > 0) & (ts[:, load_slot] > 0)
         load_us[load_mask] += (ts[load_mask, load_slot] - ts[load_mask, load_slot - 1]).to(torch.float64) / 1000.0
         compute_us[compute_mask] += (ts[compute_mask, compute_slot] - ts[compute_mask, load_slot]).to(torch.float64) / 1000.0
 
-    last_mainloop = torch.where(
-        ts[:, 6] > 0,
-        ts[:, 6],
-        torch.where(ts[:, 4] > 0, ts[:, 4], ts[:, 2]),
-    )
-    epilogue_mask = (ts[:, 7] > 0) & (last_mainloop > 0)
-    epilogue_us = zeros.clone()
-    epilogue_us[epilogue_mask] = (ts[epilogue_mask, 7] - last_mainloop[epilogue_mask]).to(torch.float64) / 1000.0
+    last_mainloop = torch.zeros(ts.shape[0], dtype=torch.int64)
+    for compute_slot in range(ts.shape[1] - 2, 0, -2):
+        slot_vals = ts[:, compute_slot]
+        last_mainloop = torch.where((last_mainloop == 0) & (slot_vals > 0), slot_vals, last_mainloop)
 
-    total_mask = (ts[:, 7] > 0) & (ts[:, 0] > 0)
+    kernel_done = ts[:, -1]
+    epilogue_mask = (kernel_done > 0) & (last_mainloop > 0)
+    epilogue_us = zeros.clone()
+    epilogue_us[epilogue_mask] = (kernel_done[epilogue_mask] - last_mainloop[epilogue_mask]).to(torch.float64) / 1000.0
+
+    total_mask = (kernel_done > 0) & (ts[:, 0] > 0)
     total_us = zeros.clone()
-    total_us[total_mask] = (ts[total_mask, 7] - ts[total_mask, 0]).to(torch.float64) / 1000.0
+    total_us[total_mask] = (kernel_done[total_mask] - ts[total_mask, 0]).to(torch.float64) / 1000.0
 
     return {
         "load_us": load_us,
