@@ -24,6 +24,17 @@ void fused_add_rms_norm_cuda(
     const torch::Tensor& out_norm,
     double eps);
 
+void rms_norm_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const torch::Tensor& out,
+    double eps);
+
+void add_cuda(
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& out);
+
 void fused_qk_rms_norm_rope(
     const torch::Tensor& q,
     const torch::Tensor& k,
@@ -54,8 +65,25 @@ void fused_add_rms_norm(
     fused_add_rms_norm_cuda(residual, x, weight, out_sum, out_norm, eps);
 }
 
+void rms_norm(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const torch::Tensor& out,
+    double eps) {
+    rms_norm_cuda(x, weight, out, eps);
+}
+
+void add(
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& out) {
+    add_cuda(a, b, out);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_qk_rms_norm_rope", &fused_qk_rms_norm_rope);
     m.def("fused_silu_mul", &fused_silu_mul);
     m.def("fused_add_rms_norm", &fused_add_rms_norm);
+    m.def("rms_norm", &rms_norm);
+    m.def("add", &add);
 }

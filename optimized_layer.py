@@ -233,17 +233,27 @@ class OptimizedDecoderLayer(nn.Module):
                 prefer_small_triton=prefer_small_decode_triton,
             )
         with _nvtx_range("decode.down_proj", enable_decode_nvtx):
-            gemv_out = _cuda_nosplit_gemv(hidden_states, self.down_proj_weight, self.down_proj_bias)
+            residual_epilogue_bias = None
+            if _ENABLE_DOWNPROJ_RESIDUAL_EPILOGUE and self.down_proj_bias is None:
+                residual_epilogue_bias = residual
+            down_proj_bias = self.down_proj_bias if residual_epilogue_bias is None else residual_epilogue_bias
+            gemv_out = _cuda_nosplit_gemv(hidden_states, self.down_proj_weight, down_proj_bias)
             if gemv_out is None:
                 gemv_out = _triton_decode_gemv(
-                    hidden_states, self.down_proj_weight, self.down_proj_bias,
+                    hidden_states, self.down_proj_weight, down_proj_bias,
                     prefer_small_triton=prefer_small_decode_triton,
                 )
-            hidden_states = gemv_out if gemv_out is not None else self.down_proj(hidden_states)
+            if gemv_out is not None:
+                hidden_states = gemv_out
+            else:
+                hidden_states = self.down_proj(hidden_states)
+                if residual_epilogue_bias is not None:
+                    hidden_states = hidden_states + residual_epilogue_bias
 
         # 8. Residual
         with _nvtx_range("decode.residual_add", enable_decode_nvtx):
-            hidden_states = hidden_states.add_(residual)
+            if residual_epilogue_bias is None:
+                hidden_states = _add(hidden_states, residual, prefer_small_triton=prefer_small_decode_triton)
         return hidden_states
 
     def _ensure_splitkv_workspace(self, split_k: int | None = None):
@@ -281,10 +291,13 @@ class OptimizedDecoderLayer(nn.Module):
 
 _TRITON_ROWS_THRESHOLD = 32
 _ENABLE_TRITON_SMALL_RMSNORM = os.environ.get("ENABLE_TRITON_SMALL_RMSNORM", "1") == "1"
+_ENABLE_CUDA_RMSNORM = os.environ.get("ENABLE_CUDA_RMSNORM", "0") == "1"
 _ENABLE_TRITON_SMALL_ADD_RMSNORM = os.environ.get("ENABLE_TRITON_SMALL_ADD_RMSNORM", "1") == "1"
 _ENABLE_CUDA_FUSED_ADD_RMSNORM = os.environ.get("ENABLE_CUDA_FUSED_ADD_RMSNORM", "0") == "1"
 _ENABLE_TRITON_SMALL_SILU_MUL = os.environ.get("ENABLE_TRITON_SMALL_SILU_MUL", "0") == "1"
 _ENABLE_CUDA_FUSED_SILU_MUL = os.environ.get("ENABLE_CUDA_FUSED_SILU_MUL", "0") == "1"
+_ENABLE_CUDA_ADD = os.environ.get("ENABLE_CUDA_ADD", "0") == "1"
+_ENABLE_DOWNPROJ_RESIDUAL_EPILOGUE = os.environ.get("ENABLE_DOWNPROJ_RESIDUAL_EPILOGUE", "0") == "1"
 _ENABLE_TRITON_SMALL_QK_NORM_ROPE = os.environ.get("ENABLE_TRITON_SMALL_QK_NORM_ROPE", "1") == "1"
 _ENABLE_TRITON_SMALL_FUSED_QK_NORM_ROPE = os.environ.get("ENABLE_TRITON_SMALL_FUSED_QK_NORM_ROPE", "0") == "1"
 _ENABLE_CUDA_FUSED_QK_NORM_ROPE = os.environ.get("ENABLE_CUDA_FUSED_QK_NORM_ROPE", "0") == "1"
@@ -334,6 +347,17 @@ def _rms_norm(
     """RMSNorm: Triton for prefill (large M), F.rms_norm for decode (small M)."""
     N = x.shape[-1]
     M = x.numel() // N
+    if (
+        M <= _TRITON_ROWS_THRESHOLD
+        and prefer_small_triton
+        and _ENABLE_CUDA_RMSNORM
+        and x.device.type == "cuda"
+        and weight.device.type == "cuda"
+        and x.stride(-1) == 1
+        and weight.stride(-1) == 1
+    ):
+        import cuda_decode_small_ops
+        return cuda_decode_small_ops.rms_norm(x, weight, eps)
     if (
         M <= _TRITON_ROWS_THRESHOLD
         and (
@@ -619,6 +643,24 @@ def _fused_silu_mul(
         BLOCK=BLOCK,
     )
     return out_flat.view_as(gate)
+
+
+def _add(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    prefer_small_triton: bool = False,
+) -> torch.Tensor:
+    if (
+        prefer_small_triton
+        and _ENABLE_CUDA_ADD
+        and a.device.type == "cuda"
+        and b.device.type == "cuda"
+        and a.stride(-1) == 1
+        and b.stride(-1) == 1
+    ):
+        import cuda_decode_small_ops
+        return cuda_decode_small_ops.add(a, b)
+    return a + b
 
 
 # ---------------------------------------------------------------------------

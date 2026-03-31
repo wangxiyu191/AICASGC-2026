@@ -181,3 +181,55 @@ def fused_add_rms_norm(
         eps,
     )
     return out_sum.view_as(residual_in), out_norm.view_as(residual_in)
+
+
+def rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    if (
+        x.device.type != "cuda"
+        or weight.device.type != "cuda"
+        or x.dtype != torch.float16
+        or weight.dtype != torch.float16
+    ):
+        raise RuntimeError("rms_norm expects fp16 CUDA tensors")
+    if x.shape[-1] != weight.numel():
+        raise RuntimeError("rms_norm weight size mismatch")
+
+    x_in = x.contiguous()
+    rows = x_in.numel() // x_in.shape[-1]
+    cols = x_in.shape[-1]
+    x_2d = x_in.reshape(rows, cols)
+    out = torch.empty_like(x_2d)
+    ext = _load_ext()
+    ext.rms_norm(
+        x_2d,
+        weight.contiguous(),
+        out,
+        eps,
+    )
+    return out.view_as(x_in)
+
+
+def add(
+    a: torch.Tensor,
+    b: torch.Tensor,
+) -> torch.Tensor:
+    if (
+        a.device.type != "cuda"
+        or b.device.type != "cuda"
+        or a.dtype != torch.float16
+        or b.dtype != torch.float16
+    ):
+        raise RuntimeError("add expects fp16 CUDA tensors")
+    if a.shape != b.shape:
+        raise RuntimeError("add expects identical shapes")
+
+    a_in = a.contiguous()
+    b_in = b.contiguous()
+    out = torch.empty_like(a_in)
+    ext = _load_ext()
+    ext.add(a_in.reshape(-1), b_in.reshape(-1), out.reshape(-1))
+    return out.view_as(a_in)

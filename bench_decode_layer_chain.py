@@ -385,9 +385,22 @@ def _run_layer_chain_graph(target_layer, payload):
             )
             outputs["down_proj_input_simulated"] = hidden_states
 
-            hidden_states = _decode_gemv(hidden_states, target_layer.down_proj_weight, target_layer.down_proj_bias)
+            residual_epilogue_bias = None
+            if (
+                optimized_layer._ENABLE_DOWNPROJ_RESIDUAL_EPILOGUE
+                and target_layer.down_proj_bias is None
+            ):
+                residual_epilogue_bias = residual
+            down_proj_bias = target_layer.down_proj_bias if residual_epilogue_bias is None else residual_epilogue_bias
 
-            hidden_states = hidden_states + residual
+            hidden_states = _decode_gemv(hidden_states, target_layer.down_proj_weight, down_proj_bias)
+
+            if residual_epilogue_bias is None:
+                hidden_states = optimized_layer._add(
+                    hidden_states,
+                    residual,
+                    prefer_small_triton=prefer_small_triton,
+                )
 
             outputs["q_after_rope"] = q
             outputs["final_hidden_states"] = hidden_states
