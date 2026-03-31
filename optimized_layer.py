@@ -127,22 +127,39 @@ class OptimizedDecoderLayer(nn.Module):
         # 3. QK-Norm + RoPE (before transpose — natural layout for cos/sin broadcast)
         cos, sin = position_embeddings
         with _nvtx_range("decode.qk_norm_rope", enable_decode_nvtx):
-            q = _fused_rms_norm_rope(
-                q.view(hidden_shape_q),
+            q_view = q.view(hidden_shape_q)
+            k_view = k.view(hidden_shape_kv)
+            fused_qk = _fused_qk_rms_norm_rope(
+                q_view,
+                k_view,
                 self.q_norm_weight,
-                self.rms_norm_eps,
-                cos,
-                sin,
-                prefer_small_triton=prefer_small_decode_triton,
-            ).transpose(1, 2)
-            k = _fused_rms_norm_rope(
-                k.view(hidden_shape_kv),
                 self.k_norm_weight,
                 self.rms_norm_eps,
                 cos,
                 sin,
                 prefer_small_triton=prefer_small_decode_triton,
-            ).transpose(1, 2)
+            )
+            if fused_qk is None:
+                q_view = _fused_rms_norm_rope(
+                    q_view,
+                    self.q_norm_weight,
+                    self.rms_norm_eps,
+                    cos,
+                    sin,
+                    prefer_small_triton=prefer_small_decode_triton,
+                )
+                k_view = _fused_rms_norm_rope(
+                    k_view,
+                    self.k_norm_weight,
+                    self.rms_norm_eps,
+                    cos,
+                    sin,
+                    prefer_small_triton=prefer_small_decode_triton,
+                )
+            else:
+                q_view, k_view = fused_qk
+            q = q_view.transpose(1, 2)
+            k = k_view.transpose(1, 2)
             v = v.view(hidden_shape_kv).transpose(1, 2)
 
         # 4. KV Cache
@@ -267,6 +284,8 @@ _ENABLE_TRITON_SMALL_RMSNORM = os.environ.get("ENABLE_TRITON_SMALL_RMSNORM", "1"
 _ENABLE_TRITON_SMALL_ADD_RMSNORM = os.environ.get("ENABLE_TRITON_SMALL_ADD_RMSNORM", "1") == "1"
 _ENABLE_TRITON_SMALL_SILU_MUL = os.environ.get("ENABLE_TRITON_SMALL_SILU_MUL", "0") == "1"
 _ENABLE_TRITON_SMALL_QK_NORM_ROPE = os.environ.get("ENABLE_TRITON_SMALL_QK_NORM_ROPE", "1") == "1"
+_ENABLE_TRITON_SMALL_FUSED_QK_NORM_ROPE = os.environ.get("ENABLE_TRITON_SMALL_FUSED_QK_NORM_ROPE", "0") == "1"
+_ENABLE_CUDA_FUSED_QK_NORM_ROPE = os.environ.get("ENABLE_CUDA_FUSED_QK_NORM_ROPE", "0") == "1"
 _ENABLE_TRITON_SMALL_DECODE_ATTENTION = os.environ.get("ENABLE_TRITON_SMALL_DECODE_ATTENTION", "1") == "1"
 _ENABLE_TRITON_SMALL_DECODE_ATTENTION_DOT = os.environ.get("ENABLE_TRITON_SMALL_DECODE_ATTENTION_DOT", "1") == "1"
 _ENABLE_TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV = os.environ.get("ENABLE_TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV", "1") == "1"
@@ -387,6 +406,116 @@ def _fused_rms_norm_rope(
         BLOCK_HALF=block_half,
     )
     return out_3d.view_as(x)
+
+
+def _fused_qk_rms_norm_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    eps: float,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    prefer_small_triton: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Fuse decode q_norm_rope + k_norm_rope into one launch when the head grouping matches."""
+    if (
+        prefer_small_triton
+        and _ENABLE_CUDA_FUSED_QK_NORM_ROPE
+        and q.device.type == "cuda"
+        and k.device.type == "cuda"
+        and q_weight.device.type == "cuda"
+        and k_weight.device.type == "cuda"
+        and cos.device.type == "cuda"
+        and sin.device.type == "cuda"
+        and q.ndim == 4
+        and k.ndim == 4
+        and q.shape[:2] == k.shape[:2]
+        and q.shape[-1] == 128
+        and k.shape[-1] == 128
+        and q.shape[2] == k.shape[2] * 2
+        and q.stride(-1) == 1
+        and k.stride(-1) == 1
+        and q_weight.stride(-1) == 1
+        and k_weight.stride(-1) == 1
+        and cos.stride(-1) == 1
+        and sin.stride(-1) == 1
+    ):
+        import cuda_decode_small_ops
+        return cuda_decode_small_ops.fused_qk_rms_norm_rope(
+            q,
+            k,
+            q_weight,
+            k_weight,
+            eps,
+            cos,
+            sin,
+        )
+
+    if (
+        (not prefer_small_triton)
+        or (not _ENABLE_TRITON_SMALL_FUSED_QK_NORM_ROPE)
+        or q.device.type != "cuda"
+        or k.device.type != "cuda"
+        or q_weight.device.type != "cuda"
+        or k_weight.device.type != "cuda"
+        or cos.device.type != "cuda"
+        or sin.device.type != "cuda"
+        or q.ndim != 4
+        or k.ndim != 4
+        or q.shape[:2] != k.shape[:2]
+        or q.shape[-1] != k.shape[-1]
+        or q.shape[1] > _TRITON_ROWS_THRESHOLD
+        or q.stride(-1) != 1
+        or k.stride(-1) != 1
+        or q_weight.stride(-1) != 1
+        or k_weight.stride(-1) != 1
+        or cos.stride(-1) != 1
+        or sin.stride(-1) != 1
+    ):
+        return None
+
+    batch, seq_len, q_heads, d = q.shape
+    kv_heads = k.shape[2]
+    if kv_heads <= 0 or q_heads % kv_heads != 0:
+        return None
+    groups = q_heads // kv_heads
+    if groups <= 0 or groups > 4:
+        return None
+    half_d = d // 2
+    if d != 128 or half_d * 2 != d:
+        return None
+
+    m = batch * seq_len
+    q_3d = q.reshape(m, q_heads, d)
+    k_3d = k.reshape(m, kv_heads, d)
+    cos_2d = cos.reshape(m, d)
+    sin_2d = sin.reshape(m, d)
+    q_out = torch.empty_like(q_3d)
+    k_out = torch.empty_like(k_3d)
+    _fused_qk_rms_norm_rope_fwd_kernel[(m * kv_heads,)](
+        q_3d,
+        k_3d,
+        q_out,
+        k_out,
+        q_weight,
+        k_weight,
+        cos_2d,
+        sin_2d,
+        kv_heads,
+        q_3d.stride(0),
+        q_3d.stride(1),
+        k_3d.stride(0),
+        k_3d.stride(1),
+        cos_2d.stride(0),
+        eps,
+        GROUPS=groups,
+        D=d,
+        HALF_D=half_d,
+        BLOCK_D=triton.next_power_of_2(d),
+        BLOCK_HALF=triton.next_power_of_2(half_d),
+    )
+    return q_out.view_as(q), k_out.view_as(k)
 
 
 def _fused_add_rms_norm(
@@ -1273,6 +1402,72 @@ def _fused_rms_norm_rope_fwd_kernel(
     out1 = n1 * cos + n0 * sin
     tl.store(OUT + m * stride_x_m + h * stride_x_h + rk, out0.to(OUT.dtype.element_ty), mask=mask_half)
     tl.store(OUT + m * stride_x_m + h * stride_x_h + HALF_D + rk, out1.to(OUT.dtype.element_ty), mask=mask_half)
+
+
+@triton.jit
+def _fused_qk_rms_norm_rope_fwd_kernel(
+    Q,
+    K,
+    Q_OUT,
+    K_OUT,
+    Q_W,
+    K_W,
+    COS,
+    SIN,
+    kv_heads,
+    stride_q_m,
+    stride_q_h,
+    stride_k_m,
+    stride_k_h,
+    stride_cos_m,
+    eps,
+    GROUPS: tl.constexpr,
+    D: tl.constexpr,
+    HALF_D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_HALF: tl.constexpr,
+):
+    """Compute q_norm_rope and k_norm_rope for one KV head-group in one program."""
+    pid = tl.program_id(0)
+    m = pid // kv_heads
+    kv_h = pid % kv_heads
+    q_head_base = kv_h * GROUPS
+
+    cols = tl.arange(0, BLOCK_D)
+    mask = cols < D
+    rk = tl.arange(0, BLOCK_HALF)
+    mask_half = rk < HALF_D
+    cs_base = m * stride_cos_m
+    cos = tl.load(COS + cs_base + rk, mask=mask_half, other=0.0).to(Q_OUT.dtype.element_ty)
+    sin = tl.load(SIN + cs_base + rk, mask=mask_half, other=0.0).to(Q_OUT.dtype.element_ty)
+
+    k_base = K + m * stride_k_m + kv_h * stride_k_h
+    k = tl.load(k_base + cols, mask=mask, other=0.0).to(tl.float32)
+    k_var = tl.sum(k * k, axis=0) / D
+    k_rstd = tl.rsqrt(k_var + eps)
+    k0 = tl.load(k_base + rk, mask=mask_half, other=0.0).to(tl.float32)
+    k1 = tl.load(k_base + HALF_D + rk, mask=mask_half, other=0.0).to(tl.float32)
+    kw0 = tl.load(K_W + rk, mask=mask_half, other=0.0).to(tl.float32)
+    kw1 = tl.load(K_W + HALF_D + rk, mask=mask_half, other=0.0).to(tl.float32)
+    kn0 = (k0 * k_rstd * kw0).to(K_OUT.dtype.element_ty)
+    kn1 = (k1 * k_rstd * kw1).to(K_OUT.dtype.element_ty)
+    tl.store(K_OUT + m * stride_k_m + kv_h * stride_k_h + rk, kn0 * cos - kn1 * sin, mask=mask_half)
+    tl.store(K_OUT + m * stride_k_m + kv_h * stride_k_h + HALF_D + rk, kn1 * cos + kn0 * sin, mask=mask_half)
+
+    for group_idx in range(GROUPS):
+        q_h = q_head_base + group_idx
+        q_base = Q + m * stride_q_m + q_h * stride_q_h
+        q = tl.load(q_base + cols, mask=mask, other=0.0).to(tl.float32)
+        q_var = tl.sum(q * q, axis=0) / D
+        q_rstd = tl.rsqrt(q_var + eps)
+        q0 = tl.load(q_base + rk, mask=mask_half, other=0.0).to(tl.float32)
+        q1 = tl.load(q_base + HALF_D + rk, mask=mask_half, other=0.0).to(tl.float32)
+        qw0 = tl.load(Q_W + rk, mask=mask_half, other=0.0).to(tl.float32)
+        qw1 = tl.load(Q_W + HALF_D + rk, mask=mask_half, other=0.0).to(tl.float32)
+        qn0 = (q0 * q_rstd * qw0).to(Q_OUT.dtype.element_ty)
+        qn1 = (q1 * q_rstd * qw1).to(Q_OUT.dtype.element_ty)
+        tl.store(Q_OUT + m * stride_q_m + q_h * stride_q_h + rk, qn0 * cos - qn1 * sin, mask=mask_half)
+        tl.store(Q_OUT + m * stride_q_m + q_h * stride_q_h + HALF_D + rk, qn1 * cos + qn0 * sin, mask=mask_half)
 
 
 @triton.jit

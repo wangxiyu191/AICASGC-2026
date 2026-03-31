@@ -2048,6 +2048,7 @@ __global__ void nosplit_matvec_k6144_persistent_xfull_w2_async_fwd_kernel(
     int64_t stride_wn,
     int n,
     bool has_bias) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 860
     __shared__ __align__(16) uint4 x_sh[kFullVecsK6144];
     __shared__ __align__(16) uint4 w_sh[2][kPersistentRowsPerBatchK6144 * kFullVecsK6144];
     __shared__ float warp_partials[kPersistentRowsPerBatchK6144][2];
@@ -2165,6 +2166,16 @@ __global__ void nosplit_matvec_k6144_persistent_xfull_w2_async_fwd_kernel(
         __syncthreads();
         maybe_record_profile<kProfile>(profile, kProfileKernelDone);
     }
+#else
+    (void)x;
+    (void)weight;
+    (void)bias;
+    (void)out;
+    (void)profile;
+    (void)stride_wn;
+    (void)n;
+    (void)has_bias;
+#endif
 }
 
 template <bool kProfile>
@@ -2744,6 +2755,15 @@ void launch_nosplit_variant(
         }
         case kNosplitVariantK6144PersistentXFullW2Async:
             TORCH_CHECK(k == 6144, "k6144_persistent_xfull_w2_async variant requires k=6144");
+            {
+                int cc_major = 0;
+                int cc_minor = 0;
+                cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, at::cuda::current_device());
+                cudaDeviceGetAttribute(&cc_minor, cudaDevAttrComputeCapabilityMinor, at::cuda::current_device());
+                TORCH_CHECK(
+                    (cc_major > 8) || (cc_major == 8 && cc_minor >= 6),
+                    "k6144_persistent_xfull_w2_async variant requires sm86+ due to static shared-memory footprint");
+            }
             C10_CUDA_CHECK(cudaFuncSetAttribute(
                 nosplit_matvec_k6144_persistent_xfull_w2_async_fwd_kernel<false>,
                 cudaFuncAttributePreferredSharedMemoryCarveout,

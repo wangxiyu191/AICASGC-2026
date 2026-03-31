@@ -311,23 +311,39 @@ def _run_layer_chain_graph(target_layer, payload):
 
             q, k_cur, _v_cur = qkv.split([target_layer.q_size, target_layer.kv_size, target_layer.kv_size], dim=-1)
 
-            q = optimized_layer._fused_rms_norm_rope(
-                q.view(hidden_shape_q),
+            q_view = q.view(hidden_shape_q)
+            k_view = k_cur.view(hidden_shape_kv)
+            fused_qk = optimized_layer._fused_qk_rms_norm_rope(
+                q_view,
+                k_view,
                 target_layer.q_norm_weight,
-                target_layer.rms_norm_eps,
-                cos,
-                sin,
-                prefer_small_triton=prefer_small_triton,
-            ).transpose(1, 2)
-
-            _k_cur = optimized_layer._fused_rms_norm_rope(
-                k_cur.view(hidden_shape_kv),
                 target_layer.k_norm_weight,
                 target_layer.rms_norm_eps,
                 cos,
                 sin,
                 prefer_small_triton=prefer_small_triton,
-            ).transpose(1, 2)
+            )
+            if fused_qk is None:
+                q_view = optimized_layer._fused_rms_norm_rope(
+                    q_view,
+                    target_layer.q_norm_weight,
+                    target_layer.rms_norm_eps,
+                    cos,
+                    sin,
+                    prefer_small_triton=prefer_small_triton,
+                )
+                k_view = optimized_layer._fused_rms_norm_rope(
+                    k_view,
+                    target_layer.k_norm_weight,
+                    target_layer.rms_norm_eps,
+                    cos,
+                    sin,
+                    prefer_small_triton=prefer_small_triton,
+                )
+            else:
+                q_view, k_view = fused_qk
+            q = q_view.transpose(1, 2)
+            _k_cur = k_view.transpose(1, 2)
 
             attn_output = optimized_layer._small_decode_attention(
                 attn["q"],

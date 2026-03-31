@@ -69,6 +69,7 @@ def _collect_trace_payload(args: argparse.Namespace) -> tuple[dict, list[torch.T
     bias = payload["bias"]
     if weight.shape[1] != 6144:
         raise RuntimeError(f"{args.target} weight shape {tuple(weight.shape)} is not k=6144")
+    device_props = torch.cuda.get_device_properties(x.device)
 
     ref = F.linear(x, weight, bias)
     trace_reps = []
@@ -120,6 +121,8 @@ def _collect_trace_payload(args: argparse.Namespace) -> tuple[dict, list[torch.T
         "full_grid_blocks": int(meta["full_grid_blocks"]),
         "max_iters": int(meta["max_iters"]),
         "sms": int(meta["sms"]),
+        "device_name": device_props.name,
+        "device_cc": f"{device_props.major}.{device_props.minor}",
         "slot_names": list(meta["slot_names"]),
         "max_abs_diff_vs_f_linear": max_abs_diff,
         "mean_abs_diff_vs_f_linear": mean_abs_diff,
@@ -364,10 +367,10 @@ def _build_html(processed: dict) -> str:
       titleEl.textContent = `SM-level CTA timeline for k6144 xwarp async ${{variantLabel}}`;
       notesEl.textContent =
         m.variant === "sms2_balanced"
-          ? "Each horizontal bar is one CTA. The bar is segmented by balanced row batches: iter0 is the first 8-row chunk, iter1 is the remaining 6/7-row chunk for that CTA. This is a CTA-level trace for the 144-CTA balanced launch, so there is no warp-level coloring noise here."
-          : "Each horizontal bar is one CTA. The bar is segmented by grid-stride iterations: iter0 is the first row-tile batch, iter1 is the second. This is a CTA-level trace for the 144-CTA launch, so there is no warp-level coloring noise here.";
+          ? `Each horizontal bar is one CTA. The bar is segmented by balanced row batches: iter0 is the first 8-row chunk, iter1 is the remaining 6/7-row chunk for that CTA. This trace was captured on ${{m.device_name}} (sm_${{String(m.device_cc).replace(".", "")}}) with launch_grid=${{m.launch_grid_blocks}} = min(full_grid=${{m.full_grid_blocks}}, 2 * sms=${{m.sms}}), so there is no warp-level coloring noise here.`
+          : `Each horizontal bar is one CTA. The bar is segmented by grid-stride iterations: iter0 is the first row-tile batch, iter1 is the second. This trace was captured on ${{m.device_name}} (sm_${{String(m.device_cc).replace(".", "")}}) with launch_grid=${{m.launch_grid_blocks}} = min(full_grid=${{m.full_grid_blocks}}, 2 * sms=${{m.sms}}), so there is no warp-level coloring noise here.`;
       metaEl.textContent =
-        `variant=${{m.variant}} target=${{m.target}} kernel=${{m.kernel_name}} sample=${{m.sample_idx}} layer=${{m.layer_idx}} decode_step=${{m.decode_step}} ` +
+        `device=${{m.device_name}} cc=${{m.device_cc}} variant=${{m.variant}} target=${{m.target}} kernel=${{m.kernel_name}} sample=${{m.sample_idx}} layer=${{m.layer_idx}} decode_step=${{m.decode_step}} ` +
         `x=${{m.x_shape.join("x")}} weight=${{m.weight_shape.join("x")}} launch_grid=${{m.launch_grid_blocks}} full_grid=${{m.full_grid_blocks}} ` +
         `max_iters=${{m.max_iters}} sms=${{m.sms}} repeats=${{m.repeats}} ` +
         `max_abs_diff=${{m.max_abs_diff_vs_f_linear.toExponential(3)}} mean_abs_diff=${{m.mean_abs_diff_vs_f_linear.toExponential(3)}}`;
