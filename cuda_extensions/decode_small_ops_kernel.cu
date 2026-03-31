@@ -12,6 +12,8 @@ constexpr int kHalfHeadDim = kHeadDim / 2;
 constexpr int kSupportedGroups = 2;
 constexpr int kWarpsPerBlock = 3;
 constexpr int kThreadsPerBlock = kWarpSize * kWarpsPerBlock;
+constexpr int kElementwiseThreads = 256;
+constexpr int kReductionThreads = 256;
 
 __device__ inline float warp_sum(float v) {
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -182,6 +184,144 @@ void fused_qk_rms_norm_rope_cuda(
         k.stride(1),
         cos.stride(0),
         kv_heads,
+        static_cast<float>(eps));
+    C10_CUDA_CHECK(cudaGetLastError());
+}
+
+__global__ void fused_silu_mul_fwd_kernel(
+    const at::Half* __restrict__ gate,
+    const at::Half* __restrict__ up,
+    at::Half* __restrict__ out,
+    int total) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) {
+        return;
+    }
+    const float gate_f = __half2float(reinterpret_cast<const __half*>(gate)[idx]);
+    const float up_f = __half2float(reinterpret_cast<const __half*>(up)[idx]);
+    const float silu = gate_f / (1.0f + expf(-gate_f));
+    reinterpret_cast<__half*>(out)[idx] = __float2half_rn(silu * up_f);
+}
+
+void fused_silu_mul_cuda(
+    const torch::Tensor& gate,
+    const torch::Tensor& up,
+    const torch::Tensor& out) {
+    TORCH_CHECK(gate.is_cuda(), "gate must be CUDA");
+    TORCH_CHECK(up.is_cuda(), "up must be CUDA");
+    TORCH_CHECK(out.is_cuda(), "out must be CUDA");
+    TORCH_CHECK(gate.scalar_type() == torch::kFloat16, "gate must be fp16");
+    TORCH_CHECK(up.scalar_type() == torch::kFloat16, "up must be fp16");
+    TORCH_CHECK(out.scalar_type() == torch::kFloat16, "out must be fp16");
+    TORCH_CHECK(gate.sizes() == up.sizes(), "gate/up shape mismatch");
+    TORCH_CHECK(gate.sizes() == out.sizes(), "gate/out shape mismatch");
+    TORCH_CHECK(gate.is_contiguous(), "gate must be contiguous");
+    TORCH_CHECK(up.is_contiguous(), "up must be contiguous");
+    TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
+
+    c10::cuda::CUDAGuard device_guard(gate.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int total = static_cast<int>(gate.numel());
+    const dim3 block(kElementwiseThreads);
+    const dim3 grid((total + block.x - 1) / block.x);
+    fused_silu_mul_fwd_kernel<<<grid, block, 0, stream>>>(
+        reinterpret_cast<const at::Half*>(gate.data_ptr<at::Half>()),
+        reinterpret_cast<const at::Half*>(up.data_ptr<at::Half>()),
+        reinterpret_cast<at::Half*>(out.data_ptr<at::Half>()),
+        total);
+    C10_CUDA_CHECK(cudaGetLastError());
+}
+
+__global__ void fused_add_rms_norm_fwd_kernel(
+    const at::Half* __restrict__ residual,
+    const at::Half* __restrict__ x,
+    const at::Half* __restrict__ weight,
+    at::Half* __restrict__ out_sum,
+    at::Half* __restrict__ out_norm,
+    int cols,
+    float eps) {
+    __shared__ float warp_sums[kReductionThreads / kWarpSize];
+
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int row_base = row * cols;
+
+    float sum_sq = 0.0f;
+    for (int col = tid; col < cols; col += blockDim.x) {
+        const float summed =
+            __half2float(reinterpret_cast<const __half*>(residual)[row_base + col]) +
+            __half2float(reinterpret_cast<const __half*>(x)[row_base + col]);
+        sum_sq += summed * summed;
+        reinterpret_cast<__half*>(out_sum)[row_base + col] = __float2half_rn(summed);
+    }
+
+    sum_sq = warp_sum(sum_sq);
+    if (lane == 0) {
+        warp_sums[warp] = sum_sq;
+    }
+    __syncthreads();
+
+    float block_sum = 0.0f;
+    if (warp == 0) {
+        block_sum = (lane < (kReductionThreads / kWarpSize)) ? warp_sums[lane] : 0.0f;
+        block_sum = warp_sum(block_sum);
+        if (lane == 0) {
+            warp_sums[0] = rsqrtf(block_sum / static_cast<float>(cols) + eps);
+        }
+    }
+    __syncthreads();
+    const float rstd = warp_sums[0];
+
+    for (int col = tid; col < cols; col += blockDim.x) {
+        const float summed = __half2float(reinterpret_cast<const __half*>(out_sum)[row_base + col]);
+        const float w = __half2float(reinterpret_cast<const __half*>(weight)[col]);
+        reinterpret_cast<__half*>(out_norm)[row_base + col] = __float2half_rn(summed * rstd * w);
+    }
+}
+
+void fused_add_rms_norm_cuda(
+    const torch::Tensor& residual,
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const torch::Tensor& out_sum,
+    const torch::Tensor& out_norm,
+    double eps) {
+    TORCH_CHECK(residual.is_cuda(), "residual must be CUDA");
+    TORCH_CHECK(x.is_cuda(), "x must be CUDA");
+    TORCH_CHECK(weight.is_cuda(), "weight must be CUDA");
+    TORCH_CHECK(out_sum.is_cuda(), "out_sum must be CUDA");
+    TORCH_CHECK(out_norm.is_cuda(), "out_norm must be CUDA");
+    TORCH_CHECK(residual.scalar_type() == torch::kFloat16, "residual must be fp16");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat16, "x must be fp16");
+    TORCH_CHECK(weight.scalar_type() == torch::kFloat16, "weight must be fp16");
+    TORCH_CHECK(out_sum.scalar_type() == torch::kFloat16, "out_sum must be fp16");
+    TORCH_CHECK(out_norm.scalar_type() == torch::kFloat16, "out_norm must be fp16");
+    TORCH_CHECK(residual.dim() == 2, "residual must be [M, N]");
+    TORCH_CHECK(x.dim() == 2, "x must be [M, N]");
+    TORCH_CHECK(weight.dim() == 1, "weight must be [N]");
+    TORCH_CHECK(residual.sizes() == x.sizes(), "residual/x shape mismatch");
+    TORCH_CHECK(residual.sizes() == out_sum.sizes(), "residual/out_sum shape mismatch");
+    TORCH_CHECK(residual.sizes() == out_norm.sizes(), "residual/out_norm shape mismatch");
+    TORCH_CHECK(residual.size(1) == weight.size(0), "weight size mismatch");
+    TORCH_CHECK(residual.is_contiguous(), "residual must be contiguous");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
+    TORCH_CHECK(out_sum.is_contiguous(), "out_sum must be contiguous");
+    TORCH_CHECK(out_norm.is_contiguous(), "out_norm must be contiguous");
+
+    c10::cuda::CUDAGuard device_guard(residual.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int rows = static_cast<int>(residual.size(0));
+    const int cols = static_cast<int>(residual.size(1));
+    fused_add_rms_norm_fwd_kernel<<<rows, kReductionThreads, 0, stream>>>(
+        reinterpret_cast<const at::Half*>(residual.data_ptr<at::Half>()),
+        reinterpret_cast<const at::Half*>(x.data_ptr<at::Half>()),
+        reinterpret_cast<const at::Half*>(weight.data_ptr<at::Half>()),
+        reinterpret_cast<at::Half*>(out_sum.data_ptr<at::Half>()),
+        reinterpret_cast<at::Half*>(out_norm.data_ptr<at::Half>()),
+        cols,
         static_cast<float>(eps));
     C10_CUDA_CHECK(cudaGetLastError());
 }

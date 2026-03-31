@@ -119,3 +119,65 @@ def fused_qk_rms_norm_rope(
         eps,
     )
     return q_out.view_as(q_in), k_out.view_as(k_in)
+
+
+def fused_silu_mul(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+) -> torch.Tensor:
+    if (
+        gate.device.type != "cuda"
+        or up.device.type != "cuda"
+        or gate.dtype != torch.float16
+        or up.dtype != torch.float16
+    ):
+        raise RuntimeError("fused_silu_mul expects fp16 CUDA tensors")
+    if gate.shape != up.shape:
+        raise RuntimeError("fused_silu_mul expects gate/up with identical shapes")
+
+    gate_in = gate.contiguous()
+    up_in = up.contiguous()
+    out = torch.empty_like(gate_in)
+    ext = _load_ext()
+    ext.fused_silu_mul(gate_in.reshape(-1), up_in.reshape(-1), out.reshape(-1))
+    return out.view_as(gate_in)
+
+
+def fused_add_rms_norm(
+    residual: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if (
+        residual.device.type != "cuda"
+        or x.device.type != "cuda"
+        or weight.device.type != "cuda"
+        or residual.dtype != torch.float16
+        or x.dtype != torch.float16
+        or weight.dtype != torch.float16
+    ):
+        raise RuntimeError("fused_add_rms_norm expects fp16 CUDA tensors")
+    if residual.shape != x.shape:
+        raise RuntimeError("fused_add_rms_norm expects residual/x with identical shapes")
+    if residual.shape[-1] != weight.numel():
+        raise RuntimeError("fused_add_rms_norm weight size mismatch")
+
+    residual_in = residual.contiguous()
+    x_in = x.contiguous()
+    rows = residual_in.numel() // residual_in.shape[-1]
+    cols = residual_in.shape[-1]
+    residual_2d = residual_in.reshape(rows, cols)
+    x_2d = x_in.reshape(rows, cols)
+    out_sum = torch.empty_like(residual_2d)
+    out_norm = torch.empty_like(residual_2d)
+    ext = _load_ext()
+    ext.fused_add_rms_norm(
+        residual_2d,
+        x_2d,
+        weight.contiguous(),
+        out_sum,
+        out_norm,
+        eps,
+    )
+    return out_sum.view_as(residual_in), out_norm.view_as(residual_in)

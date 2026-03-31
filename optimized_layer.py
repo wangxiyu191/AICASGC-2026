@@ -282,7 +282,9 @@ class OptimizedDecoderLayer(nn.Module):
 _TRITON_ROWS_THRESHOLD = 32
 _ENABLE_TRITON_SMALL_RMSNORM = os.environ.get("ENABLE_TRITON_SMALL_RMSNORM", "1") == "1"
 _ENABLE_TRITON_SMALL_ADD_RMSNORM = os.environ.get("ENABLE_TRITON_SMALL_ADD_RMSNORM", "1") == "1"
+_ENABLE_CUDA_FUSED_ADD_RMSNORM = os.environ.get("ENABLE_CUDA_FUSED_ADD_RMSNORM", "0") == "1"
 _ENABLE_TRITON_SMALL_SILU_MUL = os.environ.get("ENABLE_TRITON_SMALL_SILU_MUL", "0") == "1"
+_ENABLE_CUDA_FUSED_SILU_MUL = os.environ.get("ENABLE_CUDA_FUSED_SILU_MUL", "0") == "1"
 _ENABLE_TRITON_SMALL_QK_NORM_ROPE = os.environ.get("ENABLE_TRITON_SMALL_QK_NORM_ROPE", "1") == "1"
 _ENABLE_TRITON_SMALL_FUSED_QK_NORM_ROPE = os.environ.get("ENABLE_TRITON_SMALL_FUSED_QK_NORM_ROPE", "0") == "1"
 _ENABLE_CUDA_FUSED_QK_NORM_ROPE = os.environ.get("ENABLE_CUDA_FUSED_QK_NORM_ROPE", "0") == "1"
@@ -528,6 +530,19 @@ def _fused_add_rms_norm(
     """Return (residual_plus_x, rms_norm(residual_plus_x)) with one Triton kernel when useful."""
     N = residual.shape[-1]
     if (
+        prefer_small_triton
+        and _ENABLE_CUDA_FUSED_ADD_RMSNORM
+        and residual.device.type == "cuda"
+        and x.device.type == "cuda"
+        and weight.device.type == "cuda"
+        and residual.stride(-1) == 1
+        and x.stride(-1) == 1
+        and weight.stride(-1) == 1
+    ):
+        import cuda_decode_small_ops
+        return cuda_decode_small_ops.fused_add_rms_norm(residual, x, weight, eps)
+
+    if (
         (not prefer_small_triton)
         or (not _ENABLE_TRITON_SMALL_ADD_RMSNORM)
         or residual.device.type != "cuda"
@@ -570,6 +585,17 @@ def _fused_silu_mul(
     prefer_small_triton: bool = False,
 ) -> torch.Tensor:
     """Fuse SiLU(gate) * up into one kernel when useful."""
+    if (
+        prefer_small_triton
+        and _ENABLE_CUDA_FUSED_SILU_MUL
+        and gate.device.type == "cuda"
+        and up.device.type == "cuda"
+        and gate.stride(-1) == 1
+        and up.stride(-1) == 1
+    ):
+        import cuda_decode_small_ops
+        return cuda_decode_small_ops.fused_silu_mul(gate, up)
+
     if (
         (not prefer_small_triton)
         or (not _ENABLE_TRITON_SMALL_SILU_MUL)
