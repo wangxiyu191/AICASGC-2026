@@ -1,0 +1,333 @@
+{
+  "meta": {
+    "sample_idx": 0,
+    "layer_idx": 14,
+    "decode_step": 16,
+    "targets": [
+      "qkv",
+      "gate_up",
+      "o_proj",
+      "down_proj",
+      "lm_head"
+    ],
+    "warmup": 10,
+    "iters": 100,
+    "capture_repeats": 10,
+    "device": "cuda:0",
+    "device_name": "NVIDIA A10"
+  },
+  "per_target": {
+    "qkv": {
+      "meta": {
+        "target": "qkv",
+        "x_shape": [
+          1,
+          1,
+          2048
+        ],
+        "weight_shape": [
+          4096,
+          2048
+        ],
+        "has_bias": false,
+        "prompt_length": 690,
+        "max_cache_len": 832,
+        "labels": {
+          "default_full": "row4_gemv",
+          "default_pattern": "row4_weight_only",
+          "candidate_pattern": "row2_weight_only",
+          "candidate_full": "row2_gemv",
+          "used_path_full": "row4_gemv"
+        }
+      },
+      "results": {
+        "flat_weight_stream": {
+          "elapsed_ms": 0.030946271896362305,
+          "effective_weight_bandwidth_gb_s": 542.1401342360772,
+          "bw_vs_flat": 1.0
+        },
+        "f_linear_full": {
+          "elapsed_ms": 0.03147967910766602,
+          "effective_weight_bandwidth_gb_s": 532.9538443711253,
+          "bw_vs_flat": 0.9830555067134144
+        },
+        "row2_weight_only": {
+          "elapsed_ms": 0.030523391723632814,
+          "effective_weight_bandwidth_gb_s": 549.6511053524304,
+          "bw_vs_flat": 1.013854298256182
+        },
+        "row2_gemv": {
+          "elapsed_ms": 0.03116428756713867,
+          "effective_weight_bandwidth_gb_s": 538.3474903398984,
+          "bw_vs_flat": 0.9930043107737763
+        },
+        "row4_weight_only": {
+          "elapsed_ms": 0.030500864028930662,
+          "effective_weight_bandwidth_gb_s": 550.0570732713172,
+          "bw_vs_flat": 1.0146031229478993
+        },
+        "row4_gemv": {
+          "elapsed_ms": 0.03093286323547363,
+          "effective_weight_bandwidth_gb_s": 542.3751390967255,
+          "bw_vs_flat": 1.0004334762283915
+        }
+      },
+      "derived": {
+        "default_pattern_loss_vs_flat": -0.014603122947899339,
+        "default_compute_loss_vs_pattern": 0.013965703829432519,
+        "candidate_pattern_loss_vs_flat": -0.013854298256182007,
+        "candidate_compute_loss_vs_pattern": 0.020565072829762054,
+        "used_path_bw_vs_flat": 1.0004334762283915
+      }
+    },
+    "gate_up": {
+      "meta": {
+        "target": "gate_up",
+        "x_shape": [
+          1,
+          1,
+          2048
+        ],
+        "weight_shape": [
+          12288,
+          2048
+        ],
+        "has_bias": false,
+        "prompt_length": 690,
+        "max_cache_len": 832,
+        "labels": {
+          "default_full": "row4_gemv",
+          "default_pattern": "row4_weight_only",
+          "candidate_pattern": "row2_weight_only",
+          "candidate_full": "row2_gemv",
+          "used_path_full": "row4_gemv"
+        }
+      },
+      "results": {
+        "flat_weight_stream": {
+          "elapsed_ms": 0.08846745300292969,
+          "effective_weight_bandwidth_gb_s": 568.9284170793661,
+          "bw_vs_flat": 1.0
+        },
+        "f_linear_full": {
+          "elapsed_ms": 0.09266073608398437,
+          "effective_weight_bandwidth_gb_s": 543.1820437340493,
+          "bw_vs_flat": 0.9547458475048801
+        },
+        "row2_weight_only": {
+          "elapsed_ms": 0.08848281860351563,
+          "effective_weight_bandwidth_gb_s": 568.8296190646012,
+          "bw_vs_flat": 0.9998263436808585
+        },
+        "row2_gemv": {
+          "elapsed_ms": 0.08914739227294922,
+          "effective_weight_bandwidth_gb_s": 564.5891227630735,
+          "bw_vs_flat": 0.9923728641670447
+        },
+        "row4_weight_only": {
+          "elapsed_ms": 0.08848486328125,
+          "effective_weight_bandwidth_gb_s": 568.8164747457467,
+          "bw_vs_flat": 0.9998032400381861
+        },
+        "row4_gemv": {
+          "elapsed_ms": 0.08890755462646484,
+          "effective_weight_bandwidth_gb_s": 566.1121623630613,
+          "bw_vs_flat": 0.9950498962052867
+        }
+      },
+      "derived": {
+        "default_pattern_loss_vs_flat": 0.0001967599618138971,
+        "default_compute_loss_vs_pattern": 0.00475427928470995,
+        "candidate_pattern_loss_vs_flat": 0.00017365631914145752,
+        "candidate_compute_loss_vs_pattern": 0.007454774082441107,
+        "used_path_bw_vs_flat": 0.9950498962052867
+      }
+    },
+    "o_proj": {
+      "meta": {
+        "target": "o_proj",
+        "x_shape": [
+          1,
+          1,
+          2048
+        ],
+        "weight_shape": [
+          2048,
+          2048
+        ],
+        "has_bias": false,
+        "prompt_length": 690,
+        "max_cache_len": 832,
+        "labels": {
+          "default_full": "row2_gemv",
+          "default_pattern": "row2_weight_only",
+          "candidate_pattern": "row4_weight_only",
+          "candidate_full": "row4_gemv",
+          "used_path_full": "row2_gemv"
+        }
+      },
+      "results": {
+        "flat_weight_stream": {
+          "elapsed_ms": 0.016424959182739257,
+          "effective_weight_bandwidth_gb_s": 510.7232174321299,
+          "bw_vs_flat": 1.0
+        },
+        "f_linear_full": {
+          "elapsed_ms": 0.020540416717529295,
+          "effective_weight_bandwidth_gb_s": 408.3952197932343,
+          "bw_vs_flat": 0.7996409911548734
+        },
+        "row2_weight_only": {
+          "elapsed_ms": 0.01599897575378418,
+          "effective_weight_bandwidth_gb_s": 524.321564648654,
+          "bw_vs_flat": 1.0266256687622217
+        },
+        "row2_gemv": {
+          "elapsed_ms": 0.016286720275878908,
+          "effective_weight_bandwidth_gb_s": 515.0581490874971,
+          "bw_vs_flat": 1.0084878296255315
+        },
+        "row4_weight_only": {
+          "elapsed_ms": 0.015780863761901857,
+          "effective_weight_bandwidth_gb_s": 531.568368282335,
+          "bw_vs_flat": 1.0408149661866022
+        },
+        "row4_gemv": {
+          "elapsed_ms": 0.016363519668579102,
+          "effective_weight_bandwidth_gb_s": 512.6408113840957,
+          "bw_vs_flat": 1.0037546637523302
+        }
+      },
+      "derived": {
+        "default_pattern_loss_vs_flat": -0.02662566876222172,
+        "default_compute_loss_vs_pattern": 0.017667431945821765,
+        "candidate_pattern_loss_vs_flat": -0.040814966186602186,
+        "candidate_compute_loss_vs_pattern": 0.035607003779024926,
+        "used_path_bw_vs_flat": 1.0084878296255315
+      }
+    },
+    "down_proj": {
+      "meta": {
+        "target": "down_proj",
+        "x_shape": [
+          1,
+          1,
+          6144
+        ],
+        "weight_shape": [
+          2048,
+          6144
+        ],
+        "has_bias": false,
+        "prompt_length": 690,
+        "max_cache_len": 832,
+        "labels": {
+          "default_full": "row4_gemv",
+          "default_pattern": "row4_weight_only",
+          "candidate_pattern": "xwarp_weight_only",
+          "candidate_full": "xwarp_gemv",
+          "used_path_full": "row4_gemv"
+        }
+      },
+      "results": {
+        "flat_weight_stream": {
+          "elapsed_ms": 0.04532326507568359,
+          "effective_weight_bandwidth_gb_s": 555.2517886338628,
+          "bw_vs_flat": 1.0
+        },
+        "f_linear_full": {
+          "elapsed_ms": 0.05518950271606445,
+          "effective_weight_bandwidth_gb_s": 455.9893233586753,
+          "bw_vs_flat": 0.8212298144605492
+        },
+        "row4_weight_only": {
+          "elapsed_ms": 0.045434879302978515,
+          "effective_weight_bandwidth_gb_s": 553.8877704986055,
+          "bw_vs_flat": 0.9975434241488653
+        },
+        "row4_gemv": {
+          "elapsed_ms": 0.046358528137207033,
+          "effective_weight_bandwidth_gb_s": 542.8520924028666,
+          "bw_vs_flat": 0.9776683362668595
+        },
+        "xwarp_weight_only": {
+          "elapsed_ms": 0.04544921493530273,
+          "effective_weight_bandwidth_gb_s": 553.713062718987,
+          "bw_vs_flat": 0.9972287781032426
+        },
+        "xwarp_gemv": {
+          "elapsed_ms": 0.045243392944335936,
+          "effective_weight_bandwidth_gb_s": 556.2320233356975,
+          "bw_vs_flat": 1.0017653877428228
+        }
+      },
+      "derived": {
+        "default_pattern_loss_vs_flat": 0.002456575851134679,
+        "default_compute_loss_vs_pattern": 0.019924032779789824,
+        "candidate_pattern_loss_vs_flat": 0.002771221896757381,
+        "candidate_compute_loss_vs_pattern": -0.004549216528035638,
+        "used_path_bw_vs_flat": 0.9776683362668595
+      }
+    },
+    "lm_head": {
+      "meta": {
+        "target": "lm_head",
+        "x_shape": [
+          1,
+          1,
+          2048
+        ],
+        "weight_shape": [
+          151936,
+          2048
+        ],
+        "has_bias": false,
+        "prompt_length": 690,
+        "max_cache_len": 832,
+        "labels": {
+          "default_full": "f_linear_full",
+          "candidate_pattern": "row4_weight_only",
+          "candidate_full": "row4_gemv",
+          "used_path_full": "f_linear_full"
+        }
+      },
+      "results": {
+        "flat_weight_stream": {
+          "elapsed_ms": 1.0712166748046874,
+          "effective_weight_bandwidth_gb_s": 580.9560947260908,
+          "bw_vs_flat": 1.0
+        },
+        "f_linear_full": {
+          "elapsed_ms": 1.098894287109375,
+          "effective_weight_bandwidth_gb_s": 566.3236794478471,
+          "bw_vs_flat": 0.9748132166766533
+        },
+        "row2_weight_only": {
+          "elapsed_ms": 1.0737735595703124,
+          "effective_weight_bandwidth_gb_s": 579.5727138681225,
+          "bw_vs_flat": 0.9976187858763741
+        },
+        "row2_gemv": {
+          "elapsed_ms": 1.0773094482421874,
+          "effective_weight_bandwidth_gb_s": 577.6704706483697,
+          "bw_vs_flat": 0.9943444537245621
+        },
+        "row4_weight_only": {
+          "elapsed_ms": 1.0741053466796875,
+          "effective_weight_bandwidth_gb_s": 579.3936860325368,
+          "bw_vs_flat": 0.9973106251784989
+        },
+        "row4_gemv": {
+          "elapsed_ms": 1.08368994140625,
+          "effective_weight_bandwidth_gb_s": 574.2692925546894,
+          "bw_vs_flat": 0.9884900042669247
+        }
+      },
+      "derived": {
+        "candidate_pattern_loss_vs_flat": 0.0026893748215011115,
+        "candidate_compute_loss_vs_pattern": 0.00884440683663179,
+        "used_path_bw_vs_flat": 0.9748132166766533
+      }
+    }
+  }
+}

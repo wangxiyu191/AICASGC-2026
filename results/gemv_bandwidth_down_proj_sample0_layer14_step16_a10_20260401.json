@@ -1,0 +1,58 @@
+{
+  "meta": {
+    "sample_idx": 0,
+    "layer_idx": 14,
+    "decode_step": 16,
+    "target": "down_proj",
+    "x_shape": [
+      1,
+      1,
+      6144
+    ],
+    "weight_shape": [
+      2048,
+      6144
+    ],
+    "has_bias": false,
+    "warmup": 20,
+    "iters": 300,
+    "capture_repeats": 20,
+    "prompt_length": 690,
+    "max_cache_len": 832,
+    "device": "cuda:0",
+    "device_name": "NVIDIA A10"
+  },
+  "results": {
+    "flat_weight_stream": {
+      "elapsed_ms": 0.045351252237955726,
+      "effective_weight_bandwidth_gb_s": 554.9091316807791,
+      "bw_vs_flat": 1.0
+    },
+    "row4_weight_only": {
+      "elapsed_ms": 0.04543914794921875,
+      "effective_weight_bandwidth_gb_s": 553.835737151684,
+      "bw_vs_flat": 0.9980656390969026
+    },
+    "xwarp_weight_only": {
+      "elapsed_ms": 0.04547720336914062,
+      "effective_weight_bandwidth_gb_s": 553.3722862359808,
+      "bw_vs_flat": 0.9972304556601128
+    },
+    "row4_gemv": {
+      "elapsed_ms": 0.04649250284830729,
+      "effective_weight_bandwidth_gb_s": 541.2877874548809,
+      "bw_vs_flat": 0.9754530184344956
+    },
+    "xwarp_gemv": {
+      "elapsed_ms": 0.04537732442220052,
+      "effective_weight_bandwidth_gb_s": 554.5903007822077,
+      "bw_vs_flat": 0.9994254358409895
+    }
+  },
+  "derived": {
+    "row4_pattern_loss_vs_flat": 0.0019343609030973985,
+    "xwarp_pattern_loss_vs_flat": 0.0027695443398871866,
+    "row4_compute_loss_vs_pattern": 0.022656446406538966,
+    "xwarp_compute_loss_vs_pattern": -0.0022010761588944217
+  }
+}

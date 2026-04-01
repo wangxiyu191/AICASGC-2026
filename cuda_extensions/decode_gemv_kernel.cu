@@ -82,6 +82,13 @@ __device__ inline float warp_sum(float v) {
     return v;
 }
 
+__device__ inline unsigned int warp_sum_u32(unsigned int v) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        v += __shfl_down_sync(0xffffffff, v, offset);
+    }
+    return v;
+}
+
 __device__ inline void accumulate_hfma2_uint4(
     const uint4& x_vec,
     const uint4& w_vec,
@@ -725,6 +732,119 @@ __global__ void nosplit_matvec_k6144_hfma2_fwd_kernel(
     }
 }
 
+__global__ void weight_stream_read_half_fwd_kernel(
+    const at::Half* __restrict__ weight,
+    int32_t* __restrict__ out,
+    int64_t num_vecs) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps_per_block = blockDim.x >> 5;
+    const int64_t global_tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+    const uint4* weight_vec = reinterpret_cast<const uint4*>(weight);
+
+    unsigned int sum = 0;
+    for (int64_t vec_idx = global_tid; vec_idx < num_vecs; vec_idx += stride) {
+        const uint4 value = weight_vec[vec_idx];
+        sum += value.x + value.y + value.z + value.w;
+    }
+    sum = warp_sum_u32(sum);
+    if (lane == 0) {
+        out[blockIdx.x * warps_per_block + warp] = static_cast<int32_t>(sum);
+    }
+}
+
+__global__ void nosplit_weight_only_k6144_row4_fwd_kernel(
+    const at::Half* __restrict__ weight,
+    int32_t* __restrict__ out,
+    int64_t stride_wn,
+    int n) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row_base = blockIdx.x * kRowsPerBlock;
+    const int row = row_base + warp;
+    const __half* w_half = reinterpret_cast<const __half*>(weight);
+    constexpr int kVecsPerTile = kNosplitSpecializedTileK6144 / kHalfPerVec128;
+
+    unsigned int sum = 0;
+    if (row < n) {
+        #pragma unroll
+        for (int tile_idx = 0; tile_idx < 3; ++tile_idx) {
+            const int tile_start = tile_idx * kNosplitSpecializedTileK6144;
+            const uint4* w_row_vec = reinterpret_cast<const uint4*>(w_half + row * stride_wn + tile_start);
+            #pragma unroll
+            for (int vec_idx = lane; vec_idx < kVecsPerTile; vec_idx += 64) {
+                const uint4 w_vec0 = w_row_vec[vec_idx];
+                const uint4 w_vec1 = w_row_vec[vec_idx + 32];
+                sum += w_vec0.x + w_vec0.y + w_vec0.z + w_vec0.w;
+                sum += w_vec1.x + w_vec1.y + w_vec1.z + w_vec1.w;
+            }
+        }
+        sum = warp_sum_u32(sum);
+        if (lane == 0) {
+            out[row] = static_cast<int32_t>(sum);
+        }
+    }
+}
+
+__global__ void nosplit_weight_only_k2048_row4_fwd_kernel(
+    const at::Half* __restrict__ weight,
+    int32_t* __restrict__ out,
+    int64_t stride_wn,
+    int n) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row_base = blockIdx.x * kRowsPerBlock;
+    const int row = row_base + warp;
+    const __half* w_half = reinterpret_cast<const __half*>(weight);
+    constexpr int kVecsK2048 = kNosplitSpecializedK2048 / kHalfPerVec128;
+
+    unsigned int sum = 0;
+    if (row < n) {
+        const uint4* w_row_vec = reinterpret_cast<const uint4*>(w_half + row * stride_wn);
+        #pragma unroll
+        for (int vec_idx = lane; vec_idx < kVecsK2048; vec_idx += 64) {
+            const uint4 w_vec0 = w_row_vec[vec_idx];
+            const uint4 w_vec1 = w_row_vec[vec_idx + 32];
+            sum += w_vec0.x + w_vec0.y + w_vec0.z + w_vec0.w;
+            sum += w_vec1.x + w_vec1.y + w_vec1.z + w_vec1.w;
+        }
+        sum = warp_sum_u32(sum);
+        if (lane == 0) {
+            out[row] = static_cast<int32_t>(sum);
+        }
+    }
+}
+
+__global__ void nosplit_weight_only_k2048_row2_fwd_kernel(
+    const at::Half* __restrict__ weight,
+    int32_t* __restrict__ out,
+    int64_t stride_wn,
+    int n) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row_base = blockIdx.x * 2;
+    const int row = row_base + warp;
+    const __half* w_half = reinterpret_cast<const __half*>(weight);
+    constexpr int kVecsK2048 = kNosplitSpecializedK2048 / kHalfPerVec128;
+
+    unsigned int sum = 0;
+    if (row < n) {
+        const uint4* w_row_vec = reinterpret_cast<const uint4*>(w_half + row * stride_wn);
+        #pragma unroll
+        for (int vec_idx = lane; vec_idx < kVecsK2048; vec_idx += 64) {
+            const uint4 w_vec0 = w_row_vec[vec_idx];
+            const uint4 w_vec1 = w_row_vec[vec_idx + 32];
+            sum += w_vec0.x + w_vec0.y + w_vec0.z + w_vec0.w;
+            sum += w_vec1.x + w_vec1.y + w_vec1.z + w_vec1.w;
+        }
+        sum = warp_sum_u32(sum);
+        if (lane == 0) {
+            out[row] = static_cast<int32_t>(sum);
+        }
+    }
+}
+
 template <bool kProfile>
 __global__ void nosplit_matvec_k6144_weight_async_fwd_kernel(
     const at::Half* __restrict__ x,
@@ -1216,6 +1336,99 @@ __global__ void nosplit_matvec_k6144_n8k1024_xwarp_w_async_fwd_kernel(
     if constexpr (kProfile) {
         __syncthreads();
         maybe_record_profile<kProfile>(profile, kProfileKernelDone);
+    }
+}
+
+__global__ void nosplit_weight_only_k6144_n8k1024_xwarp_w_async_fwd_kernel(
+    const at::Half* __restrict__ weight,
+    int32_t* __restrict__ out,
+    int64_t stride_wn,
+    int n) {
+    __shared__ __align__(16) uint4 w_sh[2][kRowsPerBlockAsync][kAsyncVecsPerTileK6144];
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row_base = blockIdx.x * kRowsPerBlockAsync;
+    const int row = row_base + warp;
+    const __half* w_half = reinterpret_cast<const __half*>(weight);
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    constexpr bool kUseCpAsync = true;
+#else
+    constexpr bool kUseCpAsync = false;
+#endif
+
+    if (row < n) {
+        const uint4* w_row_vec = reinterpret_cast<const uint4*>(w_half + row * stride_wn);
+        for (int vec_idx = lane; vec_idx < kAsyncVecsPerTileK6144; vec_idx += 32) {
+            if constexpr (kUseCpAsync) {
+                cp_async_cg_16(&w_sh[0][warp][vec_idx], w_row_vec + vec_idx);
+            } else {
+                w_sh[0][warp][vec_idx] = w_row_vec[vec_idx];
+            }
+        }
+    } else {
+        for (int vec_idx = lane; vec_idx < kAsyncVecsPerTileK6144; vec_idx += 32) {
+            w_sh[0][warp][vec_idx] = zero_uint4();
+        }
+    }
+    if constexpr (kUseCpAsync) {
+        cp_async_commit_group();
+        cp_async_wait_group<0>();
+    }
+    __syncthreads();
+
+    unsigned int sum = 0;
+    #pragma unroll
+    for (int tile_idx = 0; tile_idx < 6; ++tile_idx) {
+        const int stage = tile_idx & 1;
+        const int tile_start = tile_idx * kNosplitAsyncTileK6144;
+
+        if (tile_idx + 1 < 6) {
+            const int next_tile_start = tile_start + kNosplitAsyncTileK6144;
+            if (row < n) {
+                const uint4* w_row_next_vec = reinterpret_cast<const uint4*>(w_half + row * stride_wn + next_tile_start);
+                for (int vec_idx = lane; vec_idx < kAsyncVecsPerTileK6144; vec_idx += 32) {
+                    if constexpr (kUseCpAsync) {
+                        cp_async_cg_16(&w_sh[stage ^ 1][warp][vec_idx], w_row_next_vec + vec_idx);
+                    } else {
+                        w_sh[stage ^ 1][warp][vec_idx] = w_row_next_vec[vec_idx];
+                    }
+                }
+            } else {
+                for (int vec_idx = lane; vec_idx < kAsyncVecsPerTileK6144; vec_idx += 32) {
+                    w_sh[stage ^ 1][warp][vec_idx] = zero_uint4();
+                }
+            }
+            if constexpr (kUseCpAsync) {
+                cp_async_commit_group();
+            }
+        }
+
+        if (row < n) {
+            const uint4* w_sh_row_vec = &w_sh[stage][warp][0];
+            #pragma unroll
+            for (int vec_idx = lane; vec_idx < kAsyncVecsPerTileK6144; vec_idx += 64) {
+                const uint4 w_vec0 = w_sh_row_vec[vec_idx];
+                const uint4 w_vec1 = w_sh_row_vec[vec_idx + 32];
+                sum += w_vec0.x + w_vec0.y + w_vec0.z + w_vec0.w;
+                sum += w_vec1.x + w_vec1.y + w_vec1.z + w_vec1.w;
+            }
+        }
+
+        if constexpr (kUseCpAsync) {
+            if (tile_idx + 1 < 6) {
+                cp_async_wait_group<0>();
+            }
+        }
+        __syncthreads();
+    }
+
+    if (row < n) {
+        sum = warp_sum_u32(sum);
+        if (lane == 0) {
+            out[row] = static_cast<int32_t>(sum);
+        }
     }
 }
 
@@ -3864,5 +4077,104 @@ torch::Tensor nosplit_matvec_half_profile_xwarp_sms2_balanced_cta_trace_cuda(
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
+    return out;
+}
+
+torch::Tensor weight_stream_read_half_cuda(
+    const torch::Tensor& weight,
+    const torch::Tensor& out) {
+    TORCH_CHECK(weight.is_cuda(), "weight must be CUDA");
+    TORCH_CHECK(out.is_cuda(), "out must be CUDA");
+    TORCH_CHECK(weight.scalar_type() == torch::kFloat16, "weight stream read only supports fp16");
+    TORCH_CHECK(weight.is_contiguous(), "weight stream read requires contiguous weight");
+    TORCH_CHECK(weight.dim() == 2, "weight must be [N, K]");
+    TORCH_CHECK(out.scalar_type() == torch::kInt, "out must be int32");
+    TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
+
+    constexpr int kWeightStreamThreads = 256;
+    const int warps_per_block = kWeightStreamThreads / 32;
+    TORCH_CHECK(out.numel() % warps_per_block == 0, "out size must be divisible by warps_per_block");
+
+    const int64_t num_vecs = weight.numel() / kHalfPerVec128;
+    TORCH_CHECK(
+        num_vecs * kHalfPerVec128 == weight.numel(),
+        "weight stream read requires element count divisible by 8");
+
+    const int grid_blocks = static_cast<int>(out.numel() / warps_per_block);
+    TORCH_CHECK(grid_blocks > 0, "weight stream read requires non-empty output");
+
+    c10::cuda::CUDAGuard device_guard(weight.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+    weight_stream_read_half_fwd_kernel<<<grid_blocks, kWeightStreamThreads, 0, stream>>>(
+        weight.data_ptr<at::Half>(),
+        out.data_ptr<int32_t>(),
+        num_vecs);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+torch::Tensor nosplit_weight_only_half_variant_cuda(
+    const torch::Tensor& weight,
+    const torch::Tensor& out,
+    int64_t variant) {
+    TORCH_CHECK(weight.is_cuda(), "weight must be CUDA");
+    TORCH_CHECK(out.is_cuda(), "out must be CUDA");
+    TORCH_CHECK(weight.scalar_type() == torch::kFloat16, "nosplit weight-only variant only supports fp16");
+    TORCH_CHECK(weight.stride(1) == 1, "nosplit weight-only variant requires contiguous weight");
+    TORCH_CHECK(weight.dim() == 2, "weight must be [N, K]");
+    TORCH_CHECK(out.scalar_type() == torch::kInt, "out must be int32");
+    TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
+
+    const int n = static_cast<int>(weight.size(0));
+    const int k = static_cast<int>(weight.size(1));
+    TORCH_CHECK(k == 2048 || k == 6144, "nosplit weight-only variant currently supports only k=2048/6144");
+    TORCH_CHECK(out.numel() == n, "out size mismatch");
+
+    c10::cuda::CUDAGuard device_guard(weight.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    switch (variant) {
+        case kNosplitVariantK2048Row2: {
+            const int grid_blocks = (n + 1) / 2;
+            nosplit_weight_only_k2048_row2_fwd_kernel<<<grid_blocks, kRow2Threads, 0, stream>>>(
+                weight.data_ptr<at::Half>(),
+                out.data_ptr<int32_t>(),
+                weight.stride(0),
+                n);
+            break;
+        }
+        case kNosplitVariantK2048Row4: {
+            const int grid_blocks = (n + kRowsPerBlock - 1) / kRowsPerBlock;
+            nosplit_weight_only_k2048_row4_fwd_kernel<<<grid_blocks, kRow4Threads, 0, stream>>>(
+                weight.data_ptr<at::Half>(),
+                out.data_ptr<int32_t>(),
+                weight.stride(0),
+                n);
+            break;
+        }
+        case kNosplitVariantK6144Row4: {
+            const int grid_blocks = (n + kRowsPerBlock - 1) / kRowsPerBlock;
+            nosplit_weight_only_k6144_row4_fwd_kernel<<<grid_blocks, kRow4Threads, 0, stream>>>(
+                weight.data_ptr<at::Half>(),
+                out.data_ptr<int32_t>(),
+                weight.stride(0),
+                n);
+            break;
+        }
+        case kNosplitVariantK6144N8K1024XWarpWAsync: {
+            const int grid_blocks = (n + kRowsPerBlockAsync - 1) / kRowsPerBlockAsync;
+            nosplit_weight_only_k6144_n8k1024_xwarp_w_async_fwd_kernel<<<grid_blocks, kRow8Threads, 0, stream>>>(
+                weight.data_ptr<at::Half>(),
+                out.data_ptr<int32_t>(),
+                weight.stride(0),
+                n);
+            break;
+        }
+        default:
+            TORCH_CHECK(
+                false,
+                "nosplit weight-only variant currently supports only k2048_row2, k2048_row4, k6144_row4 and k6144_n8k1024_xwarp_w_async");
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }

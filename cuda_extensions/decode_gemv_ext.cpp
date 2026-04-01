@@ -131,6 +131,15 @@ torch::Tensor nosplit_matvec_half_profile_xwarp_sms2_balanced_cta_trace_cuda(
 torch::Tensor nosplit_xwarp_wait_sync_calibration_cuda(
     const torch::Tensor& trace);
 
+torch::Tensor weight_stream_read_half_cuda(
+    const torch::Tensor& weight,
+    const torch::Tensor& out);
+
+torch::Tensor nosplit_weight_only_half_variant_cuda(
+    const torch::Tensor& weight,
+    const torch::Tensor& out,
+    int64_t variant);
+
 torch::Tensor splitk_matvec(
     const torch::Tensor& x,
     const torch::Tensor& weight,
@@ -296,6 +305,19 @@ torch::Tensor nosplit_xwarp_wait_sync_calibration(
     return nosplit_xwarp_wait_sync_calibration_cuda(trace);
 }
 
+torch::Tensor weight_stream_read_half(
+    const torch::Tensor& weight,
+    const torch::Tensor& out) {
+    return weight_stream_read_half_cuda(weight, out);
+}
+
+torch::Tensor nosplit_weight_only_half_variant(
+    const torch::Tensor& weight,
+    const torch::Tensor& out,
+    int64_t variant) {
+    return nosplit_weight_only_half_variant_cuda(weight, out, variant);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("splitk_matvec", &splitk_matvec);
     m.def("splitk_matvec_row4", &splitk_matvec_row4);
@@ -313,4 +335,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("nosplit_matvec_half_profile_xwarp_sms2_cta_trace", &nosplit_matvec_half_profile_xwarp_sms2_cta_trace);
     m.def("nosplit_matvec_half_profile_xwarp_sms2_balanced_cta_trace", &nosplit_matvec_half_profile_xwarp_sms2_balanced_cta_trace);
     m.def("nosplit_xwarp_wait_sync_calibration", &nosplit_xwarp_wait_sync_calibration);
+    m.def("weight_stream_read_half", &weight_stream_read_half);
+    m.def("nosplit_weight_only_half_variant", &nosplit_weight_only_half_variant);
 }

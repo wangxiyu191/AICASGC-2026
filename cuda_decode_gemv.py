@@ -593,6 +593,69 @@ def nosplit_matvec_half_variant(
     return out_vec.view(*x.shape[:-1], n)
 
 
+def weight_stream_read_half(
+    weight: torch.Tensor,
+    workspace: dict | None = None,
+) -> torch.Tensor:
+    if (
+        weight.device.type != "cuda"
+        or weight.dtype != torch.float16
+        or weight.ndim != 2
+        or not weight.is_contiguous()
+    ):
+        raise RuntimeError("weight_stream_read_half expects contiguous fp16 CUDA weight tensor [N, K]")
+
+    num_sms = torch.cuda.get_device_properties(weight.device).multi_processor_count
+    grid_blocks = min(max(1, (weight.numel() // 8 + 255) // 256), max(1, num_sms * 8))
+    out_elems = grid_blocks * 8
+
+    if (
+        workspace is not None
+        and workspace.get("type") == "weight_stream_read_half"
+        and tuple(workspace["out"].shape) == (out_elems,)
+        and workspace["out"].device == weight.device
+        and workspace["out"].dtype == torch.int32
+    ):
+        out = workspace["out"]
+    else:
+        out = torch.empty((out_elems,), dtype=torch.int32, device=weight.device)
+
+    ext = _load_ext()
+    ext.weight_stream_read_half(weight, out)
+    return out
+
+
+def nosplit_weight_only_half_variant(
+    weight: torch.Tensor,
+    variant: str,
+    workspace: dict | None = None,
+) -> torch.Tensor:
+    if variant not in NOSPLIT_VARIANTS:
+        raise ValueError(f"unknown nosplit variant: {variant}")
+    if (
+        weight.device.type != "cuda"
+        or weight.dtype != torch.float16
+        or weight.ndim != 2
+    ):
+        raise RuntimeError("nosplit_weight_only_half_variant expects fp16 CUDA weight tensor [N, K]")
+
+    n, _k = weight.shape
+    if (
+        workspace is not None
+        and workspace.get("type") == f"nosplit_weight_only:{variant}"
+        and tuple(workspace["out"].shape) == (n,)
+        and workspace["out"].device == weight.device
+        and workspace["out"].dtype == torch.int32
+    ):
+        out = workspace["out"]
+    else:
+        out = torch.empty((n,), dtype=torch.int32, device=weight.device)
+
+    ext = _load_ext()
+    ext.nosplit_weight_only_half_variant(weight, out, NOSPLIT_VARIANTS[variant])
+    return out
+
+
 def nosplit_matvec_half_profile(
     x: torch.Tensor,
     weight: torch.Tensor,
