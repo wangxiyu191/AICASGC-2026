@@ -18,6 +18,10 @@ import torch
 import torch.nn.functional as F
 from datasets import load_from_disk
 
+from benchmark_cuda_utils import (
+    DEFAULT_BENCHMARK_L2_FLUSH_MB,
+    make_l2_flush_runner,
+)
 import cuda_decode_gemv
 from bench_decode_attention import _prepare_inputs
 from bench_decode_linears import (
@@ -31,6 +35,7 @@ from bench_decode_linears import (
 from evaluation_wrapper import VLMModel
 
 ALL_TARGETS = ("qkv", "gate_up", "o_proj", "down_proj", "lm_head")
+DEFAULT_L2_FLUSH_MB = DEFAULT_BENCHMARK_L2_FLUSH_MB
 
 
 def _f_linear(x, weight, bias):
@@ -176,6 +181,7 @@ def _run_one_target(
     variants, labels = _build_variants(target, weight)
 
     results: dict[str, dict] = {}
+    pre_replay = _make_l2_flush_runner(args.l2_flush_mb)
     for name, fn in variants.items():
         _, elapsed_ms = _bench_impl_graph(
             fn,
@@ -185,6 +191,7 @@ def _run_one_target(
             warmup=args.warmup,
             iters=args.iters,
             capture_repeats=args.capture_repeats,
+            pre_replay=pre_replay,
         )
         results[name] = {
             "elapsed_ms": elapsed_ms,
@@ -205,6 +212,7 @@ def _run_one_target(
             "has_bias": bias is not None,
             "prompt_length": int(capture_meta["prompt_length"]),
             "max_cache_len": int(capture_meta["max_cache_len"]),
+            "l2_flush_mb": int(args.l2_flush_mb),
             "labels": labels,
         },
         "results": results,
@@ -224,6 +232,7 @@ def main():
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=300)
     parser.add_argument("--capture-repeats", type=int, default=20)
+    parser.add_argument("--l2-flush-mb", type=int, default=DEFAULT_L2_FLUSH_MB)
     parser.add_argument("--bucketed", action="store_true", default=True)
     parser.add_argument("--no-bucketed", dest="bucketed", action="store_false")
     parser.add_argument(
@@ -232,6 +241,12 @@ def main():
         default="results/gemv_bandwidth_all_sample0_layer14_step16.json",
     )
     args = parser.parse_args()
+    if args.l2_flush_mb > 0 and args.capture_repeats != 1:
+        print(
+            f"[bench_gemv_bandwidth] l2 flush enabled ({args.l2_flush_mb} MiB); "
+            f"forcing capture_repeats from {args.capture_repeats} to 1 so every measured kernel runs cold."
+        )
+        args.capture_repeats = 1
 
     vlm = VLMModel(args.model_path)
     dataset = load_from_disk(args.dataset_path)

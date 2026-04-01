@@ -34,6 +34,11 @@ from transformers.cache_utils import StaticCache
 
 import cuda_decode_attention
 import optimized_layer
+from benchmark_cuda_utils import (
+    DEFAULT_BENCHMARK_L2_FLUSH_MB,
+    benchmark_style_cuda_reset,
+    make_l2_flush_runner,
+)
 from benchmark import get_system_info
 from evaluation_wrapper import VLMModel
 from optimized_layer import set_small_decode_triton_enabled
@@ -435,11 +440,6 @@ def _bench_impl(
     return out, elapsed_ms
 
 
-def _benchmark_style_cuda_reset():
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize()
-
-
 def _bench_impl_graph(
     fn,
     q,
@@ -452,6 +452,7 @@ def _bench_impl_graph(
     warmup: int,
     iters: int,
     capture_repeats: int,
+    pre_replay=None,
 ):
     """Benchmark using CUDAGraph replay and GPU-side timing.
 
@@ -464,7 +465,7 @@ def _bench_impl_graph(
     torch.cuda.synchronize()
 
     # Capture CUDAGraph
-    _benchmark_style_cuda_reset()
+    benchmark_style_cuda_reset()
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
@@ -476,25 +477,52 @@ def _bench_impl_graph(
     torch.cuda.synchronize()
 
     # Warmup replays
-    _benchmark_style_cuda_reset()
+    benchmark_style_cuda_reset()
     for _ in range(warmup):
+        if pre_replay is not None:
+            pre_replay()
         graph.replay()
     torch.cuda.synchronize()
 
     # Timed replays using GPU events
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    _benchmark_style_cuda_reset()
-    start.record()
-    for _ in range(iters):
-        graph.replay()
-    end.record()
-    end.synchronize()
-    elapsed_ms = start.elapsed_time(end) / (iters * capture_repeats)
+    benchmark_style_cuda_reset()
+    if pre_replay is None:
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(iters):
+            graph.replay()
+        end.record()
+        end.synchronize()
+        elapsed_ms = start.elapsed_time(end) / (iters * capture_repeats)
+    else:
+        start_events = []
+        end_events = []
+        for _ in range(iters):
+            pre_replay()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            graph.replay()
+            end.record()
+            start_events.append(start)
+            end_events.append(end)
+        torch.cuda.synchronize()
+        total_elapsed_ms = sum(
+            start.elapsed_time(end) for start, end in zip(start_events, end_events)
+        )
+        elapsed_ms = total_elapsed_ms / (iters * capture_repeats)
     return out, elapsed_ms
 
 
-def _run_benchmarks(payload, warmup: int, iters: int, use_graph: bool = False, graph_capture_repeats: int = 1):
+def _run_benchmarks(
+    payload,
+    warmup: int,
+    iters: int,
+    use_graph: bool = False,
+    graph_capture_repeats: int = 1,
+    l2_flush_mb: int = DEFAULT_BENCHMARK_L2_FLUSH_MB,
+):
     q = payload["q"]
     k = payload["k"]
     v = payload["v"]
@@ -518,6 +546,7 @@ def _run_benchmarks(payload, warmup: int, iters: int, use_graph: bool = False, g
     }
 
     if use_graph:
+        pre_replay = make_l2_flush_runner(payload["q"].device, l2_flush_mb)
         bench_fn = lambda fn, q, k, v, attention_mask, scaling, num_key_value_groups, cache_position, warmup, iters: _bench_impl_graph(
             fn,
             q,
@@ -530,6 +559,7 @@ def _run_benchmarks(payload, warmup: int, iters: int, use_graph: bool = False, g
             warmup=warmup,
             iters=iters,
             capture_repeats=graph_capture_repeats,
+            pre_replay=pre_replay,
         )
     else:
         bench_fn = _bench_impl
@@ -605,6 +635,7 @@ def main():
             "Default: 1 for realistic, 64 for idealized"
         ),
     )
+    parser.add_argument("--l2-flush-mb", type=int, default=DEFAULT_BENCHMARK_L2_FLUSH_MB)
     parser.add_argument("--output", type=str, default=None, help="Output JSON path (default: results/...)")
     args = parser.parse_args()
 
@@ -615,6 +646,12 @@ def main():
         )
     if args.graph_capture_repeats is None:
         args.graph_capture_repeats = 1 if args.timing_profile == "realistic" else 64
+    if args.graph and args.l2_flush_mb > 0 and args.graph_capture_repeats != 1:
+        print(
+            f"[AttentionBench] l2 flush enabled ({args.l2_flush_mb} MiB); "
+            f"forcing graph_capture_repeats from {args.graph_capture_repeats} to 1 so every replay runs cold."
+        )
+        args.graph_capture_repeats = 1
 
     print("[AttentionBench] Loading model...")
     vlm = VLMModel(args.model_path)
@@ -661,6 +698,7 @@ def main():
         "timer": "cuda_event",
         "timing_profile": args.timing_profile,
         "graph_capture_repeats": int(args.graph_capture_repeats if args.graph else 1),
+        "l2_flush_mb": int(args.l2_flush_mb if args.graph else 0),
     }
 
     print(
@@ -679,6 +717,7 @@ def main():
         iters=args.iters,
         use_graph=args.graph,
         graph_capture_repeats=args.graph_capture_repeats,
+        l2_flush_mb=args.l2_flush_mb,
     )
 
     print("\n[AttentionBench] Summary")

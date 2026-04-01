@@ -26,6 +26,11 @@ import triton.language as tl
 from datasets import load_from_disk
 from transformers.cache_utils import StaticCache
 
+from benchmark_cuda_utils import (
+    DEFAULT_BENCHMARK_L2_FLUSH_MB,
+    benchmark_style_cuda_reset,
+    make_l2_flush_runner,
+)
 from benchmark import get_system_info
 from bench_decode_attention import _prepare_inputs
 import cuda_decode_gemv
@@ -514,12 +519,16 @@ def _bench_impl(fn, x, weight, bias, warmup: int, iters: int):
     return out, elapsed_ms
 
 
-def _benchmark_style_cuda_reset():
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize()
-
-
-def _bench_impl_graph(fn, x, weight, bias, warmup: int, iters: int, capture_repeats: int):
+def _bench_impl_graph(
+    fn,
+    x,
+    weight,
+    bias,
+    warmup: int,
+    iters: int,
+    capture_repeats: int,
+    pre_replay=None,
+):
     """Benchmark using CUDAGraph replay and GPU-side timing."""
     # Eager warmup to JIT-compile Triton kernels
     for _ in range(warmup):
@@ -527,7 +536,7 @@ def _bench_impl_graph(fn, x, weight, bias, warmup: int, iters: int, capture_repe
     torch.cuda.synchronize()
 
     # Capture CUDAGraph
-    _benchmark_style_cuda_reset()
+    benchmark_style_cuda_reset()
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
@@ -539,25 +548,52 @@ def _bench_impl_graph(fn, x, weight, bias, warmup: int, iters: int, capture_repe
     torch.cuda.synchronize()
 
     # Warmup replays
-    _benchmark_style_cuda_reset()
+    benchmark_style_cuda_reset()
     for _ in range(warmup):
+        if pre_replay is not None:
+            pre_replay()
         graph.replay()
     torch.cuda.synchronize()
 
     # Timed replays using GPU events
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    _benchmark_style_cuda_reset()
-    start.record()
-    for _ in range(iters):
-        graph.replay()
-    end.record()
-    end.synchronize()
-    elapsed_ms = start.elapsed_time(end) / (iters * capture_repeats)
+    benchmark_style_cuda_reset()
+    if pre_replay is None:
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(iters):
+            graph.replay()
+        end.record()
+        end.synchronize()
+        elapsed_ms = start.elapsed_time(end) / (iters * capture_repeats)
+    else:
+        start_events = []
+        end_events = []
+        for _ in range(iters):
+            pre_replay()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            graph.replay()
+            end.record()
+            start_events.append(start)
+            end_events.append(end)
+        torch.cuda.synchronize()
+        total_elapsed_ms = sum(
+            start.elapsed_time(end) for start, end in zip(start_events, end_events)
+        )
+        elapsed_ms = total_elapsed_ms / (iters * capture_repeats)
     return out, elapsed_ms
 
 
-def _run_benchmarks(payload, warmup: int, iters: int, use_graph: bool = False, graph_capture_repeats: int = 1):
+def _run_benchmarks(
+    payload,
+    warmup: int,
+    iters: int,
+    use_graph: bool = False,
+    graph_capture_repeats: int = 1,
+    l2_flush_mb: int = DEFAULT_BENCHMARK_L2_FLUSH_MB,
+):
     variants = {
         "f_linear": _module_linear,
         "f_linear_contiguous_weight": _f_linear_contig,
@@ -598,6 +634,7 @@ def _run_benchmarks(payload, warmup: int, iters: int, use_graph: bool = False, g
         "cuda_nosplit_persistent_hfma2_matvec": _cuda_nosplit_persistent_hfma2_matvec,
     }
     if use_graph:
+        pre_replay = make_l2_flush_runner(payload["x"].device, l2_flush_mb)
         bench_fn = lambda fn, x, weight, bias, warmup, iters: _bench_impl_graph(
             fn,
             x,
@@ -606,6 +643,7 @@ def _run_benchmarks(payload, warmup: int, iters: int, use_graph: bool = False, g
             warmup=warmup,
             iters=iters,
             capture_repeats=graph_capture_repeats,
+            pre_replay=pre_replay,
         )
     else:
         bench_fn = _bench_impl
@@ -679,6 +717,7 @@ def main():
             "Default: 1 for realistic, 64 for idealized"
         ),
     )
+    parser.add_argument("--l2-flush-mb", type=int, default=DEFAULT_BENCHMARK_L2_FLUSH_MB)
     parser.add_argument("--output", type=str, default=None)
     args = parser.parse_args()
 
@@ -689,6 +728,12 @@ def main():
         )
     if args.graph_capture_repeats is None:
         args.graph_capture_repeats = 1 if args.timing_profile == "realistic" else 64
+    if args.graph and args.l2_flush_mb > 0 and args.graph_capture_repeats != 1:
+        print(
+            f"[LinearBench] l2 flush enabled ({args.l2_flush_mb} MiB); "
+            f"forcing graph_capture_repeats from {args.graph_capture_repeats} to 1 so every replay runs cold."
+        )
+        args.graph_capture_repeats = 1
 
     print("[LinearBench] Loading model...")
     vlm = VLMModel(args.model_path)
@@ -748,12 +793,13 @@ def main():
             "timer": "cuda_event",
             "timing_profile": args.timing_profile,
             "graph_capture_repeats": int(args.graph_capture_repeats if args.graph else 1),
+            "l2_flush_mb": int(args.l2_flush_mb if args.graph else 0),
         },
-        "qkv_benchmarks": _run_benchmarks(payloads["qkv"], warmup=args.warmup, iters=args.iters, use_graph=args.graph, graph_capture_repeats=args.graph_capture_repeats),
-        "gate_up_benchmarks": _run_benchmarks(payloads["gate_up"], warmup=args.warmup, iters=args.iters, use_graph=args.graph, graph_capture_repeats=args.graph_capture_repeats),
-        "o_proj_benchmarks": _run_benchmarks(payloads["o_proj"], warmup=args.warmup, iters=args.iters, use_graph=args.graph, graph_capture_repeats=args.graph_capture_repeats),
-        "down_proj_benchmarks": _run_benchmarks(payloads["down_proj"], warmup=args.warmup, iters=args.iters, use_graph=args.graph, graph_capture_repeats=args.graph_capture_repeats),
-        "lm_head_benchmarks": _run_benchmarks(payloads["lm_head"], warmup=args.warmup, iters=args.iters, use_graph=args.graph, graph_capture_repeats=args.graph_capture_repeats),
+        "qkv_benchmarks": _run_benchmarks(payloads["qkv"], warmup=args.warmup, iters=args.iters, use_graph=args.graph, graph_capture_repeats=args.graph_capture_repeats, l2_flush_mb=args.l2_flush_mb),
+        "gate_up_benchmarks": _run_benchmarks(payloads["gate_up"], warmup=args.warmup, iters=args.iters, use_graph=args.graph, graph_capture_repeats=args.graph_capture_repeats, l2_flush_mb=args.l2_flush_mb),
+        "o_proj_benchmarks": _run_benchmarks(payloads["o_proj"], warmup=args.warmup, iters=args.iters, use_graph=args.graph, graph_capture_repeats=args.graph_capture_repeats, l2_flush_mb=args.l2_flush_mb),
+        "down_proj_benchmarks": _run_benchmarks(payloads["down_proj"], warmup=args.warmup, iters=args.iters, use_graph=args.graph, graph_capture_repeats=args.graph_capture_repeats, l2_flush_mb=args.l2_flush_mb),
+        "lm_head_benchmarks": _run_benchmarks(payloads["lm_head"], warmup=args.warmup, iters=args.iters, use_graph=args.graph, graph_capture_repeats=args.graph_capture_repeats, l2_flush_mb=args.l2_flush_mb),
     }
 
     output_path = Path(args.output)

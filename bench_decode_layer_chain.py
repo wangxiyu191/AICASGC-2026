@@ -11,8 +11,8 @@ input_rmsnorm -> qkv_gemv -> q_norm_rope -> k_norm_rope -> attention
 Notes:
 - KV cache update is not replayed here. Attention uses the already-captured
   post-update q/k/v tensors from the real decode path.
-- Replay intentionally calls torch.cuda.empty_cache() + synchronize() before
-  each replay to mimic the user's requested benchmark-style stress case.
+- Replay uses the shared benchmark reset helper and defaults to a 64 MiB L2
+  thrash before each replay so repeated graph runs stay cold.
 - Timing only uses one CUDA event pair around each whole-graph replay. No
   internal per-stage events are inserted into the graph.
 - Optional VizTracer support traces the replay loop directly without adding any
@@ -37,6 +37,11 @@ import torch
 from datasets import load_from_disk
 from transformers.cache_utils import StaticCache
 
+from benchmark_cuda_utils import (
+    DEFAULT_BENCHMARK_L2_FLUSH_MB,
+    benchmark_style_cuda_reset,
+    make_l2_flush_runner,
+)
 import cuda_decode_gemv
 import optimized_layer
 from benchmark import get_system_info
@@ -248,11 +253,6 @@ def _run_layer_chain_capture(
     )
 
 
-def _benchmark_style_cuda_reset():
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize()
-
-
 def _decode_gemv(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None):
     if (
         x.device.type == "cuda"
@@ -294,7 +294,7 @@ def _run_layer_chain_graph(target_layer, payload):
     hidden_shape_kv = (*input_shape, target_layer.num_kv_heads, target_layer.head_dim)
 
     outputs = {}
-    _benchmark_style_cuda_reset()
+    benchmark_style_cuda_reset()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
@@ -429,12 +429,12 @@ def _run_layer_chain_graph(target_layer, payload):
     }
 
 
-def _measure_graph_replay(graph, warmup: int, iters: int) -> dict[str, float]:
+def _measure_graph_replay(graph, warmup: int, iters: int, pre_replay=None) -> dict[str, float]:
     total_start = torch.cuda.Event(enable_timing=True)
     total_end = torch.cuda.Event(enable_timing=True)
 
     for _ in range(warmup):
-        _benchmark_style_cuda_reset()
+        benchmark_style_cuda_reset(pre_replay)
         total_start.record()
         graph.replay()
         total_end.record()
@@ -442,7 +442,7 @@ def _measure_graph_replay(graph, warmup: int, iters: int) -> dict[str, float]:
 
     total_values_ms = []
     for _ in range(iters):
-        _benchmark_style_cuda_reset()
+        benchmark_style_cuda_reset(pre_replay)
         total_start.record()
         graph.replay()
         total_end.record()
@@ -451,11 +451,11 @@ def _measure_graph_replay(graph, warmup: int, iters: int) -> dict[str, float]:
     return _event_stats_ms(total_values_ms)
 
 
-def _trace_graph_replay(graph, warmup: int, trace_iters: int, trace_output: Path):
+def _trace_graph_replay(graph, warmup: int, trace_iters: int, trace_output: Path, pre_replay=None):
     from viztracer import VizTracer
 
     for _ in range(warmup):
-        _benchmark_style_cuda_reset()
+        benchmark_style_cuda_reset(pre_replay)
         graph.replay()
         torch.cuda.synchronize()
 
@@ -463,7 +463,7 @@ def _trace_graph_replay(graph, warmup: int, trace_iters: int, trace_output: Path
     tracer.start()
     try:
         for _ in range(trace_iters):
-            _benchmark_style_cuda_reset()
+            benchmark_style_cuda_reset(pre_replay)
             graph.replay()
             torch.cuda.synchronize()
     finally:
@@ -481,6 +481,7 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
+    parser.add_argument("--l2-flush-mb", type=int, default=DEFAULT_BENCHMARK_L2_FLUSH_MB)
     parser.add_argument("--bucketed", action="store_true", default=True)
     parser.add_argument("--no-bucketed", dest="bucketed", action="store_false")
     parser.add_argument("--viztrace", action="store_true", help="Capture VizTracer trace for the replay loop.")
@@ -522,7 +523,7 @@ def main():
     target_layer = vlm._model.model.language_model.layers[args.layer_idx]
     print(
         "[LayerChain] Benchmarking one-layer chain "
-        f"(warmup={args.warmup}, iters={args.iters}, replay_reset=empty_cache+synchronize)..."
+        f"(warmup={args.warmup}, iters={args.iters}, replay_reset=cold_l2_flush({args.l2_flush_mb}MiB))..."
     )
     previous_small_decode_triton = set_small_decode_triton_enabled(vlm._model, True)
     try:
@@ -533,10 +534,12 @@ def main():
     finally:
         set_small_decode_triton_enabled(vlm._model, previous_small_decode_triton)
 
+    pre_replay = make_l2_flush_runner(payload["layer_input"].device, args.l2_flush_mb)
     total_replay_timing = _measure_graph_replay(
         graph=graph_result["graph"],
         warmup=args.warmup,
         iters=args.iters,
+        pre_replay=pre_replay,
     )
 
     viztrace_output = None
@@ -553,6 +556,7 @@ def main():
             warmup=args.warmup,
             trace_iters=args.viztrace_iters,
             trace_output=viztrace_output,
+            pre_replay=pre_replay,
         )
 
     output = {
@@ -565,10 +569,11 @@ def main():
             "bucketed": bool(args.bucketed),
             "warmup": int(args.warmup),
             "iters": int(args.iters),
+            "l2_flush_mb": int(args.l2_flush_mb),
             "prompt_length": int(capture_meta["prompt_length"]),
             "max_cache_len": int(capture_meta["max_cache_len"]),
             "captured_decode_step": int(capture_meta["captured_decode_step"]),
-            "replay_reset": "torch.cuda.empty_cache + torch.cuda.synchronize",
+            "replay_reset": "cold_l2_flush",
             "timing_mode": "cuda_event_total_replay_only",
             "viztrace_enabled": bool(args.viztrace),
             "viztrace_iters": int(args.viztrace_iters) if args.viztrace else 0,

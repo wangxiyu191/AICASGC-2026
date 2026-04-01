@@ -133,11 +133,25 @@ def _find_prebuilt_ext() -> Path | None:
     return None
 
 
+def _ext_source_files() -> tuple[Path, ...]:
+    files = {_SRC_DIR / "setup_decode_gemv.py"}
+    for pattern in ("*.cpp", "*.cu", "*.cuh", "*.h"):
+        files.update(_SRC_DIR.glob(pattern))
+    return tuple(sorted(path for path in files if path.exists()))
+
+
+def _should_rebuild_ext(prebuilt_ext: Path | None) -> bool:
+    if prebuilt_ext is None:
+        return True
+    ext_mtime_ns = prebuilt_ext.stat().st_mtime_ns
+    return any(path.stat().st_mtime_ns > ext_mtime_ns for path in _ext_source_files())
+
+
 @lru_cache(maxsize=1)
 def _load_ext():
     os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.0")
     prebuilt_ext = _find_prebuilt_ext()
-    if prebuilt_ext is None:
+    if _should_rebuild_ext(prebuilt_ext):
         env = dict(os.environ)
         env.setdefault("TORCH_CUDA_ARCH_LIST", "8.0")
         env["PATH"] = f"/usr/local/cuda/bin:{env.get('PATH', '')}"
@@ -497,6 +511,16 @@ def nosplit_matvec_half(
         out_vec = workspace["out"]
     else:
         out_vec = torch.empty((n,), dtype=x.dtype, device=x.device)
+
+    # Cold-L2 microbench shows the real down_proj shape (2048x6144) is
+    # consistently better on the xwarp async path than the row4 auto path.
+    if n == 2048 and _k == 6144:
+        return nosplit_matvec_half_variant(
+            x,
+            weight,
+            bias,
+            "k6144_n8k1024_xwarp_w_async",
+        )
 
     ext = _load_ext()
     ext.nosplit_matvec_half(
