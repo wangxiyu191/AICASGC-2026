@@ -781,6 +781,98 @@ def fused_silu_downproj_half(
     return out_vec.view(*gate_up.shape[:-1], n)
 
 
+def fused_gateup_silu_downproj_half(
+    x: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_proj_weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    workspace: dict | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if (
+        x.device.type != "cuda"
+        or gate_up_weight.device.type != "cuda"
+        or down_proj_weight.device.type != "cuda"
+        or x.dtype != torch.float16
+        or gate_up_weight.dtype != torch.float16
+        or down_proj_weight.dtype != torch.float16
+        or x.ndim < 2
+        or x.shape[-2] != 1
+    ):
+        raise RuntimeError("fused_gateup_silu_downproj_half expects fp16 CUDA single-token decode tensors")
+
+    x_vec = x.reshape(-1).contiguous()
+    n, _k = down_proj_weight.shape
+    if (
+        workspace is not None
+        and workspace.get("type") == "fused_gateup_silu_downproj"
+        and tuple(workspace["hidden_out"].shape) == (6144,)
+        and tuple(workspace["out"].shape) == (n,)
+        and workspace["hidden_out"].device == x.device
+        and workspace["out"].device == x.device
+        and workspace["hidden_out"].dtype == x.dtype
+        and workspace["out"].dtype == x.dtype
+    ):
+        hidden_out = workspace["hidden_out"]
+        out_vec = workspace["out"]
+    else:
+        hidden_out = torch.empty((6144,), dtype=x.dtype, device=x.device)
+        out_vec = torch.empty((n,), dtype=x.dtype, device=x.device)
+
+    ext = _load_ext()
+    ext.fused_gateup_silu_downproj_half(
+        x_vec,
+        gate_up_weight,
+        down_proj_weight,
+        bias if bias is not None else torch.empty(0, device=x.device, dtype=x.dtype),
+        hidden_out,
+        out_vec,
+        bias is not None,
+    )
+    return hidden_out.view(*x.shape[:-1], 6144), out_vec.view(*x.shape[:-1], n)
+
+
+def fused_gateup_silu_downproj_mega_half(
+    x: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_proj_weight: torch.Tensor,
+    workspace: dict | None = None,
+) -> torch.Tensor:
+    if (
+        x.device.type != "cuda"
+        or gate_up_weight.device.type != "cuda"
+        or down_proj_weight.device.type != "cuda"
+        or x.dtype != torch.float16
+        or gate_up_weight.dtype != torch.float16
+        or down_proj_weight.dtype != torch.float16
+        or x.ndim < 2
+        or x.shape[-2] != 1
+    ):
+        raise RuntimeError("fused_gateup_silu_downproj_mega_half expects fp16 CUDA single-token decode tensors")
+
+    x_vec = x.reshape(-1).contiguous()
+    n, _k = down_proj_weight.shape
+    if (
+        workspace is not None
+        and workspace.get("type") == "fused_gateup_silu_downproj_mega"
+        and tuple(workspace["out"].shape) == (n,)
+        and workspace["out"].device == x.device
+        and workspace["out"].dtype == x.dtype
+    ):
+        out_vec = workspace["out"]
+    else:
+        out_vec = torch.empty((n,), dtype=x.dtype, device=x.device)
+
+    out_vec.zero_()
+    ext = _load_ext()
+    ext.fused_gateup_silu_downproj_mega_half(
+        x_vec,
+        gate_up_weight,
+        down_proj_weight,
+        out_vec,
+    )
+    return out_vec.view(*x.shape[:-1], n)
+
+
 def nosplit_matvec_half_profile(
     x: torch.Tensor,
     weight: torch.Tensor,

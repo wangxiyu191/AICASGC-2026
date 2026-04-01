@@ -158,6 +158,21 @@ torch::Tensor fused_silu_downproj_half_cuda(
     const torch::Tensor& out,
     bool has_bias);
 
+torch::Tensor fused_gateup_silu_downproj_half_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& gate_up_weight,
+    const torch::Tensor& down_proj_weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& hidden_out,
+    const torch::Tensor& out,
+    bool has_bias);
+
+torch::Tensor fused_gateup_silu_downproj_mega_half_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& gate_up_weight,
+    const torch::Tensor& down_proj_weight,
+    const torch::Tensor& out);
+
 torch::Tensor splitk_matvec(
     const torch::Tensor& x,
     const torch::Tensor& weight,
@@ -367,6 +382,36 @@ torch::Tensor fused_silu_downproj_half(
     return fused_silu_downproj_half_cuda(gate_up, weight, bias, out, has_bias);
 }
 
+torch::Tensor fused_gateup_silu_downproj_half(
+    const torch::Tensor& x,
+    const torch::Tensor& gate_up_weight,
+    const torch::Tensor& down_proj_weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& hidden_out,
+    const torch::Tensor& out,
+    bool has_bias) {
+    return fused_gateup_silu_downproj_half_cuda(
+        x,
+        gate_up_weight,
+        down_proj_weight,
+        bias,
+        hidden_out,
+        out,
+        has_bias);
+}
+
+torch::Tensor fused_gateup_silu_downproj_mega_half(
+    const torch::Tensor& x,
+    const torch::Tensor& gate_up_weight,
+    const torch::Tensor& down_proj_weight,
+    const torch::Tensor& out) {
+    return fused_gateup_silu_downproj_mega_half_cuda(
+        x,
+        gate_up_weight,
+        down_proj_weight,
+        out);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("splitk_matvec", &splitk_matvec);
     m.def("splitk_matvec_row4", &splitk_matvec_row4);
@@ -388,4 +433,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("nosplit_weight_only_half_variant", &nosplit_weight_only_half_variant);
     m.def("fused_add_rmsnorm_gateup_half", &fused_add_rmsnorm_gateup_half);
     m.def("fused_silu_downproj_half", &fused_silu_downproj_half);
+    m.def("fused_gateup_silu_downproj_half", &fused_gateup_silu_downproj_half);
+    m.def("fused_gateup_silu_downproj_mega_half", &fused_gateup_silu_downproj_mega_half);
 }
