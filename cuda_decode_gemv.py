@@ -873,6 +873,103 @@ def fused_gateup_silu_downproj_mega_half(
     return out_vec.view(*x.shape[:-1], n)
 
 
+def fused_gateup_silu_downproj_mega_partial_half(
+    x: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_proj_weight: torch.Tensor,
+    workspace: dict | None = None,
+) -> torch.Tensor:
+    if (
+        x.device.type != "cuda"
+        or gate_up_weight.device.type != "cuda"
+        or down_proj_weight.device.type != "cuda"
+        or x.dtype != torch.float16
+        or gate_up_weight.dtype != torch.float16
+        or down_proj_weight.dtype != torch.float16
+        or x.ndim < 2
+        or x.shape[-2] != 1
+    ):
+        raise RuntimeError("fused_gateup_silu_downproj_mega_partial_half expects fp16 CUDA single-token decode tensors")
+
+    x_vec = x.reshape(-1).contiguous()
+    grid_blocks = (6144 + 256 - 1) // 256
+    if (
+        workspace is not None
+        and workspace.get("type") == "fused_gateup_silu_downproj_mega_partial"
+        and tuple(workspace["partial_out"].shape) == (grid_blocks, 2048)
+        and workspace["partial_out"].device == x.device
+        and workspace["partial_out"].dtype == x.dtype
+    ):
+        partial_out = workspace["partial_out"]
+    else:
+        partial_out = torch.empty((grid_blocks, 2048), dtype=x.dtype, device=x.device)
+
+    ext = _load_ext()
+    ext.fused_gateup_silu_downproj_mega_partial_half(
+        x_vec,
+        gate_up_weight,
+        down_proj_weight,
+        partial_out,
+    )
+    return partial_out
+
+
+def fused_gateup_silu_downproj_softsync_half(
+    x: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_proj_weight: torch.Tensor,
+    workspace: dict | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if (
+        x.device.type != "cuda"
+        or gate_up_weight.device.type != "cuda"
+        or down_proj_weight.device.type != "cuda"
+        or x.dtype != torch.float16
+        or gate_up_weight.dtype != torch.float16
+        or down_proj_weight.dtype != torch.float16
+        or x.ndim < 2
+        or x.shape[-2] != 1
+    ):
+        raise RuntimeError("fused_gateup_silu_downproj_softsync_half expects fp16 CUDA single-token decode tensors")
+
+    x_vec = x.reshape(-1).contiguous()
+    if (
+        workspace is not None
+        and workspace.get("type") == "fused_gateup_silu_downproj_softsync"
+        and tuple(workspace["barrier_count"].shape) == (1,)
+        and tuple(workspace["barrier_phase"].shape) == (1,)
+        and tuple(workspace["hidden_out"].shape) == (6144,)
+        and tuple(workspace["out"].shape) == (2048,)
+        and workspace["barrier_count"].device == x.device
+        and workspace["barrier_phase"].device == x.device
+        and workspace["hidden_out"].device == x.device
+        and workspace["out"].device == x.device
+    ):
+        barrier_count = workspace["barrier_count"]
+        barrier_phase = workspace["barrier_phase"]
+        hidden_out = workspace["hidden_out"]
+        out_vec = workspace["out"]
+    else:
+        barrier_count = torch.zeros((1,), dtype=torch.int32, device=x.device)
+        barrier_phase = torch.zeros((1,), dtype=torch.int32, device=x.device)
+        hidden_out = torch.empty((6144,), dtype=x.dtype, device=x.device)
+        out_vec = torch.empty((2048,), dtype=x.dtype, device=x.device)
+
+    barrier_count.zero_()
+    barrier_phase.zero_()
+    ext = _load_ext()
+    ext.fused_gateup_silu_downproj_softsync_half(
+        x_vec,
+        gate_up_weight,
+        down_proj_weight,
+        barrier_count,
+        barrier_phase,
+        hidden_out,
+        out_vec,
+    )
+    return hidden_out.view(*x.shape[:-1], 6144), out_vec.view(*x.shape[:-1], 2048)
+
+
 def nosplit_matvec_half_profile(
     x: torch.Tensor,
     weight: torch.Tensor,
