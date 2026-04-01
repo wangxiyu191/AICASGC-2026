@@ -366,34 +366,55 @@ def _run_layer_chain_graph(target_layer, payload):
 
             attn_output = _decode_gemv(attn_output, target_layer.o_proj_weight, target_layer.o_proj_bias)
 
-            residual, hidden_states = optimized_layer._fused_add_rms_norm(
+            fused_gate_up = optimized_layer._fused_add_rmsnorm_gateup(
                 layer_input,
                 attn_output,
                 target_layer.post_attn_layernorm_weight,
+                target_layer.gate_up_weight,
                 target_layer.rms_norm_eps,
                 prefer_small_triton=prefer_small_triton,
             )
+            if fused_gate_up is None:
+                residual, hidden_states = optimized_layer._fused_add_rms_norm(
+                    layer_input,
+                    attn_output,
+                    target_layer.post_attn_layernorm_weight,
+                    target_layer.rms_norm_eps,
+                    prefer_small_triton=prefer_small_triton,
+                )
+                gate_up = _decode_gemv(hidden_states, target_layer.gate_up_weight, None)
+            else:
+                residual, gate_up = fused_gate_up
+                hidden_states = None
 
-            gate_up = _decode_gemv(hidden_states, target_layer.gate_up_weight, None)
+            outputs["gate_up_simulated"] = gate_up
 
-            gate, up = gate_up.chunk(2, dim=-1)
-
-            hidden_states = optimized_layer._fused_silu_mul(
-                gate,
-                up,
+            fused_down_proj = optimized_layer._fused_silu_downproj(
+                gate_up,
+                target_layer.down_proj_weight,
+                target_layer.down_proj_bias,
                 prefer_small_triton=prefer_small_triton,
             )
-            outputs["down_proj_input_simulated"] = hidden_states
+            if fused_down_proj is None:
+                gate, up = gate_up.chunk(2, dim=-1)
+                hidden_states = optimized_layer._fused_silu_mul(
+                    gate,
+                    up,
+                    prefer_small_triton=prefer_small_triton,
+                )
+                outputs["down_proj_input_simulated"] = hidden_states
 
-            residual_epilogue_bias = None
-            if (
-                optimized_layer._ENABLE_DOWNPROJ_RESIDUAL_EPILOGUE
-                and target_layer.down_proj_bias is None
-            ):
-                residual_epilogue_bias = residual
-            down_proj_bias = target_layer.down_proj_bias if residual_epilogue_bias is None else residual_epilogue_bias
-
-            hidden_states = _decode_gemv(hidden_states, target_layer.down_proj_weight, down_proj_bias)
+                residual_epilogue_bias = None
+                if (
+                    optimized_layer._ENABLE_DOWNPROJ_RESIDUAL_EPILOGUE
+                    and target_layer.down_proj_bias is None
+                ):
+                    residual_epilogue_bias = residual
+                down_proj_bias = target_layer.down_proj_bias if residual_epilogue_bias is None else residual_epilogue_bias
+                hidden_states = _decode_gemv(hidden_states, target_layer.down_proj_weight, down_proj_bias)
+            else:
+                residual_epilogue_bias = None
+                hidden_states = fused_down_proj
 
             if residual_epilogue_bias is None:
                 hidden_states = optimized_layer._add(
@@ -413,7 +434,16 @@ def _run_layer_chain_graph(target_layer, payload):
 
     q_diff = (outputs["q_after_rope"] - attn["q"]).abs().float()
     o_proj_input_diff = (outputs["o_proj_input_simulated"] - payload["o_proj_input"]).abs().float()
-    down_proj_input_diff = (outputs["down_proj_input_simulated"] - payload["down_proj_input"]).abs().float()
+    if "down_proj_input_simulated" in outputs:
+        down_proj_input = outputs["down_proj_input_simulated"]
+    else:
+        gate, up = outputs["gate_up_simulated"].chunk(2, dim=-1)
+        down_proj_input = optimized_layer._fused_silu_mul(
+            gate,
+            up,
+            prefer_small_triton=prefer_small_triton,
+        )
+    down_proj_input_diff = (down_proj_input - payload["down_proj_input"]).abs().float()
 
     return {
         "graph": graph,
@@ -488,6 +518,16 @@ def main():
     parser.add_argument("--viztrace-iters", type=int, default=1, help="Number of traced graph replays.")
     parser.add_argument("--viztrace-output", type=str, default=None, help="Trace JSON output path under traces/.")
     parser.add_argument(
+        "--enable-fused-add-rmsnorm-gateup",
+        action="store_true",
+        help="Enable experimental CUDA fusion for post_attn_add_rmsnorm -> gate_up during graph replay only.",
+    )
+    parser.add_argument(
+        "--enable-fused-silu-downproj",
+        action="store_true",
+        help="Enable experimental CUDA fusion for silu_mul -> down_proj during graph replay only.",
+    )
+    parser.add_argument(
         "--output",
         type=str,
         default=None,
@@ -511,14 +551,24 @@ def main():
         f"sample_idx={args.sample_idx}, question_id={sample['question_id']}, "
         f"layer_idx={args.layer_idx}, decode_step={args.decode_step}, bucketed={args.bucketed}"
     )
-    payload, capture_meta = _run_layer_chain_capture(
-        vlm,
-        inputs,
-        decode_step=args.decode_step,
-        max_new_tokens=args.max_new_tokens,
-        bucketed=args.bucketed,
-        layer_idx=args.layer_idx,
+    capture_flag_restore = optimized_layer.set_cuda_mlp_fusion_flags(
+        add_rmsnorm_gateup=False,
+        silu_downproj=False,
     )
+    try:
+        payload, capture_meta = _run_layer_chain_capture(
+            vlm,
+            inputs,
+            decode_step=args.decode_step,
+            max_new_tokens=args.max_new_tokens,
+            bucketed=args.bucketed,
+            layer_idx=args.layer_idx,
+        )
+    finally:
+        optimized_layer.set_cuda_mlp_fusion_flags(
+            add_rmsnorm_gateup=capture_flag_restore[0],
+            silu_downproj=capture_flag_restore[1],
+        )
 
     target_layer = vlm._model.model.language_model.layers[args.layer_idx]
     print(
@@ -526,12 +576,20 @@ def main():
         f"(warmup={args.warmup}, iters={args.iters}, replay_reset=cold_l2_flush({args.l2_flush_mb}MiB))..."
     )
     previous_small_decode_triton = set_small_decode_triton_enabled(vlm._model, True)
+    optimized_layer.set_cuda_mlp_fusion_flags(
+        add_rmsnorm_gateup=args.enable_fused_add_rmsnorm_gateup,
+        silu_downproj=args.enable_fused_silu_downproj,
+    )
     try:
         graph_result = _run_layer_chain_graph(
             target_layer=target_layer,
             payload=payload,
         )
     finally:
+        optimized_layer.set_cuda_mlp_fusion_flags(
+            add_rmsnorm_gateup=capture_flag_restore[0],
+            silu_downproj=capture_flag_restore[1],
+        )
         set_small_decode_triton_enabled(vlm._model, previous_small_decode_triton)
 
     pre_replay = make_l2_flush_runner(payload["layer_input"].device, args.l2_flush_mb)
@@ -578,6 +636,8 @@ def main():
             "viztrace_enabled": bool(args.viztrace),
             "viztrace_iters": int(args.viztrace_iters) if args.viztrace else 0,
             "viztrace_output": None if viztrace_output is None else str(viztrace_output),
+            "enable_fused_add_rmsnorm_gateup": bool(args.enable_fused_add_rmsnorm_gateup),
+            "enable_fused_silu_downproj": bool(args.enable_fused_silu_downproj),
             "note": "cache update omitted; attention uses captured post-update q/k/v",
         },
         "results": {

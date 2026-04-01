@@ -73,6 +73,8 @@ def _build_variants(target: str, weight: torch.Tensor) -> tuple[dict[str, callab
         variants["row2_gemv"] = _cuda_nosplit_k2048_row2_matvec
         variants["row4_weight_only"] = _make_weight_only_runner("k2048_row4")
         variants["row4_gemv"] = _cuda_nosplit_k2048_row4_matvec
+        variants["row4_persistent_weight_only"] = _make_weight_only_runner("k2048_row4_persistent")
+        variants["row8_persistent_weight_only"] = _make_weight_only_runner("k2048_row8_persistent")
 
         if target == "o_proj":
             labels["default_pattern"] = "row2_weight_only"
@@ -181,7 +183,7 @@ def _run_one_target(
     variants, labels = _build_variants(target, weight)
 
     results: dict[str, dict] = {}
-    pre_replay = _make_l2_flush_runner(args.l2_flush_mb)
+    pre_replay = make_l2_flush_runner(weight.device, args.l2_flush_mb)
     for name, fn in variants.items():
         _, elapsed_ms = _bench_impl_graph(
             fn,

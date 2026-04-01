@@ -122,6 +122,8 @@ NOSPLIT_VARIANTS = {
     "k6144_n8k1024_xwarp_w_async": 13,
     "k6144_n8k1024_xwarp_w_async_sms2": 14,
     "k6144_n8k1024_xwarp_w_async_sms2_balanced": 15,
+    "k2048_row8_persistent": 16,
+    "k2048_row4_persistent": 17,
 }
 
 
@@ -678,6 +680,105 @@ def nosplit_weight_only_half_variant(
     ext = _load_ext()
     ext.nosplit_weight_only_half_variant(weight, out, NOSPLIT_VARIANTS[variant])
     return out
+
+
+def fused_add_rmsnorm_gateup_half(
+    residual: torch.Tensor,
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    eps: float,
+    workspace: dict | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if (
+        residual.device.type != "cuda"
+        or x.device.type != "cuda"
+        or norm_weight.device.type != "cuda"
+        or weight.device.type != "cuda"
+        or residual.dtype != torch.float16
+        or x.dtype != torch.float16
+        or norm_weight.dtype != torch.float16
+        or weight.dtype != torch.float16
+        or residual.ndim < 2
+        or residual.shape[-2] != 1
+        or residual.shape != x.shape
+    ):
+        raise RuntimeError("fused_add_rmsnorm_gateup_half expects fp16 CUDA single-token decode tensors")
+
+    residual_vec = residual.reshape(-1).contiguous()
+    x_vec = x.reshape(-1).contiguous()
+    norm_vec = norm_weight.reshape(-1).contiguous()
+    n, k = weight.shape
+    if (
+        workspace is not None
+        and workspace.get("type") == "fused_add_rmsnorm_gateup"
+        and tuple(workspace["residual_out"].shape) == (k,)
+        and tuple(workspace["gate_up_out"].shape) == (n,)
+        and workspace["residual_out"].device == residual.device
+        and workspace["gate_up_out"].device == residual.device
+        and workspace["residual_out"].dtype == residual.dtype
+        and workspace["gate_up_out"].dtype == residual.dtype
+    ):
+        residual_out = workspace["residual_out"]
+        gate_up_out = workspace["gate_up_out"]
+    else:
+        residual_out = torch.empty((k,), dtype=residual.dtype, device=residual.device)
+        gate_up_out = torch.empty((n,), dtype=residual.dtype, device=residual.device)
+
+    ext = _load_ext()
+    ext.fused_add_rmsnorm_gateup_half(
+        residual_vec,
+        x_vec,
+        norm_vec,
+        weight,
+        bias if bias is not None else torch.empty(0, device=residual.device, dtype=residual.dtype),
+        residual_out,
+        gate_up_out,
+        eps,
+        bias is not None,
+    )
+    return residual_out.view_as(residual), gate_up_out.view(*residual.shape[:-1], n)
+
+
+def fused_silu_downproj_half(
+    gate_up: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    workspace: dict | None = None,
+) -> torch.Tensor:
+    if (
+        gate_up.device.type != "cuda"
+        or weight.device.type != "cuda"
+        or gate_up.dtype != torch.float16
+        or weight.dtype != torch.float16
+        or gate_up.ndim < 2
+        or gate_up.shape[-2] != 1
+    ):
+        raise RuntimeError("fused_silu_downproj_half expects fp16 CUDA single-token decode tensors")
+
+    gate_up_vec = gate_up.reshape(-1).contiguous()
+    n, _k = weight.shape
+    if (
+        workspace is not None
+        and workspace.get("type") == "fused_silu_downproj"
+        and tuple(workspace["out"].shape) == (n,)
+        and workspace["out"].device == gate_up.device
+        and workspace["out"].dtype == gate_up.dtype
+    ):
+        out_vec = workspace["out"]
+    else:
+        out_vec = torch.empty((n,), dtype=gate_up.dtype, device=gate_up.device)
+
+    ext = _load_ext()
+    ext.fused_silu_downproj_half(
+        gate_up_vec,
+        weight,
+        bias if bias is not None else torch.empty(0, device=gate_up.device, dtype=gate_up.dtype),
+        out_vec,
+        bias is not None,
+    )
+    return out_vec.view(*gate_up.shape[:-1], n)
 
 
 def nosplit_matvec_half_profile(

@@ -212,43 +212,68 @@ class OptimizedDecoderLayer(nn.Module):
             attn_output = gemv_out if gemv_out is not None else self.o_proj(attn_output)
 
         # 6. Residual + Post-attention LayerNorm
+        gate_up = None
         with _nvtx_range("decode.post_attn_add_rmsnorm", enable_decode_nvtx):
-            residual, hidden_states = _fused_add_rms_norm(
+            fused_gate_up = _fused_add_rmsnorm_gateup(
                 residual,
                 attn_output,
                 self.post_attn_layernorm_weight,
+                self.gate_up_weight,
                 self.rms_norm_eps,
                 prefer_small_triton=prefer_small_decode_triton,
             )
+            if fused_gate_up is None:
+                residual, hidden_states = _fused_add_rms_norm(
+                    residual,
+                    attn_output,
+                    self.post_attn_layernorm_weight,
+                    self.rms_norm_eps,
+                    prefer_small_triton=prefer_small_decode_triton,
+                )
+            else:
+                residual, gate_up = fused_gate_up
+                hidden_states = None
 
         # 7. Fused gate+up (1 GEMM instead of 2) + SiLU activation
         with _nvtx_range("decode.gate_up_silu", enable_decode_nvtx):
-            gate_up = _cuda_nosplit_gemv(hidden_states, self.gate_up_weight, None)
             if gate_up is None:
-                gate_up = F.linear(hidden_states, self.gate_up_weight)
-            gate, up = gate_up.chunk(2, dim=-1)
-            hidden_states = _fused_silu_mul(
-                gate,
-                up,
+                gate_up = _cuda_nosplit_gemv(hidden_states, self.gate_up_weight, None)
+                if gate_up is None:
+                    gate_up = F.linear(hidden_states, self.gate_up_weight)
+
+            fused_down_proj = _fused_silu_downproj(
+                gate_up,
+                self.down_proj_weight,
+                self.down_proj_bias,
                 prefer_small_triton=prefer_small_decode_triton,
             )
-        with _nvtx_range("decode.down_proj", enable_decode_nvtx):
-            residual_epilogue_bias = None
-            if _ENABLE_DOWNPROJ_RESIDUAL_EPILOGUE and self.down_proj_bias is None:
-                residual_epilogue_bias = residual
-            down_proj_bias = self.down_proj_bias if residual_epilogue_bias is None else residual_epilogue_bias
-            gemv_out = _cuda_nosplit_gemv(hidden_states, self.down_proj_weight, down_proj_bias)
-            if gemv_out is None:
-                gemv_out = _triton_decode_gemv(
-                    hidden_states, self.down_proj_weight, down_proj_bias,
+            if fused_down_proj is None:
+                gate, up = gate_up.chunk(2, dim=-1)
+                hidden_states = _fused_silu_mul(
+                    gate,
+                    up,
                     prefer_small_triton=prefer_small_decode_triton,
                 )
-            if gemv_out is not None:
-                hidden_states = gemv_out
             else:
-                hidden_states = self.down_proj(hidden_states)
-                if residual_epilogue_bias is not None:
-                    hidden_states = hidden_states + residual_epilogue_bias
+                hidden_states = fused_down_proj
+        with _nvtx_range("decode.down_proj", enable_decode_nvtx):
+            residual_epilogue_bias = None
+            if fused_down_proj is None:
+                if _ENABLE_DOWNPROJ_RESIDUAL_EPILOGUE and self.down_proj_bias is None:
+                    residual_epilogue_bias = residual
+                down_proj_bias = self.down_proj_bias if residual_epilogue_bias is None else residual_epilogue_bias
+                gemv_out = _cuda_nosplit_gemv(hidden_states, self.down_proj_weight, down_proj_bias)
+                if gemv_out is None:
+                    gemv_out = _triton_decode_gemv(
+                        hidden_states, self.down_proj_weight, down_proj_bias,
+                        prefer_small_triton=prefer_small_decode_triton,
+                    )
+                if gemv_out is not None:
+                    hidden_states = gemv_out
+                else:
+                    hidden_states = self.down_proj(hidden_states)
+                    if residual_epilogue_bias is not None:
+                        hidden_states = hidden_states + residual_epilogue_bias
 
         # 8. Residual
         with _nvtx_range("decode.residual_add", enable_decode_nvtx):
@@ -294,8 +319,10 @@ _ENABLE_TRITON_SMALL_RMSNORM = os.environ.get("ENABLE_TRITON_SMALL_RMSNORM", "1"
 _ENABLE_CUDA_RMSNORM = os.environ.get("ENABLE_CUDA_RMSNORM", "0") == "1"
 _ENABLE_TRITON_SMALL_ADD_RMSNORM = os.environ.get("ENABLE_TRITON_SMALL_ADD_RMSNORM", "1") == "1"
 _ENABLE_CUDA_FUSED_ADD_RMSNORM = os.environ.get("ENABLE_CUDA_FUSED_ADD_RMSNORM", "0") == "1"
+_ENABLE_CUDA_FUSED_ADD_RMSNORM_GATEUP = os.environ.get("ENABLE_CUDA_FUSED_ADD_RMSNORM_GATEUP", "0") == "1"
 _ENABLE_TRITON_SMALL_SILU_MUL = os.environ.get("ENABLE_TRITON_SMALL_SILU_MUL", "0") == "1"
 _ENABLE_CUDA_FUSED_SILU_MUL = os.environ.get("ENABLE_CUDA_FUSED_SILU_MUL", "0") == "1"
+_ENABLE_CUDA_FUSED_SILU_DOWNPROJ = os.environ.get("ENABLE_CUDA_FUSED_SILU_DOWNPROJ", "0") == "1"
 _ENABLE_CUDA_ADD = os.environ.get("ENABLE_CUDA_ADD", "0") == "1"
 _ENABLE_DOWNPROJ_RESIDUAL_EPILOGUE = os.environ.get("ENABLE_DOWNPROJ_RESIDUAL_EPILOGUE", "0") == "1"
 _ENABLE_TRITON_SMALL_QK_NORM_ROPE = os.environ.get("ENABLE_TRITON_SMALL_QK_NORM_ROPE", "1") == "1"
@@ -603,6 +630,48 @@ def _fused_add_rms_norm(
     return summed_2d.view_as(residual), normed_2d.view_as(residual)
 
 
+def _fused_add_rmsnorm_gateup(
+    residual: torch.Tensor,
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    eps: float,
+    prefer_small_triton: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    if (
+        not prefer_small_triton
+        or not _ENABLE_CUDA_FUSED_ADD_RMSNORM_GATEUP
+        or residual.device.type != "cuda"
+        or x.device.type != "cuda"
+        or norm_weight.device.type != "cuda"
+        or gate_up_weight.device.type != "cuda"
+        or residual.dtype != torch.float16
+        or x.dtype != torch.float16
+        or norm_weight.dtype != torch.float16
+        or gate_up_weight.dtype != torch.float16
+        or residual.ndim < 2
+        or residual.shape[-2] != 1
+        or residual.shape != x.shape
+        or residual.shape[-1] != 2048
+        or gate_up_weight.shape != (12288, 2048)
+        or residual.stride(-1) != 1
+        or x.stride(-1) != 1
+        or norm_weight.stride(-1) != 1
+        or gate_up_weight.stride(-1) != 1
+    ):
+        return None
+
+    import cuda_decode_gemv
+    return cuda_decode_gemv.fused_add_rmsnorm_gateup_half(
+        residual,
+        x,
+        norm_weight,
+        gate_up_weight,
+        None,
+        eps,
+    )
+
+
 def _fused_silu_mul(
     gate: torch.Tensor,
     up: torch.Tensor,
@@ -643,6 +712,38 @@ def _fused_silu_mul(
         BLOCK=BLOCK,
     )
     return out_flat.view_as(gate)
+
+
+def _fused_silu_downproj(
+    gate_up: torch.Tensor,
+    down_proj_weight: torch.Tensor,
+    down_proj_bias: torch.Tensor | None,
+    prefer_small_triton: bool = False,
+) -> torch.Tensor | None:
+    if (
+        not prefer_small_triton
+        or not _ENABLE_CUDA_FUSED_SILU_DOWNPROJ
+        or _ENABLE_DOWNPROJ_RESIDUAL_EPILOGUE
+        or gate_up.device.type != "cuda"
+        or down_proj_weight.device.type != "cuda"
+        or gate_up.dtype != torch.float16
+        or down_proj_weight.dtype != torch.float16
+        or gate_up.ndim < 2
+        or gate_up.shape[-2] != 1
+        or gate_up.shape[-1] != 12288
+        or down_proj_weight.shape != (2048, 6144)
+        or gate_up.stride(-1) != 1
+        or down_proj_weight.stride(-1) != 1
+        or (down_proj_bias is not None and down_proj_bias.dtype != torch.float16)
+    ):
+        return None
+
+    import cuda_decode_gemv
+    return cuda_decode_gemv.fused_silu_downproj_half(
+        gate_up,
+        down_proj_weight,
+        down_proj_bias,
+    )
 
 
 def _add(
@@ -2061,4 +2162,19 @@ def set_small_decode_triton_enabled(model, enabled: bool) -> bool:
             layer._prefer_small_decode_triton = enabled
             if enabled and _ENABLE_TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV:
                 layer._ensure_splitkv_workspace()
+    return previous
+
+
+def set_cuda_mlp_fusion_flags(
+    *,
+    add_rmsnorm_gateup: bool | None = None,
+    silu_downproj: bool | None = None,
+) -> tuple[bool, bool]:
+    global _ENABLE_CUDA_FUSED_ADD_RMSNORM_GATEUP
+    global _ENABLE_CUDA_FUSED_SILU_DOWNPROJ
+    previous = (_ENABLE_CUDA_FUSED_ADD_RMSNORM_GATEUP, _ENABLE_CUDA_FUSED_SILU_DOWNPROJ)
+    if add_rmsnorm_gateup is not None:
+        _ENABLE_CUDA_FUSED_ADD_RMSNORM_GATEUP = add_rmsnorm_gateup
+    if silu_downproj is not None:
+        _ENABLE_CUDA_FUSED_SILU_DOWNPROJ = silu_downproj
     return previous
