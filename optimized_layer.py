@@ -101,6 +101,7 @@ class OptimizedDecoderLayer(nn.Module):
         cache_position=None,
         **kwargs,
     ) -> torch.Tensor:
+        prefill_static_cache_no_mask = kwargs.pop("prefill_static_cache_no_mask", False)
         input_shape = hidden_states.shape[:-1]
         hidden_shape_q = (*input_shape, self.num_heads, self.head_dim)
         hidden_shape_kv = (*input_shape, self.num_kv_heads, self.head_dim)
@@ -163,30 +164,34 @@ class OptimizedDecoderLayer(nn.Module):
             v = v.view(hidden_shape_kv).transpose(1, 2)
 
         # 4. KV Cache
+        attn_key_states = k
+        attn_value_states = v
+        cache_kwargs = None
         if past_key_values is not None:
             cache_kwargs = {
                 "sin": sin.unsqueeze(1), "cos": cos.unsqueeze(1),
                 "cache_position": cache_position,
             }
-            with _nvtx_range("decode.kv_cache_update", enable_decode_nvtx):
-                updated_kv = _static_cache_single_token_update(
-                    past_key_values,
-                    self.layer_idx,
-                    k,
-                    v,
-                    cache_position,
-                )
-                if updated_kv is None:
-                    k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
-                else:
-                    k, v = updated_kv
+            if not prefill_static_cache_no_mask:
+                with _nvtx_range("decode.kv_cache_update", enable_decode_nvtx):
+                    updated_kv = _static_cache_single_token_update(
+                        past_key_values,
+                        self.layer_idx,
+                        k,
+                        v,
+                        cache_position,
+                    )
+                    if updated_kv is None:
+                        attn_key_states, attn_value_states = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
+                    else:
+                        attn_key_states, attn_value_states = updated_kv
 
         # 5. Attention (SDPA)
         with _nvtx_range("decode.attention", enable_decode_nvtx):
             attn_output = _small_decode_attention(
                 q,
-                k,
-                v,
+                attn_key_states,
+                attn_value_states,
                 attention_mask,
                 self.scaling,
                 self.num_key_value_groups,
@@ -196,9 +201,11 @@ class OptimizedDecoderLayer(nn.Module):
             )
             if attn_output is None:
                 attn_output, _ = self._attention_interface(
-                    self, q, k, v, attention_mask,
+                    self, q, attn_key_states, attn_value_states, attention_mask,
                     dropout=0.0, scaling=self.scaling, **kwargs,
                 )
+        if past_key_values is not None and prefill_static_cache_no_mask:
+            past_key_values.update(k, v, self.layer_idx, cache_kwargs)
         with _nvtx_range("decode.o_proj", enable_decode_nvtx):
             attn_output = attn_output.reshape(*input_shape, -1)
             if not attn_output.is_contiguous():
@@ -342,6 +349,7 @@ _ENABLE_CUDA_ADD = os.environ.get("ENABLE_CUDA_ADD", "0") == "1"
 _ENABLE_DOWNPROJ_RESIDUAL_EPILOGUE = os.environ.get("ENABLE_DOWNPROJ_RESIDUAL_EPILOGUE", "0") == "1"
 _ENABLE_TRITON_SMALL_QK_NORM_ROPE = os.environ.get("ENABLE_TRITON_SMALL_QK_NORM_ROPE", "1") == "1"
 _ENABLE_TRITON_SMALL_FUSED_QK_NORM_ROPE = os.environ.get("ENABLE_TRITON_SMALL_FUSED_QK_NORM_ROPE", "0") == "1"
+_ENABLE_TRITON_PREFILL_FUSED_QK_NORM_ROPE = os.environ.get("ENABLE_TRITON_PREFILL_FUSED_QK_NORM_ROPE", "0") == "1"
 _ENABLE_CUDA_FUSED_QK_NORM_ROPE = os.environ.get("ENABLE_CUDA_FUSED_QK_NORM_ROPE", "0") == "1"
 _ENABLE_TRITON_SMALL_DECODE_ATTENTION = os.environ.get("ENABLE_TRITON_SMALL_DECODE_ATTENTION", "1") == "1"
 _ENABLE_TRITON_SMALL_DECODE_ATTENTION_DOT = os.environ.get("ENABLE_TRITON_SMALL_DECODE_ATTENTION_DOT", "1") == "1"
@@ -520,9 +528,19 @@ def _fused_qk_rms_norm_rope(
             sin,
         )
 
+    allow_triton = (
+        (
+            prefer_small_triton
+            and _ENABLE_TRITON_SMALL_FUSED_QK_NORM_ROPE
+            and q.shape[1] <= _TRITON_ROWS_THRESHOLD
+        )
+        or (
+            (not prefer_small_triton)
+            and _ENABLE_TRITON_PREFILL_FUSED_QK_NORM_ROPE
+        )
+    )
     if (
-        (not prefer_small_triton)
-        or (not _ENABLE_TRITON_SMALL_FUSED_QK_NORM_ROPE)
+        (not allow_triton)
         or q.device.type != "cuda"
         or k.device.type != "cuda"
         or q_weight.device.type != "cuda"
@@ -533,7 +551,6 @@ def _fused_qk_rms_norm_rope(
         or k.ndim != 4
         or q.shape[:2] != k.shape[:2]
         or q.shape[-1] != k.shape[-1]
-        or q.shape[1] > _TRITON_ROWS_THRESHOLD
         or q.stride(-1) != 1
         or k.stride(-1) != 1
         or q_weight.stride(-1) != 1

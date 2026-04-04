@@ -33,6 +33,7 @@ _ENABLE_PREFILL_VISION_GRID_CACHE = os.environ.get("ENABLE_PREFILL_VISION_GRID_C
 _ENABLE_PREFILL_ROPE_FASTPATH = os.environ.get("ENABLE_PREFILL_ROPE_FASTPATH", "1") == "1"
 _ENABLE_PREFILL_PATCH_EMBED_LINEAR = os.environ.get("ENABLE_PREFILL_PATCH_EMBED_LINEAR", "1") == "1"
 _ENABLE_PREFILL_MM_SLICE_FASTPATH = os.environ.get("ENABLE_PREFILL_MM_SLICE_FASTPATH", "1") == "1"
+_ENABLE_PREFILL_TEXT_FASTPATH = os.environ.get("ENABLE_PREFILL_TEXT_FASTPATH", "1") == "1"
 _PREFILL_CACHE_MAX_ITEMS = max(1, int(os.environ.get("PREFILL_CACHE_MAX_ITEMS", "64")))
 
 
@@ -1606,10 +1607,45 @@ class VLMModel:
         if _ENABLE_PREFILL_MM_SLICE_FASTPATH:
             language_model = getattr(model_core, "language_model", None)
             if language_model is not None:
-                from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModelOutputWithPast
+                from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+                    BaseModelOutputWithPast,
+                    Qwen3VLModelOutputWithPast,
+                )
 
                 orig_model_forward = model_core.forward
                 orig_deepstack_process = language_model._deepstack_process
+                orig_language_model_forward = language_model.forward
+                prefill_text_cache_position_cache = {}
+                prefill_text_rotary_cache = {}
+
+                def _cached_prefill_cache_position(device: torch.device, seq_len: int):
+                    key = (str(device), int(seq_len))
+                    cached = prefill_text_cache_position_cache.get(key)
+                    if cached is not None:
+                        return cached
+                    return _cache_put(
+                        prefill_text_cache_position_cache,
+                        key,
+                        torch.arange(seq_len, dtype=torch.long, device=device),
+                    )
+
+                def _cached_prefill_rotary_embeddings(this_text_model, hidden_states, position_ids):
+                    if not torch.is_tensor(position_ids) or hidden_states.device.type != "cuda":
+                        return this_text_model.rotary_emb(hidden_states, position_ids)
+                    key = (
+                        str(hidden_states.device),
+                        str(hidden_states.dtype),
+                        tuple(int(v) for v in position_ids.shape),
+                        int(position_ids.data_ptr()),
+                    )
+                    cached = prefill_text_rotary_cache.get(key)
+                    if cached is not None:
+                        return cached
+                    return _cache_put(
+                        prefill_text_rotary_cache,
+                        key,
+                        this_text_model.rotary_emb(hidden_states, position_ids),
+                    )
 
                 def _deepstack_process_slice_fastpath(this_text_model, hidden_states, visual_pos_masks, visual_embeds):
                     token_range = getattr(this_text_model, "_prefill_visual_token_range", None)
@@ -1627,6 +1663,93 @@ class VLMModel:
                             hidden_states[:, start:end, :].add_(visual_embeds.unsqueeze(0))
                             return hidden_states
                     return orig_deepstack_process(hidden_states, visual_pos_masks, visual_embeds)
+
+                def _language_model_forward_prefill_fastpath(
+                    this_text_model,
+                    input_ids: torch.LongTensor | None = None,
+                    attention_mask: torch.Tensor | None = None,
+                    position_ids: torch.LongTensor | None = None,
+                    past_key_values=None,
+                    inputs_embeds: torch.FloatTensor | None = None,
+                    use_cache: bool | None = None,
+                    cache_position: torch.LongTensor | None = None,
+                    visual_pos_masks: torch.Tensor | None = None,
+                    deepstack_visual_embeds: list[torch.Tensor] | None = None,
+                    **kwargs,
+                ):
+                    fastpath_state = getattr(this_text_model, "_prefill_text_fastpath_state", None)
+                    can_use_fastpath = (
+                        _ENABLE_PREFILL_TEXT_FASTPATH
+                        and fastpath_state is not None
+                        and not torch.is_grad_enabled()
+                        and input_ids is None
+                        and inputs_embeds is not None
+                        and isinstance(past_key_values, StaticCache)
+                        and cache_position is None
+                        and inputs_embeds.ndim == 3
+                        and inputs_embeds.shape[0] == 1
+                        and torch.is_tensor(position_ids)
+                        and position_ids.ndim == 3
+                        and position_ids.shape[-1] == inputs_embeds.shape[1]
+                        and fastpath_state.get("full_prompt_mask", False)
+                    )
+                    if not can_use_fastpath:
+                        return orig_language_model_forward(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            position_ids=position_ids,
+                            past_key_values=past_key_values,
+                            inputs_embeds=inputs_embeds,
+                            use_cache=use_cache,
+                            cache_position=cache_position,
+                            visual_pos_masks=visual_pos_masks,
+                            deepstack_visual_embeds=deepstack_visual_embeds,
+                            **kwargs,
+                        )
+
+                    hidden_states = inputs_embeds
+                    cache_position = _cached_prefill_cache_position(hidden_states.device, hidden_states.shape[1])
+
+                    if position_ids.ndim == 2:
+                        position_ids = position_ids[None, ...].expand(4, position_ids.shape[0], -1)
+
+                    if position_ids.ndim == 3 and position_ids.shape[0] == 4:
+                        text_position_ids = position_ids[0]
+                        rotary_position_ids = position_ids[1:]
+                    else:
+                        text_position_ids = None
+                        rotary_position_ids = position_ids
+
+                    position_embeddings = _cached_prefill_rotary_embeddings(
+                        this_text_model,
+                        hidden_states,
+                        rotary_position_ids,
+                    )
+
+                    for layer_idx, decoder_layer in enumerate(this_text_model.layers):
+                        hidden_states = decoder_layer(
+                            hidden_states,
+                            attention_mask=None,
+                            position_ids=text_position_ids,
+                            past_key_values=past_key_values,
+                            cache_position=cache_position,
+                            position_embeddings=position_embeddings,
+                            prefill_static_cache_no_mask=True,
+                            **kwargs,
+                        )
+
+                        if deepstack_visual_embeds is not None and layer_idx in range(len(deepstack_visual_embeds)):
+                            hidden_states = this_text_model._deepstack_process(
+                                hidden_states,
+                                visual_pos_masks,
+                                deepstack_visual_embeds[layer_idx],
+                            )
+
+                    hidden_states = this_text_model.norm(hidden_states)
+                    return BaseModelOutputWithPast(
+                        last_hidden_state=hidden_states,
+                        past_key_values=past_key_values,
+                    )
 
                 def _model_forward_slice_fastpath(
                     this_model,
@@ -1732,10 +1855,14 @@ class VLMModel:
                         )
 
                     previous_range = getattr(language_model, "_prefill_visual_token_range", None)
+                    previous_text_fastpath_state = getattr(language_model, "_prefill_text_fastpath_state", None)
                     language_model._prefill_visual_token_range = (
                         segment["image_start"],
                         segment["image_end"],
                     )
+                    language_model._prefill_text_fastpath_state = {
+                        "full_prompt_mask": True,
+                    }
                     try:
                         outputs = language_model(
                             input_ids=None,
@@ -1754,6 +1881,11 @@ class VLMModel:
                                 delattr(language_model, "_prefill_visual_token_range")
                         else:
                             language_model._prefill_visual_token_range = previous_range
+                        if previous_text_fastpath_state is None:
+                            if hasattr(language_model, "_prefill_text_fastpath_state"):
+                                delattr(language_model, "_prefill_text_fastpath_state")
+                        else:
+                            language_model._prefill_text_fastpath_state = previous_text_fastpath_state
 
                     return Qwen3VLModelOutputWithPast(
                         **outputs,
@@ -1761,8 +1893,13 @@ class VLMModel:
                     )
 
                 language_model._deepstack_process = MethodType(_deepstack_process_slice_fastpath, language_model)
+                language_model.forward = MethodType(_language_model_forward_prefill_fastpath, language_model)
                 model_core.forward = MethodType(_model_forward_slice_fastpath, model_core)
                 self._optimizations_applied.append("prefill:mm_slice_fastpath")
+                if _ENABLE_PREFILL_TEXT_FASTPATH:
+                    language_model._prefill_cache_position_cache = prefill_text_cache_position_cache
+                    language_model._prefill_rotary_cache = prefill_text_rotary_cache
+                    self._optimizations_applied.append("prefill:text_fastpath")
 
         if _ENABLE_PREFILL_ROPE_FASTPATH:
             rope_position_cache = {}

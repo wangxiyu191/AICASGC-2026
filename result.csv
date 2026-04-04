@@ -32,3 +32,4 @@ step,optimization,ttft_ms,throughput_tok_s,num_samples,gpu,notes
 61a,线上A800评测结果(提交 [historical commit]),62.10,212.47,5000,A800,"2026-03-29 用户提供官方评测结果; commit [historical commit]; 分数1.7274, 准确率0.7022, TTFT 62.10ms, 吞吐量212.47 tok/s"
 67,Verify ENABLE_CUDA_NOSPLIT_GEMV and capture benchmark-env trace,61.69,213.55,10,A800,"CUDA nosplit GEMV ON vs OFF: throughput +6.7%, TTFT -4.4%; 10/10 exact match; 默认开启"
 82,Benchmark: default 10-sample run after commit [historical commit],61.11,217.54,10,A800,"当前默认配置含 nosplit GEMV; TTFT 61.11ms, throughput 217.54 tok/s"
+83,Benchmark: 10-sample run after stable prefill text fastpath,43.49,226.11,10,A800,"对应 `results/benchmark_textfast_10samples_20260404.json`。当前配置在保留 StaticCache/KVCache 语义不变的前提下，新增 text prefill fastpath：跳过首次 prefill 的 `create_causal_mask`，复用 `cache_position` / `rotary_emb`，并让首次 prefill attention 直接对有效 prompt K/V 做 causal SDPA 后再写回 cache。相对 step82，TTFT `61.11ms -> 43.49ms`，throughput `217.54 -> 226.11 tok/s`。"

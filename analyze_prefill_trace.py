@@ -200,7 +200,13 @@ def _extract_major_windows(fee_events):
         ),
         "placeholder_mask": _find_longest_fee(fee_events, "Qwen3VLModel.get_placeholder_mask"),
         "compute_3d_position_ids": _find_longest_fee(fee_events, "Qwen3VLModel.compute_3d_position_ids"),
-        "text_prefill_total": _find_longest_fee(fee_events, "Qwen3VLTextModel.forward"),
+        "text_prefill_total": _find_longest_fee_any(
+            fee_events,
+            [
+                "Qwen3VLTextModel.forward",
+                "_language_model_forward_prefill_fastpath",
+            ],
+        ),
     }
     return windows
 
