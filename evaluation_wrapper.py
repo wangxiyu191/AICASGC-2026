@@ -1125,6 +1125,9 @@ class VLMModel:
         model_core = getattr(self._model, "model", None)
         if model_core is None:
             return
+        visual = getattr(model_core, "visual", None)
+        visual_dtype = getattr(visual, "dtype", None)
+        spatial_merge_size = int(model_core.config.vision_config.spatial_merge_size)
 
         def _cache_put(cache, key, value):
             if key in cache:
@@ -1134,11 +1137,187 @@ class VLMModel:
                 cache.pop(next(iter(cache)))
             return value
 
-        def _grid_key(grid_thw):
-            rows = grid_thw.detach().cpu().tolist() if torch.is_tensor(grid_thw) else grid_thw
+        prefill_grid_key_by_ptr = {}
+        prefill_segment_info_by_ptr = {}
+
+        def _tensor_ptr(tensor):
+            if torch.is_tensor(tensor):
+                return int(tensor.data_ptr())
+            return None
+
+        def _segment_ptr_key(
+            input_ids: torch.Tensor | None,
+            mm_token_type_ids: torch.Tensor | None,
+            image_grid_thw: torch.Tensor | None,
+            video_grid_thw: torch.Tensor | None = None,
+            attention_mask: torch.Tensor | None = None,
+        ):
+            if (
+                not torch.is_tensor(input_ids)
+                or not torch.is_tensor(mm_token_type_ids)
+                or not torch.is_tensor(image_grid_thw)
+                or video_grid_thw is not None
+            ):
+                return None
+            return (
+                int(input_ids.data_ptr()),
+                int(mm_token_type_ids.data_ptr()),
+                int(image_grid_thw.data_ptr()),
+            )
+
+        def _grid_key_from_rows(rows):
+            if rows is None:
+                return ()
             if rows and not isinstance(rows[0], (list, tuple)):
                 rows = [rows]
             return tuple(tuple(int(v) for v in row) for row in rows)
+
+        def _grid_cpu_tensor_from_key(grid_key, like_tensor: torch.Tensor | None = None):
+            dtype = like_tensor.dtype if torch.is_tensor(like_tensor) else torch.long
+            return torch.tensor(grid_key, dtype=dtype)
+
+        def _build_single_image_segment_info(
+            input_len: int,
+            token_types: list[int],
+            grid_tuple: tuple[int, int, int] | None,
+            active_tokens: int | None = None,
+        ):
+            if active_tokens is not None and active_tokens != input_len:
+                return None
+            if grid_tuple is None:
+                return None
+            if any(int(v) == 2 for v in token_types):
+                return None
+
+            change_positions = [idx + 1 for idx in range(len(token_types) - 1) if token_types[idx + 1] != token_types[idx]]
+            if len(change_positions) != 2:
+                return None
+
+            image_start, image_end = change_positions
+            if not (
+                token_types[0] == 0
+                and token_types[image_start] == 1
+                and image_end < len(token_types)
+                and token_types[image_end] == 0
+            ):
+                return None
+
+            image_token_count = image_end - image_start
+            expected_image_tokens = (grid_tuple[0] * grid_tuple[1] * grid_tuple[2]) // (spatial_merge_size**2)
+            if image_token_count != expected_image_tokens:
+                return None
+
+            image_advance = max(grid_tuple[1], grid_tuple[2]) // spatial_merge_size
+            return {
+                "image_start": image_start,
+                "image_end": image_end,
+                "image_token_count": image_token_count,
+                "prefix_len": image_start,
+                "suffix_len": input_len - image_end,
+                "grid_tuple": grid_tuple,
+                "spatial_merge_size": spatial_merge_size,
+                "image_advance": image_advance,
+                "rope_delta_value": image_advance - image_token_count,
+            }
+
+        def _extract_prefill_host_meta(batch):
+            if not hasattr(batch, "get"):
+                return None
+
+            image_grid_thw = batch.get("image_grid_thw")
+            grid_key = None
+            if torch.is_tensor(image_grid_thw):
+                grid_key = _grid_key_from_rows(image_grid_thw.tolist())
+
+            input_ids = batch.get("input_ids")
+            mm_token_type_ids = batch.get("mm_token_type_ids")
+            video_grid_thw = batch.get("video_grid_thw")
+            attention_mask = batch.get("attention_mask")
+            segment = None
+            can_use = (
+                torch.is_tensor(input_ids)
+                and torch.is_tensor(mm_token_type_ids)
+                and torch.is_tensor(image_grid_thw)
+                and video_grid_thw is None
+                and input_ids.ndim == 2
+                and input_ids.shape[0] == 1
+                and mm_token_type_ids.shape == input_ids.shape
+                and image_grid_thw.ndim == 2
+                and image_grid_thw.shape[0] == 1
+            )
+            if can_use:
+                active_tokens = None
+                if attention_mask is not None:
+                    if not torch.is_tensor(attention_mask) or attention_mask.ndim != 2 or attention_mask.shape != input_ids.shape:
+                        can_use = False
+                    else:
+                        active_tokens = int(attention_mask[0].sum().item())
+                if can_use:
+                    segment = _build_single_image_segment_info(
+                        input_len=int(input_ids.shape[1]),
+                        token_types=[int(v) for v in mm_token_type_ids[0].tolist()],
+                        grid_tuple=grid_key[0] if grid_key else None,
+                        active_tokens=active_tokens,
+                    )
+
+            return {
+                "grid_key": grid_key,
+                "segment": segment,
+            }
+
+        def _register_prefill_batch_meta(batch, meta):
+            if not meta or not hasattr(batch, "get"):
+                return
+            image_grid_thw = batch.get("image_grid_thw")
+            grid_key = meta.get("grid_key")
+            if grid_key and torch.is_tensor(image_grid_thw):
+                _cache_put(prefill_grid_key_by_ptr, int(image_grid_thw.data_ptr()), grid_key)
+
+            segment = meta.get("segment")
+            segment_key = _segment_ptr_key(
+                input_ids=batch.get("input_ids"),
+                mm_token_type_ids=batch.get("mm_token_type_ids"),
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=batch.get("video_grid_thw"),
+                attention_mask=batch.get("attention_mask"),
+            )
+            if segment is not None and segment_key is not None:
+                _cache_put(prefill_segment_info_by_ptr, segment_key, segment)
+
+        orig_apply_chat_template = getattr(self._processor, "apply_chat_template", None)
+        if callable(orig_apply_chat_template):
+            def _apply_chat_template_with_prefill_meta(this_processor, *args, **kwargs):
+                batch = orig_apply_chat_template(*args, **kwargs)
+                if not hasattr(batch, "to"):
+                    return batch
+                if visual_dtype is not None and hasattr(batch, "data"):
+                    for name in ("pixel_values", "pixel_values_videos"):
+                        value = batch.data.get(name)
+                        if torch.is_tensor(value) and value.device.type == "cpu" and value.dtype != visual_dtype:
+                            batch.data[name] = value.to(dtype=visual_dtype)
+                batch._prefill_host_meta = _extract_prefill_host_meta(batch)
+                orig_to = batch.to
+
+                def _to_with_prefill_meta(this_batch, *to_args, **to_kwargs):
+                    result = orig_to(*to_args, **to_kwargs)
+                    _register_prefill_batch_meta(this_batch, getattr(this_batch, "_prefill_host_meta", None))
+                    return result
+
+                batch.to = MethodType(_to_with_prefill_meta, batch)
+                return batch
+
+            self._processor.apply_chat_template = MethodType(_apply_chat_template_with_prefill_meta, self._processor)
+            self._optimizations_applied.append("prefill:input_meta_cache")
+
+        def _grid_key(grid_thw):
+            if torch.is_tensor(grid_thw):
+                cached = prefill_grid_key_by_ptr.get(_tensor_ptr(grid_thw))
+                if cached is not None:
+                    return cached
+                rows = grid_thw.detach().cpu().tolist()
+            else:
+                rows = grid_thw
+            return _grid_key_from_rows(rows)
 
         def _single_image_segment_info(
             input_ids: torch.Tensor | None,
@@ -1161,63 +1340,58 @@ class VLMModel:
             if not can_use:
                 return None
 
+            segment_key = _segment_ptr_key(
+                input_ids=input_ids,
+                mm_token_type_ids=mm_token_type_ids,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                attention_mask=attention_mask,
+            )
+            if segment_key is not None:
+                cached = prefill_segment_info_by_ptr.get(segment_key)
+                if cached is not None:
+                    return cached
+
+            active_tokens = None
             if attention_mask is not None:
                 if attention_mask.ndim != 2 or attention_mask.shape != input_ids.shape:
                     return None
-                active_tokens = int(attention_mask[0].sum().item())
-                if active_tokens != input_ids.shape[1]:
-                    return None
+                active_tokens = int(attention_mask[0].detach().cpu().sum().item())
 
-            token_types = mm_token_type_ids[0]
-            if int((token_types == 2).sum().item()) != 0:
-                return None
-
-            change_positions = (token_types[1:] != token_types[:-1]).nonzero(as_tuple=False).flatten()
-            if change_positions.numel() != 2:
-                return None
-
-            image_start = int(change_positions[0].item()) + 1
-            image_end = int(change_positions[1].item()) + 1
-            if not (
-                int(token_types[0].item()) == 0
-                and int(token_types[image_start].item()) == 1
-                and image_end < token_types.numel()
-                and int(token_types[image_end].item()) == 0
-            ):
-                return None
-
-            grid_tuple = _grid_key(image_grid_thw)[0]
-            spatial_merge_size = int(model_core.config.vision_config.spatial_merge_size)
-            image_token_count = image_end - image_start
-            expected_image_tokens = (grid_tuple[0] * grid_tuple[1] * grid_tuple[2]) // (spatial_merge_size**2)
-            if image_token_count != expected_image_tokens:
-                return None
-
-            return {
-                "image_start": image_start,
-                "image_end": image_end,
-                "image_token_count": image_token_count,
-                "prefix_len": image_start,
-                "suffix_len": int(input_ids.shape[1]) - image_end,
-                "grid_tuple": grid_tuple,
-                "spatial_merge_size": spatial_merge_size,
-            }
+            grid_key = _grid_key(image_grid_thw)
+            segment = _build_single_image_segment_info(
+                input_len=int(input_ids.shape[1]),
+                token_types=[int(v) for v in mm_token_type_ids[0].detach().cpu().tolist()],
+                grid_tuple=grid_key[0] if grid_key else None,
+                active_tokens=active_tokens,
+            )
+            if segment is not None and segment_key is not None:
+                _cache_put(prefill_segment_info_by_ptr, segment_key, segment)
+            return segment
 
         if _ENABLE_PREFILL_VISION_GRID_CACHE:
-            visual = getattr(model_core, "visual", None)
             if visual is not None:
-                from transformers.models.qwen3_vl.modeling_qwen3_vl import BaseModelOutputWithDeepstackFeatures
+                from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+                    ALL_ATTENTION_FUNCTIONS,
+                    BaseModelOutputWithDeepstackFeatures,
+                    apply_rotary_pos_emb_vision,
+                    eager_attention_forward,
+                    is_flash_attention_requested,
+                )
 
                 fast_pos_cache = {}
                 rot_pos_cache = {}
                 position_embeddings_cache = {}
                 cu_seqlens_cache = {}
+                vision_attn_split_sizes_cache = {}
+                vision_pooler_split_sizes_cache = {}
                 orig_fast_pos = visual.fast_pos_embed_interpolate
                 orig_rot_pos = visual.rot_pos_emb
                 orig_visual_forward = visual.forward
                 deepstack_merger_index = {
                     int(layer_num): idx for idx, layer_num in enumerate(getattr(visual, "deepstack_visual_indexes", ()))
                 }
+                original_vision_attn_forwards = {}
 
                 if _ENABLE_PREFILL_PATCH_EMBED_LINEAR:
                     patch_embed = getattr(visual, "patch_embed", None)
@@ -1236,19 +1410,46 @@ class VLMModel:
                         patch_embed._prefill_linear_weight = linear_weight
                         self._optimizations_applied.append("prefill:patch_embed_linear")
 
+                def _cached_vision_attn_split_sizes(grid_thw):
+                    key = _grid_key(grid_thw)
+                    cached = vision_attn_split_sizes_cache.get(key)
+                    if cached is not None:
+                        return cached
+                    split_sizes = tuple(int(h) * int(w) for t, h, w in key for _ in range(int(t)))
+                    return _cache_put(vision_attn_split_sizes_cache, key, split_sizes)
+
+                def _cached_vision_pooler_split_sizes(grid_thw):
+                    key = _grid_key(grid_thw)
+                    cached = vision_pooler_split_sizes_cache.get(key)
+                    if cached is not None:
+                        return cached
+                    split_sizes = tuple(
+                        (int(t) * int(h) * int(w)) // (spatial_merge_size**2)
+                        for t, h, w in key
+                    )
+                    return _cache_put(vision_pooler_split_sizes_cache, key, split_sizes)
+
                 def _fast_pos_embed_interpolate_cached(this_visual, grid_thw):
                     key = _grid_key(grid_thw)
                     cached = fast_pos_cache.get(key)
                     if cached is not None:
                         return cached
-                    return _cache_put(fast_pos_cache, key, orig_fast_pos(grid_thw))
+                    return _cache_put(
+                        fast_pos_cache,
+                        key,
+                        orig_fast_pos(_grid_cpu_tensor_from_key(key, grid_thw)),
+                    )
 
                 def _rot_pos_emb_cached(this_visual, grid_thw):
                     key = _grid_key(grid_thw)
                     cached = rot_pos_cache.get(key)
                     if cached is not None:
                         return cached
-                    return _cache_put(rot_pos_cache, key, orig_rot_pos(grid_thw))
+                    return _cache_put(
+                        rot_pos_cache,
+                        key,
+                        orig_rot_pos(_grid_cpu_tensor_from_key(key, grid_thw)),
+                    )
 
                 def _cached_vision_geometry(this_visual, grid_thw):
                     key = _grid_key(grid_thw)
@@ -1268,6 +1469,65 @@ class VLMModel:
                         cu_seqlens = _cache_put(cu_seqlens_cache, key, F.pad(cu_seqlens, (1, 0), value=0))
                     return position_embeddings, cu_seqlens
 
+                def _vision_attn_forward_prefill_split_sizes(
+                    this_attn,
+                    hidden_states,
+                    cu_seqlens,
+                    rotary_pos_emb=None,
+                    position_embeddings=None,
+                    **kwargs,
+                ):
+                    split_sizes = kwargs.pop("prefill_split_sizes", None)
+                    orig_attn_forward = original_vision_attn_forwards.get(id(this_attn))
+                    if (
+                        split_sizes is None
+                        or torch.is_grad_enabled()
+                        or is_flash_attention_requested(this_attn.config)
+                    ):
+                        return orig_attn_forward(
+                            hidden_states,
+                            cu_seqlens,
+                            rotary_pos_emb=rotary_pos_emb,
+                            position_embeddings=position_embeddings,
+                            **kwargs,
+                        )
+
+                    seq_length = hidden_states.shape[0]
+                    query_states, key_states, value_states = (
+                        this_attn.qkv(hidden_states).reshape(seq_length, 3, this_attn.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
+                    )
+                    cos, sin = position_embeddings
+                    query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
+
+                    query_states = query_states.transpose(0, 1).unsqueeze(0)
+                    key_states = key_states.transpose(0, 1).unsqueeze(0)
+                    value_states = value_states.transpose(0, 1).unsqueeze(0)
+
+                    attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+                        this_attn.config._attn_implementation, eager_attention_forward
+                    )
+                    splits = [
+                        torch.split(tensor, split_sizes, dim=2)
+                        for tensor in (query_states, key_states, value_states)
+                    ]
+                    attn_outputs = [
+                        attention_interface(
+                            this_attn,
+                            q,
+                            k,
+                            v,
+                            attention_mask=None,
+                            scaling=this_attn.scaling,
+                            dropout=0.0 if not this_attn.training else this_attn.attention_dropout,
+                            is_causal=False,
+                            **kwargs,
+                        )[0]
+                        for q, k, v in zip(*splits)
+                    ]
+                    attn_output = torch.cat(attn_outputs, dim=1)
+                    attn_output = attn_output.reshape(seq_length, -1).contiguous()
+                    return this_attn.proj(attn_output)
+
                 def _visual_forward_cached(this_visual, hidden_states, grid_thw, **kwargs):
                     if (
                         torch.is_grad_enabled()
@@ -1283,6 +1543,7 @@ class VLMModel:
                     hidden_states = hidden_states + pos_embeds
 
                     position_embeddings, cu_seqlens = _cached_vision_geometry(this_visual, grid_thw)
+                    attn_split_sizes = _cached_vision_attn_split_sizes(grid_thw)
 
                     seq_len, _ = hidden_states.size()
                     hidden_states = hidden_states.reshape(seq_len, -1)
@@ -1293,6 +1554,7 @@ class VLMModel:
                             hidden_states,
                             cu_seqlens=cu_seqlens,
                             position_embeddings=position_embeddings,
+                            prefill_split_sizes=attn_split_sizes,
                             **kwargs,
                         )
                         merger_idx = deepstack_merger_index.get(layer_num)
@@ -1310,10 +1572,35 @@ class VLMModel:
                 visual.fast_pos_embed_interpolate = MethodType(_fast_pos_embed_interpolate_cached, visual)
                 visual.rot_pos_emb = MethodType(_rot_pos_emb_cached, visual)
                 visual.forward = MethodType(_visual_forward_cached, visual)
+                for blk in visual.blocks:
+                    original_vision_attn_forwards[id(blk.attn)] = blk.attn.forward
+                    blk.attn.forward = MethodType(_vision_attn_forward_prefill_split_sizes, blk.attn)
+                    blk.attn._prefill_original_forward = original_vision_attn_forwards[id(blk.attn)]
+                orig_get_image_features = model_core.get_image_features
+
+                def _get_image_features_cached(this_model, pixel_values, image_grid_thw=None, **kwargs):
+                    return_dict = kwargs.pop("return_dict", True)
+                    if return_dict is False or image_grid_thw is None or not torch.is_tensor(image_grid_thw):
+                        return orig_get_image_features(pixel_values, image_grid_thw, return_dict=return_dict, **kwargs)
+                    pixel_values = pixel_values.type(this_model.visual.dtype)
+                    vision_output: BaseModelOutputWithDeepstackFeatures = this_model.visual(
+                        pixel_values,
+                        grid_thw=image_grid_thw,
+                        return_dict=True,
+                        **kwargs,
+                    )
+                    image_embeds = vision_output.pooler_output
+                    split_sizes = _cached_vision_pooler_split_sizes(image_grid_thw)
+                    vision_output.pooler_output = torch.split(image_embeds, split_sizes)
+                    return vision_output
+
+                model_core.get_image_features = MethodType(_get_image_features_cached, model_core)
                 visual._prefill_fast_pos_cache = fast_pos_cache
                 visual._prefill_rot_pos_cache = rot_pos_cache
                 visual._prefill_position_embeddings_cache = position_embeddings_cache
                 visual._prefill_cu_seqlens_cache = cu_seqlens_cache
+                visual._prefill_attn_split_sizes_cache = vision_attn_split_sizes_cache
+                visual._prefill_pooler_split_sizes_cache = vision_pooler_split_sizes_cache
                 self._optimizations_applied.append("prefill:vision_grid_cache")
 
         if _ENABLE_PREFILL_MM_SLICE_FASTPATH:
@@ -1523,7 +1810,7 @@ class VLMModel:
                 if vision_positions is None:
                     vision_positions = orig_get_vision_position_ids(
                         prefix_len,
-                        image_grid_thw[0],
+                        torch.tensor(grid_tuple, dtype=image_grid_thw.dtype),
                         1,
                         spatial_merge_size,
                         device=input_ids.device,
@@ -1533,14 +1820,14 @@ class VLMModel:
                 prefix_positions = (
                     torch.arange(prefix_len, device=input_ids.device, dtype=input_ids.dtype).view(1, -1).expand(3, -1)
                 )
-                image_advance = max(grid_tuple[1], grid_tuple[2]) // spatial_merge_size
+                image_advance = segment["image_advance"]
                 suffix_positions = (
                     torch.arange(suffix_len, device=input_ids.device, dtype=input_ids.dtype).view(1, -1).expand(3, -1)
                     + (prefix_len + image_advance)
                 )
                 llm_positions = torch.cat([prefix_positions, vision_positions, suffix_positions], dim=1).reshape(3, -1)
                 rope_deltas = torch.tensor(
-                    [[int(llm_positions.max().item()) + 1 - int(input_ids.shape[1])]],
+                    [[segment["rope_delta_value"]]],
                     device=input_ids.device,
                     dtype=input_ids.dtype,
                 )
