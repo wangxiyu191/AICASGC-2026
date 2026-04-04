@@ -20,6 +20,7 @@ except ImportError:
         pass
 import os
 import torch
+import torch.nn.functional as F
 from transformers import AutoModelForImageTextToText, AutoProcessor
 from transformers.cache_utils import StaticCache
 
@@ -1140,10 +1141,18 @@ class VLMModel:
         if _ENABLE_PREFILL_VISION_GRID_CACHE:
             visual = getattr(model_core, "visual", None)
             if visual is not None:
+                from transformers.models.qwen3_vl.modeling_qwen3_vl import BaseModelOutputWithDeepstackFeatures
+
                 fast_pos_cache = {}
                 rot_pos_cache = {}
+                position_embeddings_cache = {}
+                cu_seqlens_cache = {}
                 orig_fast_pos = visual.fast_pos_embed_interpolate
                 orig_rot_pos = visual.rot_pos_emb
+                orig_visual_forward = visual.forward
+                deepstack_merger_index = {
+                    int(layer_num): idx for idx, layer_num in enumerate(getattr(visual, "deepstack_visual_indexes", ()))
+                }
 
                 def _fast_pos_embed_interpolate_cached(this_visual, grid_thw):
                     key = _grid_key(grid_thw)
@@ -1159,10 +1168,70 @@ class VLMModel:
                         return cached
                     return _cache_put(rot_pos_cache, key, orig_rot_pos(grid_thw))
 
+                def _cached_vision_geometry(this_visual, grid_thw):
+                    key = _grid_key(grid_thw)
+                    position_embeddings = position_embeddings_cache.get(key)
+                    cu_seqlens = cu_seqlens_cache.get(key)
+                    if position_embeddings is None:
+                        rotary_pos_emb = this_visual.rot_pos_emb(grid_thw)
+                        seq_len = int(rotary_pos_emb.shape[0])
+                        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
+                        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+                        position_embeddings = _cache_put(position_embeddings_cache, key, (emb.cos(), emb.sin()))
+                    if cu_seqlens is None:
+                        cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
+                            dim=0,
+                            dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
+                        )
+                        cu_seqlens = _cache_put(cu_seqlens_cache, key, F.pad(cu_seqlens, (1, 0), value=0))
+                    return position_embeddings, cu_seqlens
+
+                def _visual_forward_cached(this_visual, hidden_states, grid_thw, **kwargs):
+                    if (
+                        torch.is_grad_enabled()
+                        or kwargs.get("return_dict", True) is False
+                        or kwargs.get("output_hidden_states")
+                        or kwargs.get("output_attentions")
+                    ):
+                        return orig_visual_forward(hidden_states, grid_thw, **kwargs)
+
+                    hidden_states = this_visual.patch_embed(hidden_states)
+
+                    pos_embeds = this_visual.fast_pos_embed_interpolate(grid_thw)
+                    hidden_states = hidden_states + pos_embeds
+
+                    position_embeddings, cu_seqlens = _cached_vision_geometry(this_visual, grid_thw)
+
+                    seq_len, _ = hidden_states.size()
+                    hidden_states = hidden_states.reshape(seq_len, -1)
+
+                    deepstack_feature_lists = []
+                    for layer_num, blk in enumerate(this_visual.blocks):
+                        hidden_states = blk(
+                            hidden_states,
+                            cu_seqlens=cu_seqlens,
+                            position_embeddings=position_embeddings,
+                            **kwargs,
+                        )
+                        merger_idx = deepstack_merger_index.get(layer_num)
+                        if merger_idx is not None:
+                            deepstack_feature = this_visual.deepstack_merger_list[merger_idx](hidden_states)
+                            deepstack_feature_lists.append(deepstack_feature)
+
+                    merged_hidden_states = this_visual.merger(hidden_states)
+                    return BaseModelOutputWithDeepstackFeatures(
+                        last_hidden_state=hidden_states,
+                        pooler_output=merged_hidden_states,
+                        deepstack_features=deepstack_feature_lists,
+                    )
+
                 visual.fast_pos_embed_interpolate = MethodType(_fast_pos_embed_interpolate_cached, visual)
                 visual.rot_pos_emb = MethodType(_rot_pos_emb_cached, visual)
+                visual.forward = MethodType(_visual_forward_cached, visual)
                 visual._prefill_fast_pos_cache = fast_pos_cache
                 visual._prefill_rot_pos_cache = rot_pos_cache
+                visual._prefill_position_embeddings_cache = position_embeddings_cache
+                visual._prefill_cu_seqlens_cache = cu_seqlens_cache
                 self._optimizations_applied.append("prefill:vision_grid_cache")
 
         if _ENABLE_PREFILL_ROPE_FASTPATH:
