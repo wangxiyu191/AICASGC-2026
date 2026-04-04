@@ -56,6 +56,17 @@ def _find_longest_fee(fee_events, needle: str):
     return max(matches, key=lambda ev: ev.get("dur", 0))
 
 
+def _find_longest_fee_any(fee_events, needles: list[str]):
+    matches = [
+        ev
+        for ev in fee_events
+        if any(needle in ev.get("name", "") for needle in needles)
+    ]
+    if not matches:
+        return None
+    return max(matches, key=lambda ev: ev.get("dur", 0))
+
+
 def _event_end(ev) -> float:
     return ev.get("ts", 0.0) + ev.get("dur", 0.0)
 
@@ -173,7 +184,13 @@ def _extract_major_windows(fee_events):
     windows = {
         "run_prefill_once": _find_longest_fee(fee_events, "_run_prefill_once"),
         "full_forward": _find_longest_fee(fee_events, "Qwen3VLForConditionalGeneration.forward"),
-        "model_forward": _find_longest_fee(fee_events, "Qwen3VLModel.forward"),
+        "model_forward": _find_longest_fee_any(
+            fee_events,
+            [
+                "Qwen3VLModel.forward",
+                "_model_forward_slice_fastpath",
+            ],
+        ),
         "vision_only": _find_longest_fee(fee_events, "Qwen3VLModel.get_image_features"),
         "placeholder_mask": _find_longest_fee(fee_events, "Qwen3VLModel.get_placeholder_mask"),
         "compute_3d_position_ids": _find_longest_fee(fee_events, "Qwen3VLModel.compute_3d_position_ids"),

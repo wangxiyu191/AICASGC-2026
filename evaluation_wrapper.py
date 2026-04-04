@@ -31,6 +31,8 @@ from optimized_layer import replace_decoder_layers, set_small_decode_triton_enab
 
 _ENABLE_PREFILL_VISION_GRID_CACHE = os.environ.get("ENABLE_PREFILL_VISION_GRID_CACHE", "1") == "1"
 _ENABLE_PREFILL_ROPE_FASTPATH = os.environ.get("ENABLE_PREFILL_ROPE_FASTPATH", "1") == "1"
+_ENABLE_PREFILL_PATCH_EMBED_LINEAR = os.environ.get("ENABLE_PREFILL_PATCH_EMBED_LINEAR", "1") == "1"
+_ENABLE_PREFILL_MM_SLICE_FASTPATH = os.environ.get("ENABLE_PREFILL_MM_SLICE_FASTPATH", "1") == "1"
 _PREFILL_CACHE_MAX_ITEMS = max(1, int(os.environ.get("PREFILL_CACHE_MAX_ITEMS", "64")))
 
 
@@ -1138,6 +1140,69 @@ class VLMModel:
                 rows = [rows]
             return tuple(tuple(int(v) for v in row) for row in rows)
 
+        def _single_image_segment_info(
+            input_ids: torch.Tensor | None,
+            mm_token_type_ids: torch.Tensor | None,
+            image_grid_thw: torch.Tensor | None,
+            video_grid_thw: torch.Tensor | None = None,
+            attention_mask: torch.Tensor | None = None,
+        ):
+            can_use = (
+                input_ids is not None
+                and mm_token_type_ids is not None
+                and image_grid_thw is not None
+                and video_grid_thw is None
+                and input_ids.ndim == 2
+                and input_ids.shape[0] == 1
+                and mm_token_type_ids.shape == input_ids.shape
+                and image_grid_thw.ndim == 2
+                and image_grid_thw.shape[0] == 1
+            )
+            if not can_use:
+                return None
+
+            if attention_mask is not None:
+                if attention_mask.ndim != 2 or attention_mask.shape != input_ids.shape:
+                    return None
+                active_tokens = int(attention_mask[0].sum().item())
+                if active_tokens != input_ids.shape[1]:
+                    return None
+
+            token_types = mm_token_type_ids[0]
+            if int((token_types == 2).sum().item()) != 0:
+                return None
+
+            change_positions = (token_types[1:] != token_types[:-1]).nonzero(as_tuple=False).flatten()
+            if change_positions.numel() != 2:
+                return None
+
+            image_start = int(change_positions[0].item()) + 1
+            image_end = int(change_positions[1].item()) + 1
+            if not (
+                int(token_types[0].item()) == 0
+                and int(token_types[image_start].item()) == 1
+                and image_end < token_types.numel()
+                and int(token_types[image_end].item()) == 0
+            ):
+                return None
+
+            grid_tuple = _grid_key(image_grid_thw)[0]
+            spatial_merge_size = int(model_core.config.vision_config.spatial_merge_size)
+            image_token_count = image_end - image_start
+            expected_image_tokens = (grid_tuple[0] * grid_tuple[1] * grid_tuple[2]) // (spatial_merge_size**2)
+            if image_token_count != expected_image_tokens:
+                return None
+
+            return {
+                "image_start": image_start,
+                "image_end": image_end,
+                "image_token_count": image_token_count,
+                "prefix_len": image_start,
+                "suffix_len": int(input_ids.shape[1]) - image_end,
+                "grid_tuple": grid_tuple,
+                "spatial_merge_size": spatial_merge_size,
+            }
+
         if _ENABLE_PREFILL_VISION_GRID_CACHE:
             visual = getattr(model_core, "visual", None)
             if visual is not None:
@@ -1153,6 +1218,23 @@ class VLMModel:
                 deepstack_merger_index = {
                     int(layer_num): idx for idx, layer_num in enumerate(getattr(visual, "deepstack_visual_indexes", ()))
                 }
+
+                if _ENABLE_PREFILL_PATCH_EMBED_LINEAR:
+                    patch_embed = getattr(visual, "patch_embed", None)
+                    if patch_embed is not None and hasattr(patch_embed, "proj"):
+                        orig_patch_embed_forward = patch_embed.forward
+                        linear_weight = patch_embed.proj.weight.flatten(1)
+                        linear_bias = patch_embed.proj.bias
+                        expected_in_features = int(linear_weight.shape[1])
+
+                        def _patch_embed_linear_forward(this_patch_embed, hidden_states):
+                            if hidden_states is None or hidden_states.ndim != 2 or hidden_states.shape[-1] != expected_in_features:
+                                return orig_patch_embed_forward(hidden_states)
+                            return F.linear(hidden_states.to(dtype=linear_weight.dtype), linear_weight, linear_bias)
+
+                        patch_embed.forward = MethodType(_patch_embed_linear_forward, patch_embed)
+                        patch_embed._prefill_linear_weight = linear_weight
+                        self._optimizations_applied.append("prefill:patch_embed_linear")
 
                 def _fast_pos_embed_interpolate_cached(this_visual, grid_thw):
                     key = _grid_key(grid_thw)
@@ -1234,6 +1316,167 @@ class VLMModel:
                 visual._prefill_cu_seqlens_cache = cu_seqlens_cache
                 self._optimizations_applied.append("prefill:vision_grid_cache")
 
+        if _ENABLE_PREFILL_MM_SLICE_FASTPATH:
+            language_model = getattr(model_core, "language_model", None)
+            if language_model is not None:
+                from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModelOutputWithPast
+
+                orig_model_forward = model_core.forward
+                orig_deepstack_process = language_model._deepstack_process
+
+                def _deepstack_process_slice_fastpath(this_text_model, hidden_states, visual_pos_masks, visual_embeds):
+                    token_range = getattr(this_text_model, "_prefill_visual_token_range", None)
+                    if (
+                        token_range is not None
+                        and hidden_states.ndim == 3
+                        and hidden_states.shape[0] == 1
+                        and visual_embeds is not None
+                    ):
+                        start, end = token_range
+                        if end > start and visual_embeds.ndim == 2 and visual_embeds.shape[0] == (end - start):
+                            if visual_embeds.device != hidden_states.device or visual_embeds.dtype != hidden_states.dtype:
+                                visual_embeds = visual_embeds.to(hidden_states.device, hidden_states.dtype)
+                            hidden_states = hidden_states.clone()
+                            hidden_states[:, start:end, :].add_(visual_embeds.unsqueeze(0))
+                            return hidden_states
+                    return orig_deepstack_process(hidden_states, visual_pos_masks, visual_embeds)
+
+                def _model_forward_slice_fastpath(
+                    this_model,
+                    input_ids: torch.LongTensor = None,
+                    attention_mask: torch.Tensor | None = None,
+                    position_ids: torch.LongTensor | None = None,
+                    past_key_values=None,
+                    inputs_embeds: torch.FloatTensor | None = None,
+                    pixel_values: torch.Tensor | None = None,
+                    pixel_values_videos: torch.FloatTensor | None = None,
+                    image_grid_thw: torch.LongTensor | None = None,
+                    video_grid_thw: torch.LongTensor | None = None,
+                    mm_token_type_ids: torch.IntTensor | None = None,
+                    cache_position: torch.LongTensor | None = None,
+                    **kwargs,
+                ):
+                    segment = _single_image_segment_info(
+                        input_ids=input_ids,
+                        mm_token_type_ids=mm_token_type_ids,
+                        image_grid_thw=image_grid_thw,
+                        video_grid_thw=video_grid_thw,
+                        attention_mask=attention_mask,
+                    )
+                    if (
+                        torch.is_grad_enabled()
+                        or kwargs.get("return_dict", True) is False
+                        or kwargs.get("output_hidden_states")
+                        or kwargs.get("output_attentions")
+                        or segment is None
+                        or pixel_values is None
+                        or pixel_values_videos is not None
+                        or inputs_embeds is not None
+                    ):
+                        return orig_model_forward(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            position_ids=position_ids,
+                            past_key_values=past_key_values,
+                            inputs_embeds=inputs_embeds,
+                            pixel_values=pixel_values,
+                            pixel_values_videos=pixel_values_videos,
+                            image_grid_thw=image_grid_thw,
+                            video_grid_thw=video_grid_thw,
+                            mm_token_type_ids=mm_token_type_ids,
+                            cache_position=cache_position,
+                            **kwargs,
+                        )
+
+                    inputs_embeds = this_model.get_input_embeddings()(input_ids)
+                    image_outputs = this_model.get_image_features(pixel_values, image_grid_thw, return_dict=True)
+                    pooler_output = image_outputs.pooler_output
+                    if isinstance(pooler_output, (tuple, list)):
+                        if len(pooler_output) != 1:
+                            return orig_model_forward(
+                                input_ids=input_ids,
+                                attention_mask=attention_mask,
+                                position_ids=position_ids,
+                                past_key_values=past_key_values,
+                                inputs_embeds=None,
+                                pixel_values=pixel_values,
+                                pixel_values_videos=pixel_values_videos,
+                                image_grid_thw=image_grid_thw,
+                                video_grid_thw=video_grid_thw,
+                                mm_token_type_ids=mm_token_type_ids,
+                                cache_position=cache_position,
+                                **kwargs,
+                            )
+                        image_embeds = pooler_output[0]
+                    else:
+                        image_embeds = pooler_output
+
+                    if image_embeds.ndim != 2 or image_embeds.shape[0] != segment["image_token_count"]:
+                        return orig_model_forward(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            position_ids=position_ids,
+                            past_key_values=past_key_values,
+                            inputs_embeds=None,
+                            pixel_values=pixel_values,
+                            pixel_values_videos=pixel_values_videos,
+                            image_grid_thw=image_grid_thw,
+                            video_grid_thw=video_grid_thw,
+                            mm_token_type_ids=mm_token_type_ids,
+                            cache_position=cache_position,
+                            **kwargs,
+                        )
+
+                    if image_embeds.device != inputs_embeds.device or image_embeds.dtype != inputs_embeds.dtype:
+                        image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+
+                    inputs_embeds = inputs_embeds.clone()
+                    inputs_embeds[:, segment["image_start"] : segment["image_end"], :].copy_(image_embeds.unsqueeze(0))
+
+                    if position_ids is None:
+                        position_ids = this_model.compute_3d_position_ids(
+                            input_ids=input_ids,
+                            image_grid_thw=image_grid_thw,
+                            video_grid_thw=video_grid_thw,
+                            inputs_embeds=inputs_embeds,
+                            attention_mask=attention_mask,
+                            past_key_values=past_key_values,
+                            mm_token_type_ids=mm_token_type_ids,
+                        )
+
+                    previous_range = getattr(language_model, "_prefill_visual_token_range", None)
+                    language_model._prefill_visual_token_range = (
+                        segment["image_start"],
+                        segment["image_end"],
+                    )
+                    try:
+                        outputs = language_model(
+                            input_ids=None,
+                            position_ids=position_ids,
+                            attention_mask=attention_mask,
+                            past_key_values=past_key_values,
+                            inputs_embeds=inputs_embeds,
+                            cache_position=cache_position,
+                            visual_pos_masks=None,
+                            deepstack_visual_embeds=image_outputs.deepstack_features,
+                            **kwargs,
+                        )
+                    finally:
+                        if previous_range is None:
+                            if hasattr(language_model, "_prefill_visual_token_range"):
+                                delattr(language_model, "_prefill_visual_token_range")
+                        else:
+                            language_model._prefill_visual_token_range = previous_range
+
+                    return Qwen3VLModelOutputWithPast(
+                        **outputs,
+                        rope_deltas=this_model.rope_deltas,
+                    )
+
+                language_model._deepstack_process = MethodType(_deepstack_process_slice_fastpath, language_model)
+                model_core.forward = MethodType(_model_forward_slice_fastpath, model_core)
+                self._optimizations_applied.append("prefill:mm_slice_fastpath")
+
         if _ENABLE_PREFILL_ROPE_FASTPATH:
             rope_position_cache = {}
             rope_output_cache = {}
@@ -1249,18 +1492,14 @@ class VLMModel:
                 attention_mask: torch.Tensor | None = None,
                 **kwargs,
             ):
-                can_use_fastpath = (
-                    input_ids is not None
-                    and mm_token_type_ids is not None
-                    and image_grid_thw is not None
-                    and video_grid_thw is None
-                    and input_ids.ndim == 2
-                    and input_ids.shape[0] == 1
-                    and mm_token_type_ids.shape == input_ids.shape
-                    and image_grid_thw.ndim == 2
-                    and image_grid_thw.shape[0] == 1
+                segment = _single_image_segment_info(
+                    input_ids=input_ids,
+                    mm_token_type_ids=mm_token_type_ids,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    attention_mask=attention_mask,
                 )
-                if not can_use_fastpath:
+                if segment is None:
                     return orig_get_rope_index(
                         input_ids,
                         mm_token_type_ids,
@@ -1269,73 +1508,10 @@ class VLMModel:
                         attention_mask=attention_mask,
                         **kwargs,
                     )
-
-                if attention_mask is not None:
-                    active_tokens = int(attention_mask[0].sum().item())
-                    if active_tokens != input_ids.shape[1]:
-                        return orig_get_rope_index(
-                            input_ids,
-                            mm_token_type_ids,
-                            image_grid_thw=image_grid_thw,
-                            video_grid_thw=video_grid_thw,
-                            attention_mask=attention_mask,
-                            **kwargs,
-                        )
-
-                token_types = mm_token_type_ids[0]
-                if int((token_types == 2).sum().item()) != 0:
-                    return orig_get_rope_index(
-                        input_ids,
-                        mm_token_type_ids,
-                        image_grid_thw=image_grid_thw,
-                        video_grid_thw=video_grid_thw,
-                        attention_mask=attention_mask,
-                        **kwargs,
-                    )
-
-                change_positions = (token_types[1:] != token_types[:-1]).nonzero(as_tuple=False).flatten()
-                if change_positions.numel() != 2:
-                    return orig_get_rope_index(
-                        input_ids,
-                        mm_token_type_ids,
-                        image_grid_thw=image_grid_thw,
-                        video_grid_thw=video_grid_thw,
-                        attention_mask=attention_mask,
-                        **kwargs,
-                    )
-
-                image_start = int(change_positions[0].item()) + 1
-                image_end = int(change_positions[1].item()) + 1
-                if not (
-                    int(token_types[0].item()) == 0
-                    and int(token_types[image_start].item()) == 1
-                    and image_end < token_types.numel()
-                    and int(token_types[image_end].item()) == 0
-                ):
-                    return orig_get_rope_index(
-                        input_ids,
-                        mm_token_type_ids,
-                        image_grid_thw=image_grid_thw,
-                        video_grid_thw=video_grid_thw,
-                        attention_mask=attention_mask,
-                        **kwargs,
-                    )
-
-                prefix_len = image_start
-                suffix_len = input_ids.shape[1] - image_end
-                grid_tuple = _grid_key(image_grid_thw)[0]
-                spatial_merge_size = int(this_model.config.vision_config.spatial_merge_size)
-                expected_image_tokens = (grid_tuple[0] * grid_tuple[1] * grid_tuple[2]) // (spatial_merge_size**2)
-                if (image_end - image_start) != expected_image_tokens:
-                    return orig_get_rope_index(
-                        input_ids,
-                        mm_token_type_ids,
-                        image_grid_thw=image_grid_thw,
-                        video_grid_thw=video_grid_thw,
-                        attention_mask=attention_mask,
-                        **kwargs,
-                    )
-
+                prefix_len = segment["prefix_len"]
+                suffix_len = segment["suffix_len"]
+                grid_tuple = segment["grid_tuple"]
+                spatial_merge_size = segment["spatial_merge_size"]
                 device_key = str(input_ids.device)
                 rope_key = (device_key, grid_tuple, prefix_len, suffix_len, int(input_ids.shape[1]))
                 cached = rope_output_cache.get(rope_key)
