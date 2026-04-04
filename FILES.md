@@ -29,6 +29,7 @@ AICAS 2026 竞赛项目 — Qwen3-VL-2B-Instruct 推理优化。
 | [bench_decode_linears.py](./bench_decode_linears.py) | 真实路径 decode linear microbenchmark（qkv/gate_up/o_proj/down_proj/lm_head） |
 | [bench_gemv_bandwidth.py](./bench_gemv_bandwidth.py) | decode GEMV 带宽拆分 microbenchmark（flat 顺序读 / row4-xwarp 纯读 pattern / full GEMV） |
 | [bench_decode_layer_chain.py](./bench_decode_layer_chain.py) | 单层 decode chain CUDAGraph microbenchmark（含 viztrace 集成） |
+| [bench_prefill.py](./bench_prefill.py) | 真实路径 prefill forward benchmark（host/GPU 双计时，支持 bucketed cache 与 viztrace） |
 | [bench_rmsnorm.py](./bench_rmsnorm.py) | RMSNorm microbenchmark |
 | [run_viztrace.py](./run_viztrace.py) | VizTracer profiling 脚本，分别采集 TTFT 和 throughput trace |
 | [analyze_traces.py](./analyze_traces.py) | Trace 分析脚本，解析 viztracer JSON 输出并生成瓶颈报告（含 decode step 抽样时间线） |
