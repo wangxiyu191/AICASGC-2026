@@ -28,6 +28,14 @@ AICAS 2026 竞赛项目 — Qwen3-VL-2B-Instruct 推理优化。
 | [bench_decode_attention.py](./bench_decode_attention.py) | 真实路径 decode attention microbenchmark（GPU-only cudaEvent 计时，支持 graph capture） |
 | [bench_decode_linears.py](./bench_decode_linears.py) | 真实路径 decode linear microbenchmark（qkv/gate_up/o_proj/down_proj/lm_head） |
 | [bench_gemv_bandwidth.py](./bench_gemv_bandwidth.py) | decode GEMV 带宽拆分 microbenchmark（flat 顺序读 / row4-xwarp 纯读 pattern / full GEMV） |
+| [bench_l2_partition_locality.py](./bench_l2_partition_locality.py) | dual-copy / `smid` 路由 / `8KB` skew 的 L2 locality 专项 probe，含 synthetic weight-stream 与真实 `down_proj` GEMV 验证 |
+| [bench_8kb_interleave_latency.py](./bench_8kb_interleave_latency.py) | 单次 kernel 内按 `smid` 逐块记录 cold-L2 pointer-chase 延迟，直接对比 even/odd `8KB` chunk 的原始 HBM-load 延迟 |
+| [bench_interleave_granularity_latency.py](./bench_interleave_granularity_latency.py) | 固定每个 SM 总窗口大小后，扫描 `128B~8KB` 粒度的 odd/even pointer-chase 延迟，辅助区分 interleave 粒度与 TLB/page 覆盖影响 |
+| [bench_sequential_stride_latency.py](./bench_sequential_stride_latency.py) | 单 block / 单线程串行 pointer-chase 顺序扫固定地址步长区域，记录每一次 load 的周期级 latency，用于观察 `256B` 顺序访问下的 page-level 周期结构 |
+| [export_sequential_stride_table.py](./export_sequential_stride_table.py) | 将顺序 stride latency JSON 导出成“行=访问地址、列=smid”的矩阵 CSV，便于直接做热力图或表格分析 |
+| [export_sequential_page_mean_table.py](./export_sequential_page_mean_table.py) | 直接运行顺序 stride probe，并把每个 `SM x 8KB page` 的均值导出成更小的 `page x smid` CSV，适合在大地址区间上找二维规律 |
+| [analyze_sequential_stride_checkerboard.py](./analyze_sequential_stride_checkerboard.py) | 对顺序 stride latency 的 `8KB page x smid` 矩阵做二维 checkerboard 拟合，恢复 `SM 类 x 地址页类` 规律、周期和位公式 |
+| [summarize_sequential_stride_mapping_findings.py](./summarize_sequential_stride_mapping_findings.py) | 从现有 sequential-stride 结果 JSON 自动生成 Markdown 结论文档，汇总 `1MiB` / `128MiB` / chunk-regime 三层发现 |
 | [bench_decode_layer_chain.py](./bench_decode_layer_chain.py) | 单层 decode chain CUDAGraph microbenchmark（含 viztrace 集成） |
 | [bench_prefill.py](./bench_prefill.py) | 真实路径 prefill forward benchmark（host/GPU 双计时，支持 bucketed cache 与 viztrace） |
 | [bench_rmsnorm.py](./bench_rmsnorm.py) | RMSNorm microbenchmark |
@@ -69,6 +77,7 @@ AICAS 2026 竞赛项目 — Qwen3-VL-2B-Instruct 推理优化。
 | 文件 | 说明 |
 |------|------|
 | [docs/README.md](./docs/README.md) | 优化文档索引（计划、日志、踩坑记录、Trace 分析、引擎对比） |
+| [docs/sequential_stride_mapping_findings_20260404.md](./docs/sequential_stride_mapping_findings_20260404.md) | A800 上 `SM x Address` 顺序 stride 规律总结，归纳 `1MiB` 局部 checkerboard、`128MiB` chunk 结构与当前判断 |
 | [FILES.md](./FILES.md) | 本文件 — 项目文件索引 |
 | [AGENTS.md](./AGENTS.md) | AI 助手工作指引与约定 |
 | [README_CN.md](./README_CN.md) | 竞赛介绍与评测说明 |

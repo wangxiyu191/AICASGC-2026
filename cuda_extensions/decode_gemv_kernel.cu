@@ -34,6 +34,8 @@ constexpr int kXWarpDetailSlotsPerTile = 10;
 constexpr int kXWarpDetailTileCount = 6;
 constexpr int kXWarpDetailSlots =
     kXWarpDetailPrologueSlots + kXWarpDetailTileCount * kXWarpDetailSlotsPerTile + 2;
+constexpr int kL2ParityProbeThreads = 256;
+constexpr int kL2ParityProbeDynamicSmemBytes = 96 * 1024;
 
 __device__ inline void software_grid_sync(
     int* barrier_count,
@@ -97,6 +99,14 @@ enum NosplitVariant : int64_t {
     kNosplitVariantK2048Row4Persistent = 17,
 };
 
+enum DualCopyRouteMode : int64_t {
+    kDualCopyRouteForceA = 0,
+    kDualCopyRouteForceB = 1,
+    kDualCopyRouteSmidHalf = 2,
+    kDualCopyRouteSmidParity = 3,
+    kDualCopyRouteTable = 4,
+};
+
 template <typename scalar_t>
 __device__ inline float to_float(scalar_t v) {
     return static_cast<float>(v);
@@ -132,6 +142,57 @@ __device__ inline uint64_t read_globaltimer() {
     unsigned long long ts;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(ts));
     return static_cast<uint64_t>(ts);
+}
+
+__device__ inline uint64_t read_clock64_cycles() {
+    return static_cast<uint64_t>(clock64());
+}
+
+__device__ inline int read_smid_int() {
+    uint32_t smid;
+    asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
+    return static_cast<int>(smid);
+}
+
+__device__ inline uint32_t load_global_cg_u32(const uint32_t* ptr) {
+#if defined(__CUDA_ARCH__)
+    uint32_t value;
+    asm volatile("ld.global.cg.u32 %0, [%1];" : "=r"(value) : "l"(ptr));
+    return value;
+#else
+    return *ptr;
+#endif
+}
+
+__device__ inline uint64_t load_global_cg_u64(const uint64_t* ptr) {
+#if defined(__CUDA_ARCH__)
+    uint64_t value;
+    asm volatile("ld.global.cg.u64 %0, [%1];" : "=l"(value) : "l"(ptr));
+    return value;
+#else
+    return *ptr;
+#endif
+}
+
+__device__ inline int pick_dualcopy_route(
+    int smid,
+    const int32_t* route_table,
+    int route_mode,
+    int smid_threshold) {
+    switch (route_mode) {
+        case kDualCopyRouteForceA:
+            return 0;
+        case kDualCopyRouteForceB:
+            return 1;
+        case kDualCopyRouteSmidHalf:
+            return smid >= smid_threshold ? 1 : 0;
+        case kDualCopyRouteSmidParity:
+            return smid & 1;
+        case kDualCopyRouteTable:
+            return route_table == nullptr ? 0 : (route_table[smid] & 1);
+        default:
+            return 0;
+    }
 }
 
 __device__ inline unsigned int to_smem_ptr(const void* ptr) {
@@ -1316,6 +1377,189 @@ __global__ void weight_stream_read_half_fwd_kernel(
     }
 }
 
+__global__ void weight_stream_read_dual_half_fwd_kernel(
+    const at::Half* __restrict__ weight_a,
+    const at::Half* __restrict__ weight_b,
+    const int32_t* __restrict__ route_table,
+    int32_t* __restrict__ out,
+    int64_t* __restrict__ trace,
+    int32_t* __restrict__ smid_out,
+    int32_t* __restrict__ route_out,
+    int64_t vecs_per_block,
+    int route_mode,
+    int smid_threshold) {
+    __shared__ uint64_t block_start;
+    __shared__ int block_smid;
+    __shared__ int selected_copy;
+
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps_per_block = blockDim.x >> 5;
+    const int64_t block_vec_base = static_cast<int64_t>(blockIdx.x) * vecs_per_block;
+
+    if (threadIdx.x == 0) {
+        block_smid = read_smid_int();
+        selected_copy = pick_dualcopy_route(block_smid, route_table, route_mode, smid_threshold);
+        if (smid_out != nullptr) {
+            smid_out[blockIdx.x] = block_smid;
+        }
+        if (route_out != nullptr) {
+            route_out[blockIdx.x] = selected_copy;
+        }
+        block_start = read_globaltimer();
+    }
+    __syncthreads();
+
+    const uint4* weight_vec = reinterpret_cast<const uint4*>(selected_copy ? weight_b : weight_a);
+    unsigned int sum = 0;
+    for (int64_t vec_idx = threadIdx.x; vec_idx < vecs_per_block; vec_idx += blockDim.x) {
+        const uint4 value = weight_vec[block_vec_base + vec_idx];
+        sum += value.x + value.y + value.z + value.w;
+    }
+    sum = warp_sum_u32(sum);
+    if (lane == 0) {
+        out[blockIdx.x * warps_per_block + warp] = static_cast<int32_t>(sum);
+    }
+
+    __syncthreads();
+    if (threadIdx.x == 0 && trace != nullptr) {
+        trace[static_cast<int64_t>(blockIdx.x) * 2] = static_cast<int64_t>(block_start);
+        trace[static_cast<int64_t>(blockIdx.x) * 2 + 1] = static_cast<int64_t>(read_globaltimer());
+    }
+}
+
+__device__ inline void flush_l2_probe_block_segment(
+    const int32_t* flush_buf,
+    int64_t flush_elems_per_block,
+    int32_t* flush_sink) {
+    const uint32_t* flush_u32 = reinterpret_cast<const uint32_t*>(flush_buf);
+    const int64_t block_base = static_cast<int64_t>(blockIdx.x) * flush_elems_per_block;
+
+    unsigned int sum = 0;
+    for (int64_t idx = threadIdx.x; idx < flush_elems_per_block; idx += blockDim.x) {
+        sum += load_global_cg_u32(flush_u32 + block_base + idx);
+    }
+    if (flush_sink != nullptr) {
+        atomicAdd(flush_sink + blockIdx.x, static_cast<int32_t>(sum));
+    }
+}
+
+__global__ void l2_sequential_pointer_chase_trace_fwd_kernel(
+    const int64_t* __restrict__ chain,
+    const int64_t* __restrict__ start,
+    const int32_t* __restrict__ flush_buf,
+    int64_t flush_elems_per_block,
+    int64_t chain_len,
+    int64_t* __restrict__ latency_out,
+    int32_t* __restrict__ smid_out,
+    int64_t* __restrict__ final_idx_out,
+    int32_t* __restrict__ flush_sink) {
+    extern __shared__ uint8_t smem_dummy[];
+    (void)smem_dummy;
+
+    if (threadIdx.x == 0) {
+        smid_out[blockIdx.x] = read_smid_int();
+
+        // Warm page-table/TLB state once so the timed phase mostly reflects
+        // cache / memory latency rather than first-touch translation overhead.
+        int64_t idx = start[blockIdx.x];
+        #pragma unroll 1
+        for (int64_t step = 0; step < chain_len; ++step) {
+            idx = static_cast<int64_t>(load_global_cg_u64(reinterpret_cast<const uint64_t*>(chain) + idx));
+        }
+        final_idx_out[blockIdx.x] = idx;
+    }
+    __syncthreads();
+
+    flush_l2_probe_block_segment(flush_buf, flush_elems_per_block, flush_sink);
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        int64_t idx = start[blockIdx.x];
+        const int64_t trace_base = static_cast<int64_t>(blockIdx.x) * chain_len;
+        #pragma unroll 1
+        for (int64_t step = 0; step < chain_len; ++step) {
+            const uint64_t t0 = read_clock64_cycles();
+            idx = static_cast<int64_t>(load_global_cg_u64(reinterpret_cast<const uint64_t*>(chain) + idx));
+            const uint64_t t1 = read_clock64_cycles();
+            latency_out[trace_base + step] = static_cast<int64_t>(t1 - t0);
+        }
+        final_idx_out[blockIdx.x] = idx;
+    }
+}
+
+__global__ void l2_8kb_pointer_chase_pair_fwd_kernel(
+    const int64_t* __restrict__ chain,
+    const int64_t* __restrict__ start_even,
+    const int64_t* __restrict__ start_odd,
+    const int32_t* __restrict__ flush_buf,
+    int64_t flush_elems_per_block,
+    int64_t chain_len,
+    int swap_order,
+    int64_t* __restrict__ trace,
+    int32_t* __restrict__ smid_out,
+    int64_t* __restrict__ final_idx_out,
+    int32_t* __restrict__ flush_sink) {
+    extern __shared__ uint8_t smem_dummy[];
+    (void)smem_dummy;
+
+    if (threadIdx.x == 0) {
+        smid_out[blockIdx.x] = read_smid_int();
+
+        // Warm page-table/TLB state once so the timed phase mostly reflects
+        // global-memory latency, not first-touch translation overhead.
+        int64_t idx = start_even[blockIdx.x];
+        #pragma unroll 1
+        for (int64_t step = 0; step < chain_len; ++step) {
+            idx = static_cast<int64_t>(load_global_cg_u64(reinterpret_cast<const uint64_t*>(chain) + idx));
+        }
+        final_idx_out[static_cast<int64_t>(blockIdx.x) * 2] = idx;
+
+        idx = start_odd[blockIdx.x];
+        #pragma unroll 1
+        for (int64_t step = 0; step < chain_len; ++step) {
+            idx = static_cast<int64_t>(load_global_cg_u64(reinterpret_cast<const uint64_t*>(chain) + idx));
+        }
+        final_idx_out[static_cast<int64_t>(blockIdx.x) * 2 + 1] = idx;
+    }
+    __syncthreads();
+
+    flush_l2_probe_block_segment(flush_buf, flush_elems_per_block, flush_sink);
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        const int64_t* first_start = swap_order ? start_odd : start_even;
+        int64_t idx = first_start[blockIdx.x];
+        const uint64_t t0 = read_globaltimer();
+        #pragma unroll 1
+        for (int64_t step = 0; step < chain_len; ++step) {
+            idx = static_cast<int64_t>(load_global_cg_u64(reinterpret_cast<const uint64_t*>(chain) + idx));
+        }
+        const uint64_t t1 = read_globaltimer();
+        trace[static_cast<int64_t>(blockIdx.x) * 4] = static_cast<int64_t>(t0);
+        trace[static_cast<int64_t>(blockIdx.x) * 4 + 1] = static_cast<int64_t>(t1);
+        final_idx_out[static_cast<int64_t>(blockIdx.x) * 2 + (swap_order ? 1 : 0)] = idx;
+    }
+    __syncthreads();
+
+    flush_l2_probe_block_segment(flush_buf, flush_elems_per_block, flush_sink);
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        const int64_t* second_start = swap_order ? start_even : start_odd;
+        int64_t idx = second_start[blockIdx.x];
+        const uint64_t t0 = read_globaltimer();
+        #pragma unroll 1
+        for (int64_t step = 0; step < chain_len; ++step) {
+            idx = static_cast<int64_t>(load_global_cg_u64(reinterpret_cast<const uint64_t*>(chain) + idx));
+        }
+        const uint64_t t1 = read_globaltimer();
+        trace[static_cast<int64_t>(blockIdx.x) * 4 + 2] = static_cast<int64_t>(t0);
+        trace[static_cast<int64_t>(blockIdx.x) * 4 + 3] = static_cast<int64_t>(t1);
+        final_idx_out[static_cast<int64_t>(blockIdx.x) * 2 + (swap_order ? 0 : 1)] = idx;
+    }
+}
+
 __global__ void nosplit_weight_only_k6144_row4_fwd_kernel(
     const at::Half* __restrict__ weight,
     int32_t* __restrict__ out,
@@ -2307,6 +2551,98 @@ __device__ inline void run_k6144_xwarp_async_row_batch(
         }
     }
     __syncthreads();
+}
+
+template <bool kUseCpAsync>
+__device__ inline void run_k6144_xwarp_async_dualcopy_block(
+    const __half* x_half,
+    const __half* weight_a_half,
+    const __half* weight_b_half,
+    const __half* bias_half,
+    __half* out_half,
+    const int32_t* route_table,
+    int route_mode,
+    int smid_threshold,
+    uint4 x_sh[2][kAsyncVecsPerTileK6144],
+    uint4 w_sh[2][kRowsPerBlockAsync][kAsyncVecsPerTileK6144],
+    int warp,
+    int lane,
+    int64_t stride_wn,
+    int n,
+    bool has_bias) {
+    __shared__ int selected_copy;
+    if (threadIdx.x == 0) {
+        const int smid = read_smid_int();
+        selected_copy = pick_dualcopy_route(smid, route_table, route_mode, smid_threshold);
+    }
+    __syncthreads();
+
+    const __half* w_half = selected_copy ? weight_b_half : weight_a_half;
+    const int row_base = blockIdx.x * kRowsPerBlockAsync;
+    const int active_rows = max(0, min(kRowsPerBlockAsync, n - row_base));
+    if (active_rows > 0) {
+        run_k6144_xwarp_async_row_batch<kUseCpAsync>(
+            x_half,
+            w_half,
+            bias_half,
+            out_half,
+            x_sh,
+            w_sh,
+            warp,
+            lane,
+            row_base,
+            active_rows,
+            stride_wn,
+            n,
+            has_bias);
+    }
+}
+
+__global__ void nosplit_matvec_k6144_n8k1024_xwarp_w_async_dualcopy_fwd_kernel(
+    const at::Half* __restrict__ x,
+    const at::Half* __restrict__ weight_a,
+    const at::Half* __restrict__ weight_b,
+    const at::Half* __restrict__ bias,
+    at::Half* __restrict__ out,
+    const int32_t* __restrict__ route_table,
+    int route_mode,
+    int smid_threshold,
+    int64_t stride_wn,
+    int n,
+    bool has_bias) {
+    __shared__ __align__(16) uint4 x_sh[2][kAsyncVecsPerTileK6144];
+    __shared__ __align__(16) uint4 w_sh[2][kRowsPerBlockAsync][kAsyncVecsPerTileK6144];
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const __half* x_half = reinterpret_cast<const __half*>(x);
+    const __half* weight_a_half = reinterpret_cast<const __half*>(weight_a);
+    const __half* weight_b_half = reinterpret_cast<const __half*>(weight_b);
+    const __half* bias_half = reinterpret_cast<const __half*>(bias);
+    __half* out_half = reinterpret_cast<__half*>(out);
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    constexpr bool kUseCpAsync = true;
+#else
+    constexpr bool kUseCpAsync = false;
+#endif
+
+    run_k6144_xwarp_async_dualcopy_block<kUseCpAsync>(
+        x_half,
+        weight_a_half,
+        weight_b_half,
+        bias_half,
+        out_half,
+        route_table,
+        route_mode,
+        smid_threshold,
+        x_sh,
+        w_sh,
+        warp,
+        lane,
+        stride_wn,
+        n,
+        has_bias);
 }
 
 __global__ void nosplit_matvec_k6144_n8k1024_xwarp_w_async_sms2_balanced_fwd_kernel(
@@ -4234,6 +4570,74 @@ torch::Tensor nosplit_matvec_half_variant_cuda(
     return out;
 }
 
+torch::Tensor nosplit_matvec_half_dualcopy_routed_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& weight_a,
+    const torch::Tensor& weight_b,
+    const torch::Tensor& bias,
+    const torch::Tensor& out,
+    const torch::Tensor& route_table,
+    bool has_bias,
+    int64_t route_mode,
+    int64_t smid_threshold) {
+    TORCH_CHECK(x.is_cuda(), "x must be CUDA");
+    TORCH_CHECK(weight_a.is_cuda(), "weight_a must be CUDA");
+    TORCH_CHECK(weight_b.is_cuda(), "weight_b must be CUDA");
+    TORCH_CHECK(out.is_cuda(), "out must be CUDA");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat16, "dualcopy nosplit matvec only supports fp16");
+    TORCH_CHECK(weight_a.scalar_type() == torch::kFloat16, "dualcopy nosplit matvec only supports fp16");
+    TORCH_CHECK(weight_b.scalar_type() == torch::kFloat16, "dualcopy nosplit matvec only supports fp16");
+    TORCH_CHECK(weight_a.stride(1) == 1, "dualcopy nosplit matvec requires contiguous weight_a");
+    TORCH_CHECK(weight_b.stride(1) == 1, "dualcopy nosplit matvec requires contiguous weight_b");
+    TORCH_CHECK(x.dim() == 1, "x must be flattened [K]");
+    TORCH_CHECK(weight_a.dim() == 2, "weight_a must be [N, K]");
+    TORCH_CHECK(weight_b.sizes() == weight_a.sizes(), "weight_b size mismatch");
+    TORCH_CHECK(weight_a.size(1) == x.size(0), "weight/x shape mismatch");
+    TORCH_CHECK(out.scalar_type() == torch::kFloat16, "out must be fp16");
+    TORCH_CHECK(
+        route_mode >= kDualCopyRouteForceA && route_mode <= kDualCopyRouteTable,
+        "invalid dualcopy route_mode: ",
+        route_mode);
+    if (route_mode == kDualCopyRouteTable) {
+        TORCH_CHECK(route_table.is_cuda(), "route_table must be CUDA for table routing");
+        TORCH_CHECK(route_table.scalar_type() == torch::kInt, "route_table must be int32");
+        TORCH_CHECK(route_table.is_contiguous(), "route_table must be contiguous");
+    }
+    if (has_bias) {
+        TORCH_CHECK(bias.is_cuda(), "bias must be CUDA when present");
+        TORCH_CHECK(bias.numel() == weight_a.size(0), "bias size mismatch");
+    }
+
+    const int n = static_cast<int>(weight_a.size(0));
+    const int k = static_cast<int>(weight_a.size(1));
+    TORCH_CHECK(k == 6144, "dualcopy nosplit matvec currently supports only k=6144");
+    TORCH_CHECK(out.numel() == n, "out size mismatch");
+
+    int num_sms = 0;
+    C10_CUDA_CHECK(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, x.device().index()));
+    if (route_mode == kDualCopyRouteTable) {
+        TORCH_CHECK(route_table.numel() >= num_sms, "route_table too small for SM count");
+    }
+    const int grid_blocks = (n + kRowsPerBlockAsync - 1) / kRowsPerBlockAsync;
+
+    c10::cuda::CUDAGuard device_guard(x.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+    nosplit_matvec_k6144_n8k1024_xwarp_w_async_dualcopy_fwd_kernel<<<grid_blocks, kRow8Threads, 0, stream>>>(
+        x.data_ptr<at::Half>(),
+        weight_a.data_ptr<at::Half>(),
+        weight_b.data_ptr<at::Half>(),
+        has_bias ? bias.data_ptr<at::Half>() : nullptr,
+        out.data_ptr<at::Half>(),
+        route_mode == kDualCopyRouteTable ? route_table.data_ptr<int32_t>() : nullptr,
+        static_cast<int>(route_mode),
+        static_cast<int>(smid_threshold),
+        weight_a.stride(0),
+        n,
+        has_bias);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
 torch::Tensor nosplit_matvec_half_profile_cuda(
     const torch::Tensor& x,
     const torch::Tensor& weight,
@@ -5052,6 +5456,270 @@ torch::Tensor weight_stream_read_half_cuda(
         num_vecs);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
+}
+
+torch::Tensor weight_stream_read_dual_half_cuda(
+    const torch::Tensor& weight_a,
+    const torch::Tensor& weight_b,
+    const torch::Tensor& out,
+    const torch::Tensor& trace,
+    const torch::Tensor& smid,
+    const torch::Tensor& route,
+    const torch::Tensor& route_table,
+    int64_t vecs_per_block,
+    int64_t route_mode,
+    int64_t smid_threshold) {
+    TORCH_CHECK(weight_a.is_cuda(), "weight_a must be CUDA");
+    TORCH_CHECK(weight_b.is_cuda(), "weight_b must be CUDA");
+    TORCH_CHECK(out.is_cuda(), "out must be CUDA");
+    TORCH_CHECK(trace.is_cuda(), "trace must be CUDA");
+    TORCH_CHECK(smid.is_cuda(), "smid must be CUDA");
+    TORCH_CHECK(route.is_cuda(), "route must be CUDA");
+    TORCH_CHECK(weight_a.scalar_type() == torch::kFloat16, "dual weight stream only supports fp16");
+    TORCH_CHECK(weight_b.scalar_type() == torch::kFloat16, "dual weight stream only supports fp16");
+    TORCH_CHECK(weight_a.is_contiguous(), "dual weight stream requires contiguous weight_a");
+    TORCH_CHECK(weight_b.is_contiguous(), "dual weight stream requires contiguous weight_b");
+    TORCH_CHECK(weight_a.sizes() == weight_b.sizes(), "dual weight stream weight size mismatch");
+    TORCH_CHECK(weight_a.dim() == 2, "weight_a must be [N, K]");
+    TORCH_CHECK(out.scalar_type() == torch::kInt, "out must be int32");
+    TORCH_CHECK(trace.scalar_type() == torch::kInt64, "trace must be int64");
+    TORCH_CHECK(smid.scalar_type() == torch::kInt, "smid must be int32");
+    TORCH_CHECK(route.scalar_type() == torch::kInt, "route must be int32");
+    TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
+    TORCH_CHECK(trace.is_contiguous(), "trace must be contiguous");
+    TORCH_CHECK(smid.is_contiguous(), "smid must be contiguous");
+    TORCH_CHECK(route.is_contiguous(), "route must be contiguous");
+    TORCH_CHECK(vecs_per_block > 0, "vecs_per_block must be > 0");
+    TORCH_CHECK(
+        route_mode >= kDualCopyRouteForceA && route_mode <= kDualCopyRouteTable,
+        "invalid dual weight stream route_mode: ",
+        route_mode);
+
+    constexpr int kWeightStreamThreads = 256;
+    const int warps_per_block = kWeightStreamThreads / 32;
+    TORCH_CHECK(out.numel() % warps_per_block == 0, "out size must be divisible by warps_per_block");
+    const int grid_blocks = static_cast<int>(out.numel() / warps_per_block);
+    TORCH_CHECK(grid_blocks > 0, "dual weight stream requires non-empty output");
+    TORCH_CHECK(trace.numel() == static_cast<int64_t>(grid_blocks) * 2, "trace size mismatch");
+    TORCH_CHECK(smid.numel() == grid_blocks, "smid size mismatch");
+    TORCH_CHECK(route.numel() == grid_blocks, "route size mismatch");
+
+    const int64_t total_vecs = weight_a.numel() / kHalfPerVec128;
+    TORCH_CHECK(total_vecs * kHalfPerVec128 == weight_a.numel(), "dual weight stream requires element count divisible by 8");
+    TORCH_CHECK(
+        static_cast<int64_t>(grid_blocks) * vecs_per_block <= total_vecs,
+        "dual weight stream grid * vecs_per_block exceeds tensor size");
+
+    int num_sms = 0;
+    C10_CUDA_CHECK(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, weight_a.device().index()));
+    if (route_mode == kDualCopyRouteTable) {
+        TORCH_CHECK(route_table.is_cuda(), "route_table must be CUDA for table routing");
+        TORCH_CHECK(route_table.scalar_type() == torch::kInt, "route_table must be int32");
+        TORCH_CHECK(route_table.is_contiguous(), "route_table must be contiguous");
+        TORCH_CHECK(route_table.numel() >= num_sms, "route_table too small for SM count");
+    }
+
+    c10::cuda::CUDAGuard device_guard(weight_a.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+    weight_stream_read_dual_half_fwd_kernel<<<grid_blocks, kWeightStreamThreads, 0, stream>>>(
+        weight_a.data_ptr<at::Half>(),
+        weight_b.data_ptr<at::Half>(),
+        route_mode == kDualCopyRouteTable ? route_table.data_ptr<int32_t>() : nullptr,
+        out.data_ptr<int32_t>(),
+        trace.data_ptr<int64_t>(),
+        smid.data_ptr<int32_t>(),
+        route.data_ptr<int32_t>(),
+        vecs_per_block,
+        static_cast<int>(route_mode),
+        static_cast<int>(smid_threshold));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+torch::Tensor l2_8kb_pointer_chase_pair_cuda(
+    const torch::Tensor& chain,
+    const torch::Tensor& start_even,
+    const torch::Tensor& start_odd,
+    const torch::Tensor& flush_buf,
+    const torch::Tensor& trace,
+    const torch::Tensor& smid,
+    const torch::Tensor& final_idx,
+    const torch::Tensor& flush_sink,
+    int64_t chain_len,
+    int64_t swap_order) {
+    TORCH_CHECK(chain.is_cuda(), "chain must be CUDA");
+    TORCH_CHECK(start_even.is_cuda(), "start_even must be CUDA");
+    TORCH_CHECK(start_odd.is_cuda(), "start_odd must be CUDA");
+    TORCH_CHECK(flush_buf.is_cuda(), "flush_buf must be CUDA");
+    TORCH_CHECK(trace.is_cuda(), "trace must be CUDA");
+    TORCH_CHECK(smid.is_cuda(), "smid must be CUDA");
+    TORCH_CHECK(final_idx.is_cuda(), "final_idx must be CUDA");
+    TORCH_CHECK(flush_sink.is_cuda(), "flush_sink must be CUDA");
+    TORCH_CHECK(chain.scalar_type() == torch::kInt64, "chain must be int64");
+    TORCH_CHECK(start_even.scalar_type() == torch::kInt64, "start_even must be int64");
+    TORCH_CHECK(start_odd.scalar_type() == torch::kInt64, "start_odd must be int64");
+    TORCH_CHECK(flush_buf.scalar_type() == torch::kInt32, "flush_buf must be int32");
+    TORCH_CHECK(trace.scalar_type() == torch::kInt64, "trace must be int64");
+    TORCH_CHECK(smid.scalar_type() == torch::kInt, "smid must be int32");
+    TORCH_CHECK(final_idx.scalar_type() == torch::kInt64, "final_idx must be int64");
+    TORCH_CHECK(flush_sink.scalar_type() == torch::kInt, "flush_sink must be int32");
+    TORCH_CHECK(chain.is_contiguous(), "chain must be contiguous");
+    TORCH_CHECK(start_even.is_contiguous(), "start_even must be contiguous");
+    TORCH_CHECK(start_odd.is_contiguous(), "start_odd must be contiguous");
+    TORCH_CHECK(flush_buf.is_contiguous(), "flush_buf must be contiguous");
+    TORCH_CHECK(trace.is_contiguous(), "trace must be contiguous");
+    TORCH_CHECK(smid.is_contiguous(), "smid must be contiguous");
+    TORCH_CHECK(final_idx.is_contiguous(), "final_idx must be contiguous");
+    TORCH_CHECK(flush_sink.is_contiguous(), "flush_sink must be contiguous");
+    TORCH_CHECK(chain.dim() == 1, "chain must be 1D");
+    TORCH_CHECK(start_even.dim() == 1, "start_even must be 1D");
+    TORCH_CHECK(start_odd.dim() == 1, "start_odd must be 1D");
+    TORCH_CHECK(chain_len > 0, "chain_len must be > 0");
+
+    const int64_t num_blocks = start_even.numel();
+    TORCH_CHECK(start_odd.numel() == num_blocks, "start_odd size mismatch");
+    TORCH_CHECK(trace.numel() == num_blocks * 4, "trace size mismatch");
+    TORCH_CHECK(smid.numel() == num_blocks, "smid size mismatch");
+    TORCH_CHECK(final_idx.numel() == num_blocks * 2, "final_idx size mismatch");
+    TORCH_CHECK(flush_sink.numel() == num_blocks, "flush_sink size mismatch");
+    TORCH_CHECK(flush_buf.numel() % num_blocks == 0, "flush_buf size must divide evenly by block count");
+
+    const int64_t flush_elems_per_block = flush_buf.numel() / num_blocks;
+    TORCH_CHECK(flush_elems_per_block > 0, "flush buffer per block must be > 0");
+
+    c10::cuda::CUDAGuard device_guard(chain.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        l2_8kb_pointer_chase_pair_fwd_kernel,
+        cudaFuncAttributePreferredSharedMemoryCarveout,
+        100));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        l2_8kb_pointer_chase_pair_fwd_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        kL2ParityProbeDynamicSmemBytes));
+
+    int max_blocks_per_sm = 0;
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &max_blocks_per_sm,
+        l2_8kb_pointer_chase_pair_fwd_kernel,
+        kL2ParityProbeThreads,
+        kL2ParityProbeDynamicSmemBytes));
+    TORCH_CHECK(
+        max_blocks_per_sm == 1,
+        "l2_8kb pointer-chase probe expected 1 resident block/SM, got ",
+        max_blocks_per_sm);
+
+    trace.zero_();
+    smid.fill_(-1);
+    flush_sink.zero_();
+    l2_8kb_pointer_chase_pair_fwd_kernel<<<
+        static_cast<int>(num_blocks),
+        kL2ParityProbeThreads,
+        kL2ParityProbeDynamicSmemBytes,
+        stream>>>(
+            chain.data_ptr<int64_t>(),
+            start_even.data_ptr<int64_t>(),
+            start_odd.data_ptr<int64_t>(),
+            flush_buf.data_ptr<int32_t>(),
+            flush_elems_per_block,
+            chain_len,
+            static_cast<int>(swap_order != 0),
+            trace.data_ptr<int64_t>(),
+            smid.data_ptr<int32_t>(),
+            final_idx.data_ptr<int64_t>(),
+            flush_sink.data_ptr<int32_t>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return trace;
+}
+
+torch::Tensor l2_sequential_pointer_chase_trace_cuda(
+    const torch::Tensor& chain,
+    const torch::Tensor& start,
+    const torch::Tensor& flush_buf,
+    const torch::Tensor& latency,
+    const torch::Tensor& smid,
+    const torch::Tensor& final_idx,
+    const torch::Tensor& flush_sink,
+    int64_t chain_len) {
+    TORCH_CHECK(chain.is_cuda(), "chain must be CUDA");
+    TORCH_CHECK(start.is_cuda(), "start must be CUDA");
+    TORCH_CHECK(flush_buf.is_cuda(), "flush_buf must be CUDA");
+    TORCH_CHECK(latency.is_cuda(), "latency must be CUDA");
+    TORCH_CHECK(smid.is_cuda(), "smid must be CUDA");
+    TORCH_CHECK(final_idx.is_cuda(), "final_idx must be CUDA");
+    TORCH_CHECK(flush_sink.is_cuda(), "flush_sink must be CUDA");
+    TORCH_CHECK(chain.scalar_type() == torch::kInt64, "chain must be int64");
+    TORCH_CHECK(start.scalar_type() == torch::kInt64, "start must be int64");
+    TORCH_CHECK(flush_buf.scalar_type() == torch::kInt32, "flush_buf must be int32");
+    TORCH_CHECK(latency.scalar_type() == torch::kInt64, "latency must be int64");
+    TORCH_CHECK(smid.scalar_type() == torch::kInt, "smid must be int32");
+    TORCH_CHECK(final_idx.scalar_type() == torch::kInt64, "final_idx must be int64");
+    TORCH_CHECK(flush_sink.scalar_type() == torch::kInt, "flush_sink must be int32");
+    TORCH_CHECK(chain.is_contiguous(), "chain must be contiguous");
+    TORCH_CHECK(start.is_contiguous(), "start must be contiguous");
+    TORCH_CHECK(flush_buf.is_contiguous(), "flush_buf must be contiguous");
+    TORCH_CHECK(latency.is_contiguous(), "latency must be contiguous");
+    TORCH_CHECK(smid.is_contiguous(), "smid must be contiguous");
+    TORCH_CHECK(final_idx.is_contiguous(), "final_idx must be contiguous");
+    TORCH_CHECK(flush_sink.is_contiguous(), "flush_sink must be contiguous");
+    TORCH_CHECK(chain.dim() == 1, "chain must be 1D");
+    TORCH_CHECK(start.dim() == 1, "start must be 1D");
+    TORCH_CHECK(chain_len > 0, "chain_len must be > 0");
+
+    const int64_t num_blocks = start.numel();
+    TORCH_CHECK(num_blocks > 0, "start must be non-empty");
+    TORCH_CHECK(latency.numel() == num_blocks * chain_len, "latency size mismatch");
+    TORCH_CHECK(smid.numel() == num_blocks, "smid size mismatch");
+    TORCH_CHECK(final_idx.numel() == num_blocks, "final_idx size mismatch");
+    TORCH_CHECK(flush_sink.numel() == num_blocks, "flush_sink size mismatch");
+    TORCH_CHECK(flush_buf.numel() % num_blocks == 0, "flush_buf size must divide evenly by block count");
+
+    const int64_t flush_elems_per_block = flush_buf.numel() / num_blocks;
+    TORCH_CHECK(flush_elems_per_block > 0, "flush buffer per block must be > 0");
+
+    c10::cuda::CUDAGuard device_guard(chain.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        l2_sequential_pointer_chase_trace_fwd_kernel,
+        cudaFuncAttributePreferredSharedMemoryCarveout,
+        100));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        l2_sequential_pointer_chase_trace_fwd_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        kL2ParityProbeDynamicSmemBytes));
+
+    int max_blocks_per_sm = 0;
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &max_blocks_per_sm,
+        l2_sequential_pointer_chase_trace_fwd_kernel,
+        kL2ParityProbeThreads,
+        kL2ParityProbeDynamicSmemBytes));
+    TORCH_CHECK(
+        max_blocks_per_sm == 1,
+        "l2 sequential pointer-chase trace expected 1 resident block/SM, got ",
+        max_blocks_per_sm);
+
+    latency.zero_();
+    smid.fill_(-1);
+    flush_sink.zero_();
+    l2_sequential_pointer_chase_trace_fwd_kernel<<<
+        static_cast<int>(num_blocks),
+        kL2ParityProbeThreads,
+        kL2ParityProbeDynamicSmemBytes,
+        stream>>>(
+            chain.data_ptr<int64_t>(),
+            start.data_ptr<int64_t>(),
+            flush_buf.data_ptr<int32_t>(),
+            flush_elems_per_block,
+            chain_len,
+            latency.data_ptr<int64_t>(),
+            smid.data_ptr<int32_t>(),
+            final_idx.data_ptr<int64_t>(),
+            flush_sink.data_ptr<int32_t>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return latency;
 }
 
 torch::Tensor nosplit_weight_only_half_variant_cuda(

@@ -74,6 +74,17 @@ torch::Tensor nosplit_matvec_half_variant_cuda(
     bool has_bias,
     int64_t variant);
 
+torch::Tensor nosplit_matvec_half_dualcopy_routed_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& weight_a,
+    const torch::Tensor& weight_b,
+    const torch::Tensor& bias,
+    const torch::Tensor& out,
+    const torch::Tensor& route_table,
+    bool has_bias,
+    int64_t route_mode,
+    int64_t smid_threshold);
+
 torch::Tensor nosplit_matvec_half_profile_cuda(
     const torch::Tensor& x,
     const torch::Tensor& weight,
@@ -134,6 +145,40 @@ torch::Tensor nosplit_xwarp_wait_sync_calibration_cuda(
 torch::Tensor weight_stream_read_half_cuda(
     const torch::Tensor& weight,
     const torch::Tensor& out);
+
+torch::Tensor weight_stream_read_dual_half_cuda(
+    const torch::Tensor& weight_a,
+    const torch::Tensor& weight_b,
+    const torch::Tensor& out,
+    const torch::Tensor& trace,
+    const torch::Tensor& smid,
+    const torch::Tensor& route,
+    const torch::Tensor& route_table,
+    int64_t vecs_per_block,
+    int64_t route_mode,
+    int64_t smid_threshold);
+
+torch::Tensor l2_8kb_pointer_chase_pair_cuda(
+    const torch::Tensor& chain,
+    const torch::Tensor& start_even,
+    const torch::Tensor& start_odd,
+    const torch::Tensor& flush_buf,
+    const torch::Tensor& trace,
+    const torch::Tensor& smid,
+    const torch::Tensor& final_idx,
+    const torch::Tensor& flush_sink,
+    int64_t chain_len,
+    int64_t swap_order);
+
+torch::Tensor l2_sequential_pointer_chase_trace_cuda(
+    const torch::Tensor& chain,
+    const torch::Tensor& start,
+    const torch::Tensor& flush_buf,
+    const torch::Tensor& latency,
+    const torch::Tensor& smid,
+    const torch::Tensor& final_idx,
+    const torch::Tensor& flush_sink,
+    int64_t chain_len);
 
 torch::Tensor nosplit_weight_only_half_variant_cuda(
     const torch::Tensor& weight,
@@ -280,6 +325,28 @@ torch::Tensor nosplit_matvec_half_variant(
     return nosplit_matvec_half_variant_cuda(x, weight, bias, out, has_bias, variant);
 }
 
+torch::Tensor nosplit_matvec_half_dualcopy_routed(
+    const torch::Tensor& x,
+    const torch::Tensor& weight_a,
+    const torch::Tensor& weight_b,
+    const torch::Tensor& bias,
+    const torch::Tensor& out,
+    const torch::Tensor& route_table,
+    bool has_bias,
+    int64_t route_mode,
+    int64_t smid_threshold) {
+    return nosplit_matvec_half_dualcopy_routed_cuda(
+        x,
+        weight_a,
+        weight_b,
+        bias,
+        out,
+        route_table,
+        has_bias,
+        route_mode,
+        smid_threshold);
+}
+
 torch::Tensor nosplit_matvec_half_profile(
     const torch::Tensor& x,
     const torch::Tensor& weight,
@@ -357,6 +424,74 @@ torch::Tensor weight_stream_read_half(
     const torch::Tensor& weight,
     const torch::Tensor& out) {
     return weight_stream_read_half_cuda(weight, out);
+}
+
+torch::Tensor weight_stream_read_dual_half(
+    const torch::Tensor& weight_a,
+    const torch::Tensor& weight_b,
+    const torch::Tensor& out,
+    const torch::Tensor& trace,
+    const torch::Tensor& smid,
+    const torch::Tensor& route,
+    const torch::Tensor& route_table,
+    int64_t vecs_per_block,
+    int64_t route_mode,
+    int64_t smid_threshold) {
+    return weight_stream_read_dual_half_cuda(
+        weight_a,
+        weight_b,
+        out,
+        trace,
+        smid,
+        route,
+        route_table,
+        vecs_per_block,
+        route_mode,
+        smid_threshold);
+}
+
+torch::Tensor l2_8kb_pointer_chase_pair(
+    const torch::Tensor& chain,
+    const torch::Tensor& start_even,
+    const torch::Tensor& start_odd,
+    const torch::Tensor& flush_buf,
+    const torch::Tensor& trace,
+    const torch::Tensor& smid,
+    const torch::Tensor& final_idx,
+    const torch::Tensor& flush_sink,
+    int64_t chain_len,
+    int64_t swap_order) {
+    return l2_8kb_pointer_chase_pair_cuda(
+        chain,
+        start_even,
+        start_odd,
+        flush_buf,
+        trace,
+        smid,
+        final_idx,
+        flush_sink,
+        chain_len,
+        swap_order);
+}
+
+torch::Tensor l2_sequential_pointer_chase_trace(
+    const torch::Tensor& chain,
+    const torch::Tensor& start,
+    const torch::Tensor& flush_buf,
+    const torch::Tensor& latency,
+    const torch::Tensor& smid,
+    const torch::Tensor& final_idx,
+    const torch::Tensor& flush_sink,
+    int64_t chain_len) {
+    return l2_sequential_pointer_chase_trace_cuda(
+        chain,
+        start,
+        flush_buf,
+        latency,
+        smid,
+        final_idx,
+        flush_sink,
+        chain_len);
 }
 
 torch::Tensor nosplit_weight_only_half_variant(
@@ -467,6 +602,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("nosplit_matvec_half", &nosplit_matvec_half);
     m.def("nosplit_hfma2_matvec_half", &nosplit_hfma2_matvec_half);
     m.def("nosplit_matvec_half_variant", &nosplit_matvec_half_variant);
+    m.def("nosplit_matvec_half_dualcopy_routed", &nosplit_matvec_half_dualcopy_routed);
     m.def("nosplit_matvec_half_profile", &nosplit_matvec_half_profile);
     m.def("nosplit_matvec_half_profile_variant", &nosplit_matvec_half_profile_variant);
     m.def("nosplit_matvec_half_profile_xwarp_detail", &nosplit_matvec_half_profile_xwarp_detail);
@@ -475,6 +611,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("nosplit_matvec_half_profile_xwarp_sms2_balanced_cta_trace", &nosplit_matvec_half_profile_xwarp_sms2_balanced_cta_trace);
     m.def("nosplit_xwarp_wait_sync_calibration", &nosplit_xwarp_wait_sync_calibration);
     m.def("weight_stream_read_half", &weight_stream_read_half);
+    m.def("weight_stream_read_dual_half", &weight_stream_read_dual_half);
+    m.def("l2_8kb_pointer_chase_pair", &l2_8kb_pointer_chase_pair);
+    m.def("l2_sequential_pointer_chase_trace", &l2_sequential_pointer_chase_trace);
     m.def("nosplit_weight_only_half_variant", &nosplit_weight_only_half_variant);
     m.def("fused_add_rmsnorm_gateup_half", &fused_add_rmsnorm_gateup_half);
     m.def("fused_silu_downproj_half", &fused_silu_downproj_half);
