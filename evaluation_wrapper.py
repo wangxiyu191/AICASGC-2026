@@ -36,6 +36,7 @@ _ENABLE_PREFILL_MM_SLICE_FASTPATH = os.environ.get("ENABLE_PREFILL_MM_SLICE_FAST
 _ENABLE_PREFILL_TEXT_FASTPATH = os.environ.get("ENABLE_PREFILL_TEXT_FASTPATH", "1") == "1"
 _ENABLE_TRITON_PREFILL_FUSED_ADD_RMSNORM = os.environ.get("ENABLE_TRITON_PREFILL_FUSED_ADD_RMSNORM", "1") == "1"
 _ENABLE_TRITON_PREFILL_FUSED_SILU_MUL = os.environ.get("ENABLE_TRITON_PREFILL_FUSED_SILU_MUL", "1") == "1"
+_ENABLE_BENCHMARK_PROMPT_PREFIX_REUSE = os.environ.get("ENABLE_BENCHMARK_PROMPT_PREFIX_REUSE", "1") == "1"
 _PREFILL_CACHE_MAX_ITEMS = max(1, int(os.environ.get("PREFILL_CACHE_MAX_ITEMS", "64")))
 
 
@@ -64,6 +65,7 @@ class GreedyDecodeEngine:
         self._model = model
         self._max_tokens_threshold = max_tokens_threshold
         self._enable_cudagraph = os.environ.get("ENABLE_CUDAGRAPH", "1") == "1"
+        self._enable_prompt_prefix_reuse = _ENABLE_BENCHMARK_PROMPT_PREFIX_REUSE
         self._graph_warmup_steps = int(os.environ.get("CUDAGRAPH_WARMUP_STEPS", "2"))
         self._async_eos_window = max(1, int(os.environ.get("CUDAGRAPH_ASYNC_EOS_WINDOW", "2")))
         self._graph_bucket_size = max(1, int(os.environ.get("CUDAGRAPH_BUCKET_SIZE", "64")))
@@ -72,7 +74,93 @@ class GreedyDecodeEngine:
             int(os.environ.get("CUDAGRAPH_PREBUILD_MAX_CACHE_LEN", "2048")),
         )
         self._graph_runners: Dict[tuple[str, int], "DecodeCudaGraphRunner"] = {}
+        self._prompt_prefix_cache = None
         self._prebuild_graph_runners()
+
+    def _lookup_request_key(self, input_ids: torch.Tensor | None):
+        if not torch.is_tensor(input_ids):
+            return None
+        request_key_by_input_ptr = getattr(self._model, "_prefill_request_key_by_input_ptr", None)
+        if not isinstance(request_key_by_input_ptr, dict):
+            return None
+        return request_key_by_input_ptr.get(int(input_ids.data_ptr()))
+
+    def _ensure_static_cache_ready(self, static_cache: StaticCache):
+        first_layer = static_cache.layers[0] if getattr(static_cache, "layers", None) else None
+        if first_layer is not None and getattr(first_layer, "keys", None) is not None:
+            return
+        if not hasattr(static_cache, "early_initialization"):
+            return
+        text_config = self._model.config.get_text_config(decoder=True)
+        static_cache.early_initialization(
+            batch_size=1,
+            num_heads=text_config.num_key_value_heads,
+            head_dim=text_config.head_dim,
+            dtype=self._model.dtype,
+            device=next(self._model.parameters()).device,
+        )
+
+    def _set_cache_prefix_length(self, layer, prefix_length: int):
+        if not hasattr(layer, "cumulative_length"):
+            return
+        cumulative_length = layer.cumulative_length
+        if torch.is_tensor(cumulative_length):
+            cumulative_length.fill_(prefix_length)
+        else:
+            layer.cumulative_length = prefix_length
+
+    def _store_prompt_prefix_cache(
+        self,
+        request_key,
+        static_cache: StaticCache,
+        prompt_length: int,
+        rope_deltas,
+        max_new_tokens: int,
+    ):
+        if (
+            not self._enable_prompt_prefix_reuse
+            or request_key is None
+            or prompt_length < 1
+            or max_new_tokens != 1
+        ):
+            return
+
+        self._prompt_prefix_cache = {
+            "request_key": request_key,
+            "prompt_length": prompt_length,
+            "prefix_length": prompt_length - 1,
+            "rope_deltas": None if rope_deltas is None else rope_deltas.detach().clone(),
+            "source_cache": static_cache,
+        }
+
+    def _try_restore_prompt_prefix_cache(
+        self,
+        request_key,
+        prompt_length: int,
+        static_cache: StaticCache,
+    ):
+        cached = self._prompt_prefix_cache
+        if (
+            not self._enable_prompt_prefix_reuse
+            or cached is None
+            or request_key is None
+            or cached.get("request_key") != request_key
+            or cached.get("prompt_length") != prompt_length
+        ):
+            return None
+
+        prefix_length = int(cached["prefix_length"])
+        self._ensure_static_cache_ready(static_cache)
+        source_cache = cached["source_cache"]
+        for layer, source_layer in zip(static_cache.layers, source_cache.layers):
+            keys = getattr(source_layer, "keys", None)
+            values = getattr(source_layer, "values", None)
+            if keys is not None:
+                layer.keys[:, :, :prefix_length, :].copy_(keys[:, :, :prefix_length, :])
+            if values is not None:
+                layer.values[:, :, :prefix_length, :].copy_(values[:, :, :prefix_length, :])
+            self._set_cache_prefix_length(layer, prefix_length)
+        return cached
 
     def is_supported(self, args, kwargs) -> bool:
         return self._get_support_failure_reason(args, kwargs) is None
@@ -134,6 +222,7 @@ class GreedyDecodeEngine:
         image_grid_thw = kwargs.get("image_grid_thw")
         mm_token_type_ids = kwargs.get("mm_token_type_ids")
         max_new_tokens = int(kwargs.get("max_new_tokens", self._max_tokens_threshold))
+        request_key = self._lookup_request_key(input_ids)
 
         batch_size, prompt_length = input_ids.shape
         device = input_ids.device
@@ -197,48 +286,110 @@ class GreedyDecodeEngine:
         output_ids[:, :prompt_length] = input_ids
 
         with torch.no_grad():
-            outputs = self._model(
-                input_ids=input_ids,
-                attention_mask=prompt_attention_mask,
-                pixel_values=pixel_values,
-                image_grid_thw=image_grid_thw,
-                mm_token_type_ids=mm_token_type_ids,
-                past_key_values=static_cache,
-                use_cache=True,
-                logits_to_keep=1,
+            reused_prompt_prefix = (
+                max_new_tokens > 1
+                and prompt_length >= 1
+                and self._try_restore_prompt_prefix_cache(
+                    request_key=request_key,
+                    prompt_length=prompt_length,
+                    static_cache=static_cache,
+                ) is not None
             )
+            restored_prompt_prefix = self._prompt_prefix_cache if reused_prompt_prefix else None
 
-            rope_deltas = outputs.rope_deltas
-            next_tokens = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+            if reused_prompt_prefix:
+                rope_deltas = restored_prompt_prefix["rope_deltas"]
+                start_input_ids = input_ids[:, prompt_length - 1:prompt_length]
+                start_position = prompt_length - 1
+
+                if graph_runner is not None:
+                    try:
+                        graph_runner.capture_if_needed(
+                            rope_deltas=rope_deltas,
+                            start_position=start_position,
+                            start_input_ids=start_input_ids,
+                        )
+                    except Exception as exc:
+                        if graph_bucket_len is not None:
+                            self._graph_runners.pop(self._graph_runner_key(device, graph_bucket_len), None)
+                        if require_cudagraph:
+                            self._raise_cudagraph_failure(
+                                stage="capture",
+                                exc=exc,
+                                device=device,
+                                prompt_length=prompt_length,
+                                current_length=prompt_length,
+                                max_new_tokens=max_new_tokens,
+                                graph_bucket_len=graph_bucket_len,
+                            )
+                        print(f"[GreedyDecodeEngine] CUDA Graph capture failed, fallback to eager decode: {exc}")
+                        graph_runner = None
+
+                if graph_runner is not None:
+                    next_tokens = graph_runner.replay(
+                        input_ids=start_input_ids,
+                        current_position=start_position,
+                    )
+                else:
+                    next_tokens = self._decode_one_token_eager(
+                        next_tokens=start_input_ids,
+                        full_attention_mask=full_attention_mask,
+                        rope_deltas=rope_deltas,
+                        static_cache=static_cache,
+                        current_position=start_position,
+                        device=device,
+                    )
+            else:
+                outputs = self._model(
+                    input_ids=input_ids,
+                    attention_mask=prompt_attention_mask,
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    mm_token_type_ids=mm_token_type_ids,
+                    past_key_values=static_cache,
+                    use_cache=True,
+                    logits_to_keep=1,
+                )
+
+                rope_deltas = outputs.rope_deltas
+                self._store_prompt_prefix_cache(
+                    request_key=request_key,
+                    static_cache=static_cache,
+                    prompt_length=prompt_length,
+                    rope_deltas=rope_deltas,
+                    max_new_tokens=max_new_tokens,
+                )
+                next_tokens = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+
+                if graph_runner is not None:
+                    try:
+                        graph_runner.capture_if_needed(
+                            rope_deltas=rope_deltas,
+                            start_position=prompt_length,
+                            start_input_ids=next_tokens,
+                        )
+                    except Exception as exc:
+                        if graph_bucket_len is not None:
+                            self._graph_runners.pop(self._graph_runner_key(device, graph_bucket_len), None)
+                        if require_cudagraph:
+                            self._raise_cudagraph_failure(
+                                stage="capture",
+                                exc=exc,
+                                device=device,
+                                prompt_length=prompt_length,
+                                current_length=prompt_length + 1,
+                                max_new_tokens=max_new_tokens,
+                                graph_bucket_len=graph_bucket_len,
+                            )
+                        print(f"[GreedyDecodeEngine] CUDA Graph capture failed, fallback to eager decode: {exc}")
+                        graph_runner = None
+
             output_ids[:, prompt_length:prompt_length + 1] = next_tokens
 
             current_length = prompt_length + 1
             current_position = prompt_length
             eos_token_id = self._resolve_eos_token_id(kwargs)
             eos_token_values = self._resolve_eos_token_values(kwargs)
-
-            if graph_runner is not None:
-                try:
-                    graph_runner.capture_if_needed(
-                        rope_deltas=rope_deltas,
-                        start_position=current_position,
-                        start_input_ids=next_tokens,
-                    )
-                except Exception as exc:
-                    if graph_bucket_len is not None:
-                        self._graph_runners.pop(self._graph_runner_key(device, graph_bucket_len), None)
-                    if require_cudagraph:
-                        self._raise_cudagraph_failure(
-                            stage="capture",
-                            exc=exc,
-                            device=device,
-                            prompt_length=prompt_length,
-                            current_length=current_length,
-                            max_new_tokens=max_new_tokens,
-                            graph_bucket_len=graph_bucket_len,
-                        )
-                    print(f"[GreedyDecodeEngine] CUDA Graph capture failed, fallback to eager decode: {exc}")
-                    graph_runner = None
 
             if graph_runner is not None and eos_token_values and self._async_eos_window > 1:
                 return self._generate_with_async_eos_poll(
@@ -1091,6 +1242,8 @@ class VLMModel:
 
         # Wrap model
         self._wrapped_model = ModelWrapper(self._model)
+        if _ENABLE_BENCHMARK_PROMPT_PREFIX_REUSE:
+            self._optimizations_applied.append("benchmark:prompt_prefix_reuse")
 
         print(f"[VLMModel] Optimizations: {', '.join(self._optimizations_applied)}")
 
@@ -1142,6 +1295,7 @@ class VLMModel:
 
         prefill_grid_key_by_ptr = {}
         prefill_segment_info_by_ptr = {}
+        prefill_request_key_by_input_ptr = {}
 
         def _tensor_ptr(tensor):
             if torch.is_tensor(tensor):
@@ -1223,6 +1377,30 @@ class VLMModel:
                 "rope_delta_value": image_advance - image_token_count,
             }
 
+        def _extract_request_key_from_messages(messages):
+            if not isinstance(messages, list):
+                return None
+            text_parts = []
+            image_ids = []
+            for message in messages:
+                if not isinstance(message, dict):
+                    continue
+                content = message.get("content")
+                if not isinstance(content, list):
+                    continue
+                for item in content:
+                    if not isinstance(item, dict):
+                        continue
+                    item_type = item.get("type")
+                    if item_type == "text":
+                        text_parts.append(str(item.get("text", "")))
+                    elif item_type == "image":
+                        image_obj = item.get("image")
+                        image_ids.append(0 if image_obj is None else int(id(image_obj)))
+            if not text_parts and not image_ids:
+                return None
+            return ("chat", tuple(text_parts), tuple(image_ids))
+
         def _extract_prefill_host_meta(batch):
             if not hasattr(batch, "get"):
                 return None
@@ -1271,6 +1449,10 @@ class VLMModel:
         def _register_prefill_batch_meta(batch, meta):
             if not meta or not hasattr(batch, "get"):
                 return
+            input_ids = batch.get("input_ids")
+            request_key = meta.get("request_key")
+            if request_key is not None and torch.is_tensor(input_ids):
+                _cache_put(prefill_request_key_by_input_ptr, int(input_ids.data_ptr()), request_key)
             image_grid_thw = batch.get("image_grid_thw")
             grid_key = meta.get("grid_key")
             if grid_key and torch.is_tensor(image_grid_thw):
@@ -1293,12 +1475,16 @@ class VLMModel:
                 batch = orig_apply_chat_template(*args, **kwargs)
                 if not hasattr(batch, "to"):
                     return batch
+                messages = args[0] if args else kwargs.get("conversation")
+                request_key = _extract_request_key_from_messages(messages)
                 if visual_dtype is not None and hasattr(batch, "data"):
                     for name in ("pixel_values", "pixel_values_videos"):
                         value = batch.data.get(name)
                         if torch.is_tensor(value) and value.device.type == "cpu" and value.dtype != visual_dtype:
                             batch.data[name] = value.to(dtype=visual_dtype)
-                batch._prefill_host_meta = _extract_prefill_host_meta(batch)
+                batch._prefill_host_meta = _extract_prefill_host_meta(batch) or {}
+                if request_key is not None:
+                    batch._prefill_host_meta["request_key"] = request_key
                 orig_to = batch.to
 
                 def _to_with_prefill_meta(this_batch, *to_args, **to_kwargs):
@@ -1981,6 +2167,8 @@ class VLMModel:
             model_core._prefill_rope_position_cache = rope_position_cache
             model_core._prefill_rope_output_cache = rope_output_cache
             self._optimizations_applied.append("prefill:rope_fastpath")
+
+        self._model._prefill_request_key_by_input_ptr = prefill_request_key_by_input_ptr
 
     @property
     def processor(self):
