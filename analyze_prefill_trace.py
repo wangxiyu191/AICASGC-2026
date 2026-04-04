@@ -91,6 +91,130 @@ def _count_matching(events, start_ts: float, end_ts: float, predicate: Callable[
     return count
 
 
+def _clipped_window_events(events, start_ts: float, end_ts: float):
+    window = []
+    for ev in events:
+        overlap_us = _overlap_us(ev, start_ts, end_ts)
+        if overlap_us <= 0:
+            continue
+        clipped = dict(ev)
+        clipped["_start_ts"] = max(ev.get("ts", 0.0), start_ts)
+        clipped["_end_ts"] = min(_event_end(ev), end_ts)
+        window.append(clipped)
+    window.sort(key=lambda ev: (ev["_start_ts"], ev["_end_ts"]))
+    return window
+
+
+def _display_gpu_name(ev: dict) -> str:
+    if ev.get("cat") == "kernel":
+        return simplify_kernel_name(ev.get("name", ""))
+    return f"[{ev.get('cat', 'gpu')}] {ev.get('name', '')}"
+
+
+def _build_gpu_gap_profile(
+    start_ts: float,
+    end_ts: float,
+    cpu_events,
+    gpu_events,
+    top_k: int,
+):
+    window_gpu = _clipped_window_events(gpu_events, start_ts, end_ts)
+    span_us = max(0.0, end_ts - start_ts)
+    if not window_gpu:
+        return {
+            "gpu_busy_timeline_ms": 0.0,
+            "gpu_idle_timeline_ms": span_us / 1000.0,
+            "gpu_busy_timeline_pct": 0.0,
+            "total_positive_gap_ms": 0.0,
+            "gap_thresholds": [],
+            "top_gap_boundaries": [],
+            "top_gap_cpu_groups": [],
+            "top_gap_cpu_ops": [],
+        }
+
+    merged = []
+    for ev in window_gpu:
+        ev_start = ev["_start_ts"]
+        ev_end = ev["_end_ts"]
+        if not merged or ev_start > merged[-1][1]:
+            merged.append([ev_start, ev_end])
+        else:
+            merged[-1][1] = max(merged[-1][1], ev_end)
+
+    busy_us = sum(end - start for start, end in merged)
+    idle_us = max(0.0, span_us - busy_us)
+
+    thresholds_us = (20.0, 50.0, 100.0, 200.0)
+    threshold_summary = {threshold: {"count": 0, "total_us": 0.0} for threshold in thresholds_us}
+    boundary_totals = defaultdict(float)
+    boundary_counts = defaultdict(int)
+    boundary_max = defaultdict(float)
+    gap_windows = []
+    total_positive_gap_us = 0.0
+
+    prev = window_gpu[0]
+    for cur in window_gpu[1:]:
+        gap_us = cur["_start_ts"] - prev["_end_ts"]
+        if gap_us > 0:
+            total_positive_gap_us += gap_us
+            for threshold in thresholds_us:
+                if gap_us >= threshold:
+                    threshold_summary[threshold]["count"] += 1
+                    threshold_summary[threshold]["total_us"] += gap_us
+            if gap_us >= 50.0:
+                boundary = (_display_gpu_name(prev), _display_gpu_name(cur))
+                boundary_totals[boundary] += gap_us
+                boundary_counts[boundary] += 1
+                boundary_max[boundary] = max(boundary_max[boundary], gap_us)
+                gap_windows.append((prev["_end_ts"], cur["_start_ts"]))
+        if cur["_end_ts"] > prev["_end_ts"]:
+            prev = cur
+
+    gap_cpu_groups = defaultdict(float)
+    gap_cpu_ops = defaultdict(float)
+    if gap_windows:
+        for ev in cpu_events:
+            for gap_start, gap_end in gap_windows:
+                overlap_us = _overlap_us(ev, gap_start, gap_end)
+                if overlap_us <= 0:
+                    continue
+                gap_cpu_groups[categorize_cpu_op(ev.get("name", ""))] += overlap_us
+                gap_cpu_ops[ev.get("name", "")] += overlap_us
+
+    return {
+        "gpu_busy_timeline_ms": busy_us / 1000.0,
+        "gpu_idle_timeline_ms": idle_us / 1000.0,
+        "gpu_busy_timeline_pct": (busy_us / span_us * 100.0) if span_us > 0 else 0.0,
+        "total_positive_gap_ms": total_positive_gap_us / 1000.0,
+        "gap_thresholds": [
+            {
+                "threshold_us": threshold,
+                "count": threshold_summary[threshold]["count"],
+                "total_ms": threshold_summary[threshold]["total_us"] / 1000.0,
+            }
+            for threshold in thresholds_us
+        ],
+        "top_gap_boundaries": [
+            {
+                "prev": prev_name,
+                "next": next_name,
+                "count": boundary_counts[(prev_name, next_name)],
+                "total_ms": boundary_totals[(prev_name, next_name)] / 1000.0,
+                "max_ms": boundary_max[(prev_name, next_name)] / 1000.0,
+            }
+            for (prev_name, next_name), _ in _sorted_items(boundary_totals, top_k)
+        ],
+        "top_gap_cpu_groups": [
+            {"name": group, "total_ms": total_us / 1000.0}
+            for group, total_us in _sorted_items(gap_cpu_groups, top_k)
+        ],
+        "top_gap_cpu_ops": [
+            {"name": op, "total_ms": total_us / 1000.0}
+            for op, total_us in _sorted_items(gap_cpu_ops, top_k)
+        ],
+    }
+
+
 def _summarize_window(
     name: str,
     start_ts: float,
@@ -134,6 +258,13 @@ def _summarize_window(
 
     gpu_accum_us = sum(gpu_groups.values())
     cpu_accum_us = sum(cpu_groups.values())
+    gpu_gap_profile = _build_gpu_gap_profile(
+        start_ts,
+        end_ts,
+        cpu_events=cpu_events,
+        gpu_events=gpu_events,
+        top_k=top_k,
+    )
 
     result = {
         "name": name,
@@ -145,6 +276,14 @@ def _summarize_window(
         "gpu_event_count": gpu_event_count,
         "cpu_event_count": cpu_event_count,
         "gpu_accum_vs_span_pct": (gpu_accum_us / span_us * 100.0) if span_us > 0 else 0.0,
+        "gpu_busy_timeline_ms": gpu_gap_profile["gpu_busy_timeline_ms"],
+        "gpu_idle_timeline_ms": gpu_gap_profile["gpu_idle_timeline_ms"],
+        "gpu_busy_timeline_pct": gpu_gap_profile["gpu_busy_timeline_pct"],
+        "gpu_gap_total_ms": gpu_gap_profile["total_positive_gap_ms"],
+        "gpu_gap_thresholds": gpu_gap_profile["gap_thresholds"],
+        "top_gpu_gap_boundaries": gpu_gap_profile["top_gap_boundaries"],
+        "top_gap_cpu_groups": gpu_gap_profile["top_gap_cpu_groups"],
+        "top_gap_cpu_ops": gpu_gap_profile["top_gap_cpu_ops"],
         "top_gpu_groups": [
             {"name": group, "total_ms": total_us / 1000.0}
             for group, total_us in _sorted_items(gpu_groups, top_k)
@@ -349,10 +488,33 @@ def _print_phase_summary(phase):
         f"gpu_events={phase['gpu_event_count']}  cpu_events={phase['cpu_event_count']}  "
         f"attention_kernels={phase['attention_kernel_count']}  conv_kernels={phase['conv_kernel_count']}"
     )
+    print(
+        "  "
+        f"gpu_busy_timeline={phase['gpu_busy_timeline_ms']:.3f} ms  "
+        f"gpu_idle_timeline={phase['gpu_idle_timeline_ms']:.3f} ms  "
+        f"busy_pct={phase['gpu_busy_timeline_pct']:.1f}%"
+    )
+    gap_50 = next((item for item in phase["gpu_gap_thresholds"] if item["threshold_us"] == 50.0), None)
+    gap_100 = next((item for item in phase["gpu_gap_thresholds"] if item["threshold_us"] == 100.0), None)
+    if gap_50 is not None or gap_100 is not None:
+        parts = []
+        if gap_50 is not None:
+            parts.append(f">=50us gaps={gap_50['count']} total={gap_50['total_ms']:.3f} ms")
+        if gap_100 is not None:
+            parts.append(f">=100us gaps={gap_100['count']} total={gap_100['total_ms']:.3f} ms")
+        print("  " + "  ".join(parts))
     if phase["top_gpu_groups"]:
         print("  top gpu groups:")
         for item in phase["top_gpu_groups"]:
             print(f"    {item['name']}: {item['total_ms']:.3f} ms")
+    if phase["top_gpu_gap_boundaries"]:
+        print("  top gpu gap boundaries (>=50us):")
+        for item in phase["top_gpu_gap_boundaries"][: min(5, len(phase["top_gpu_gap_boundaries"]))]:
+            print(
+                "    "
+                f"{item['count']}x {item['prev']} -> {item['next']}: "
+                f"total={item['total_ms']:.3f} ms max={item['max_ms']:.3f} ms"
+            )
     if phase["top_gpu_ops"]:
         print("  top gpu ops:")
         for item in phase["top_gpu_ops"]:
@@ -360,6 +522,10 @@ def _print_phase_summary(phase):
     if phase["top_cpu_groups"]:
         print("  top cpu groups:")
         for item in phase["top_cpu_groups"]:
+            print(f"    {item['name']}: {item['total_ms']:.3f} ms")
+    if phase["top_gap_cpu_groups"]:
+        print("  top cpu groups during gpu gaps (>=50us):")
+        for item in phase["top_gap_cpu_groups"][: min(5, len(phase["top_gap_cpu_groups"]))]:
             print(f"    {item['name']}: {item['total_ms']:.3f} ms")
 
 

@@ -157,6 +157,7 @@ def _trace_prefill(
     trace_iters: int,
     trace_output: Path,
     l2_flush_mb: int,
+    viztrace_mode: str,
 ):
     from viztracer import VizTracer
 
@@ -171,7 +172,22 @@ def _trace_prefill(
         )
         torch.cuda.synchronize()
 
-    tracer = VizTracer(log_torch=True, output_file=str(trace_output), max_stack_depth=15, verbose=0)
+    viztrace_kwargs = {
+        "output_file": str(trace_output),
+        "verbose": 0,
+    }
+    if viztrace_mode == "full":
+        viztrace_kwargs["log_torch"] = True
+        viztrace_kwargs["max_stack_depth"] = 15
+        viztrace_kwargs["min_duration"] = 0
+    elif viztrace_mode == "lite":
+        viztrace_kwargs["log_torch"] = False
+        viztrace_kwargs["max_stack_depth"] = 8
+        viztrace_kwargs["min_duration"] = 50
+    else:
+        raise ValueError(f"Unsupported viztrace_mode={viztrace_mode}")
+
+    tracer = VizTracer(**viztrace_kwargs)
     tracer.start()
     try:
         for _ in range(trace_iters):
@@ -201,6 +217,17 @@ def main():
     parser.add_argument("--l2-flush-mb", type=int, default=DEFAULT_BENCHMARK_L2_FLUSH_MB)
     parser.add_argument("--viztrace", action="store_true", help="Capture VizTracer trace for the prefill loop.")
     parser.add_argument("--viztrace-iters", type=int, default=1, help="Number of traced prefill runs.")
+    parser.add_argument(
+        "--viztrace-mode",
+        type=str,
+        default="full",
+        choices=("full", "lite"),
+        help=(
+            "VizTracer capture mode. "
+            "'full' keeps torch ops / GPU kernels but has much higher runtime overhead; "
+            "'lite' records only top-level Python/FEE timing with lower overhead."
+        ),
+    )
     parser.add_argument("--viztrace-output", type=str, default=None, help="Trace JSON output path under traces/.")
     parser.add_argument("--output", type=str, default=None, help="Output JSON path (default: results/...)")
     args = parser.parse_args()
@@ -282,7 +309,7 @@ def main():
         trace_path.parent.mkdir(parents=True, exist_ok=True)
         print(
             "[PrefillBench] Capturing viztrace "
-            f"(warmup={args.warmup}, iters={args.viztrace_iters})..."
+            f"(warmup={args.warmup}, iters={args.viztrace_iters}, mode={args.viztrace_mode})..."
         )
         _trace_prefill(
             vlm,
@@ -293,6 +320,7 @@ def main():
             trace_iters=args.viztrace_iters,
             trace_output=trace_path,
             l2_flush_mb=args.l2_flush_mb,
+            viztrace_mode=args.viztrace_mode,
         )
         print(f"[PrefillBench] Trace saved to: {trace_path}")
 
@@ -308,6 +336,7 @@ def main():
         output["trace"] = {
             "enabled": True,
             "iters": int(args.viztrace_iters),
+            "mode": args.viztrace_mode,
             "output": str(trace_path),
         }
     else:

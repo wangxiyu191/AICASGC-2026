@@ -338,16 +338,19 @@ _TRITON_ROWS_THRESHOLD = 32
 _ENABLE_TRITON_SMALL_RMSNORM = os.environ.get("ENABLE_TRITON_SMALL_RMSNORM", "1") == "1"
 _ENABLE_CUDA_RMSNORM = os.environ.get("ENABLE_CUDA_RMSNORM", "0") == "1"
 _ENABLE_TRITON_SMALL_ADD_RMSNORM = os.environ.get("ENABLE_TRITON_SMALL_ADD_RMSNORM", "1") == "1"
+_ENABLE_TRITON_PREFILL_FUSED_ADD_RMSNORM = os.environ.get("ENABLE_TRITON_PREFILL_FUSED_ADD_RMSNORM", "1") == "1"
 _ENABLE_CUDA_FUSED_ADD_RMSNORM = os.environ.get("ENABLE_CUDA_FUSED_ADD_RMSNORM", "0") == "1"
 _ENABLE_CUDA_FUSED_ADD_RMSNORM_GATEUP = os.environ.get("ENABLE_CUDA_FUSED_ADD_RMSNORM_GATEUP", "0") == "1"
 _ENABLE_CUDA_FUSED_GATEUP_SILU_DOWNPROJ = os.environ.get("ENABLE_CUDA_FUSED_GATEUP_SILU_DOWNPROJ", "0") == "1"
 _ENABLE_CUDA_FUSED_GATEUP_SILU_DOWNPROJ_MEGA = os.environ.get("ENABLE_CUDA_FUSED_GATEUP_SILU_DOWNPROJ_MEGA", "0") == "1"
 _ENABLE_TRITON_SMALL_SILU_MUL = os.environ.get("ENABLE_TRITON_SMALL_SILU_MUL", "0") == "1"
+_ENABLE_TRITON_PREFILL_FUSED_SILU_MUL = os.environ.get("ENABLE_TRITON_PREFILL_FUSED_SILU_MUL", "1") == "1"
 _ENABLE_CUDA_FUSED_SILU_MUL = os.environ.get("ENABLE_CUDA_FUSED_SILU_MUL", "0") == "1"
 _ENABLE_CUDA_FUSED_SILU_DOWNPROJ = os.environ.get("ENABLE_CUDA_FUSED_SILU_DOWNPROJ", "0") == "1"
 _ENABLE_CUDA_ADD = os.environ.get("ENABLE_CUDA_ADD", "0") == "1"
 _ENABLE_DOWNPROJ_RESIDUAL_EPILOGUE = os.environ.get("ENABLE_DOWNPROJ_RESIDUAL_EPILOGUE", "0") == "1"
 _ENABLE_TRITON_SMALL_QK_NORM_ROPE = os.environ.get("ENABLE_TRITON_SMALL_QK_NORM_ROPE", "1") == "1"
+_ENABLE_TRITON_PREFILL_FUSED_RMS_NORM_ROPE = os.environ.get("ENABLE_TRITON_PREFILL_FUSED_RMS_NORM_ROPE", "0") == "1"
 _ENABLE_TRITON_SMALL_FUSED_QK_NORM_ROPE = os.environ.get("ENABLE_TRITON_SMALL_FUSED_QK_NORM_ROPE", "0") == "1"
 _ENABLE_TRITON_PREFILL_FUSED_QK_NORM_ROPE = os.environ.get("ENABLE_TRITON_PREFILL_FUSED_QK_NORM_ROPE", "0") == "1"
 _ENABLE_CUDA_FUSED_QK_NORM_ROPE = os.environ.get("ENABLE_CUDA_FUSED_QK_NORM_ROPE", "0") == "1"
@@ -443,14 +446,23 @@ def _fused_rms_norm_rope(
     """Fuse RMSNorm + RoPE for decode-small shapes when profitable."""
     batch, seq_len, nheads, D = x.shape
     half_d = D // 2
+    allow_triton = (
+        (
+            prefer_small_triton
+            and _ENABLE_TRITON_SMALL_QK_NORM_ROPE
+            and seq_len <= _TRITON_ROWS_THRESHOLD
+        )
+        or (
+            (not prefer_small_triton)
+            and _ENABLE_TRITON_PREFILL_FUSED_RMS_NORM_ROPE
+        )
+    )
     if (
-        (not prefer_small_triton)
-        or (not _ENABLE_TRITON_SMALL_QK_NORM_ROPE)
+        (not allow_triton)
         or x.device.type != "cuda"
         or weight.device.type != "cuda"
         or cos.device.type != "cuda"
         or sin.device.type != "cuda"
-        or seq_len > _TRITON_ROWS_THRESHOLD
         or x.stride(-1) != 1
         or weight.stride(-1) != 1
         or cos.stride(-1) != 1
@@ -612,6 +624,16 @@ def _fused_add_rms_norm(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return (residual_plus_x, rms_norm(residual_plus_x)) with one Triton kernel when useful."""
     N = residual.shape[-1]
+    allow_triton = (
+        (
+            prefer_small_triton
+            and _ENABLE_TRITON_SMALL_ADD_RMSNORM
+        )
+        or (
+            (not prefer_small_triton)
+            and _ENABLE_TRITON_PREFILL_FUSED_ADD_RMSNORM
+        )
+    )
     if (
         prefer_small_triton
         and _ENABLE_CUDA_FUSED_ADD_RMSNORM
@@ -626,8 +648,7 @@ def _fused_add_rms_norm(
         return cuda_decode_small_ops.fused_add_rms_norm(residual, x, weight, eps)
 
     if (
-        (not prefer_small_triton)
-        or (not _ENABLE_TRITON_SMALL_ADD_RMSNORM)
+        (not allow_triton)
         or residual.device.type != "cuda"
         or x.device.type != "cuda"
         or weight.device.type != "cuda"
@@ -710,6 +731,16 @@ def _fused_silu_mul(
     prefer_small_triton: bool = False,
 ) -> torch.Tensor:
     """Fuse SiLU(gate) * up into one kernel when useful."""
+    allow_triton = (
+        (
+            prefer_small_triton
+            and _ENABLE_TRITON_SMALL_SILU_MUL
+        )
+        or (
+            (not prefer_small_triton)
+            and _ENABLE_TRITON_PREFILL_FUSED_SILU_MUL
+        )
+    )
     if (
         prefer_small_triton
         and _ENABLE_CUDA_FUSED_SILU_MUL
@@ -722,8 +753,7 @@ def _fused_silu_mul(
         return cuda_decode_small_ops.fused_silu_mul(gate, up)
 
     if (
-        (not prefer_small_triton)
-        or (not _ENABLE_TRITON_SMALL_SILU_MUL)
+        (not allow_triton)
         or gate.device.type != "cuda"
         or up.device.type != "cuda"
         or gate.stride(-1) != 1

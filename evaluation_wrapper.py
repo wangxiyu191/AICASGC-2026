@@ -34,6 +34,8 @@ _ENABLE_PREFILL_ROPE_FASTPATH = os.environ.get("ENABLE_PREFILL_ROPE_FASTPATH", "
 _ENABLE_PREFILL_PATCH_EMBED_LINEAR = os.environ.get("ENABLE_PREFILL_PATCH_EMBED_LINEAR", "1") == "1"
 _ENABLE_PREFILL_MM_SLICE_FASTPATH = os.environ.get("ENABLE_PREFILL_MM_SLICE_FASTPATH", "1") == "1"
 _ENABLE_PREFILL_TEXT_FASTPATH = os.environ.get("ENABLE_PREFILL_TEXT_FASTPATH", "1") == "1"
+_ENABLE_TRITON_PREFILL_FUSED_ADD_RMSNORM = os.environ.get("ENABLE_TRITON_PREFILL_FUSED_ADD_RMSNORM", "1") == "1"
+_ENABLE_TRITON_PREFILL_FUSED_SILU_MUL = os.environ.get("ENABLE_TRITON_PREFILL_FUSED_SILU_MUL", "1") == "1"
 _PREFILL_CACHE_MAX_ITEMS = max(1, int(os.environ.get("PREFILL_CACHE_MAX_ITEMS", "64")))
 
 
@@ -1900,6 +1902,10 @@ class VLMModel:
                     language_model._prefill_cache_position_cache = prefill_text_cache_position_cache
                     language_model._prefill_rotary_cache = prefill_text_rotary_cache
                     self._optimizations_applied.append("prefill:text_fastpath")
+                if _ENABLE_TRITON_PREFILL_FUSED_ADD_RMSNORM:
+                    self._optimizations_applied.append("prefill:fused_add_rmsnorm")
+                if _ENABLE_TRITON_PREFILL_FUSED_SILU_MUL:
+                    self._optimizations_applied.append("prefill:fused_silu_mul")
 
         if _ENABLE_PREFILL_ROPE_FASTPATH:
             rope_position_cache = {}
