@@ -25,6 +25,8 @@ from transformers import AutoModelForImageTextToText, AutoProcessor
 from transformers.cache_utils import StaticCache
 
 os.environ.setdefault("ENABLE_CUDA_NOSPLIT_GEMV", "1")
+os.environ.setdefault("ENABLE_CUDA_FUSED_GATEUP_SILU_DOWNPROJ", "1")
+os.environ.setdefault("CUDA_FUSED_GATEUP_SILU_DOWNPROJ_VARIANT", "persistent")
 
 from optimized_layer import replace_decoder_layers, set_small_decode_triton_enabled
 
@@ -1247,6 +1249,9 @@ class VLMModel:
         self._wrapped_model = ModelWrapper(self._model)
         if _ENABLE_BENCHMARK_PROMPT_PREFIX_REUSE:
             self._optimizations_applied.append("benchmark:prompt_prefix_reuse")
+        if os.environ.get("ENABLE_CUDA_FUSED_GATEUP_SILU_DOWNPROJ", "0") == "1":
+            variant = os.environ.get("CUDA_FUSED_GATEUP_SILU_DOWNPROJ_VARIANT", "persistent").strip().lower()
+            self._optimizations_applied.append(f"decode:mlp_fused_{variant}")
 
         print(f"[VLMModel] Optimizations: {', '.join(self._optimizations_applied)}")
 

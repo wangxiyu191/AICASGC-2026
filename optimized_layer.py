@@ -349,6 +349,10 @@ _ENABLE_CUDA_FUSED_ADD_RMSNORM = os.environ.get("ENABLE_CUDA_FUSED_ADD_RMSNORM",
 _ENABLE_CUDA_FUSED_ADD_RMSNORM_GATEUP = os.environ.get("ENABLE_CUDA_FUSED_ADD_RMSNORM_GATEUP", "0") == "1"
 _ENABLE_CUDA_FUSED_GATEUP_SILU_DOWNPROJ = os.environ.get("ENABLE_CUDA_FUSED_GATEUP_SILU_DOWNPROJ", "0") == "1"
 _ENABLE_CUDA_FUSED_GATEUP_SILU_DOWNPROJ_MEGA = os.environ.get("ENABLE_CUDA_FUSED_GATEUP_SILU_DOWNPROJ_MEGA", "0") == "1"
+_CUDA_FUSED_GATEUP_SILU_DOWNPROJ_VARIANT = os.environ.get(
+    "CUDA_FUSED_GATEUP_SILU_DOWNPROJ_VARIANT",
+    "persistent",
+).strip().lower()
 _ENABLE_TRITON_SMALL_SILU_MUL = os.environ.get("ENABLE_TRITON_SMALL_SILU_MUL", "0") == "1"
 _ENABLE_TRITON_PREFILL_FUSED_SILU_MUL = os.environ.get("ENABLE_TRITON_PREFILL_FUSED_SILU_MUL", "1") == "1"
 _ENABLE_CUDA_FUSED_SILU_MUL = os.environ.get("ENABLE_CUDA_FUSED_SILU_MUL", "0") == "1"
@@ -852,6 +856,28 @@ def _fused_gateup_silu_downproj(
             gate_up_weight,
             down_proj_weight,
         )
+    if down_proj_bias is None:
+        if _CUDA_FUSED_GATEUP_SILU_DOWNPROJ_VARIANT == "persistent":
+            _hidden_states, out = cuda_decode_gemv.fused_gateup_silu_downproj_persistent_half(
+                x,
+                gate_up_weight,
+                down_proj_weight,
+            )
+            return out
+        if _CUDA_FUSED_GATEUP_SILU_DOWNPROJ_VARIANT == "gridsync":
+            _hidden_states, out = cuda_decode_gemv.fused_gateup_silu_downproj_gridsync_half(
+                x,
+                gate_up_weight,
+                down_proj_weight,
+            )
+            return out
+        if _CUDA_FUSED_GATEUP_SILU_DOWNPROJ_VARIANT == "softsync":
+            _hidden_states, out = cuda_decode_gemv.fused_gateup_silu_downproj_softsync_half(
+                x,
+                gate_up_weight,
+                down_proj_weight,
+            )
+            return out
     _hidden_states, out = cuda_decode_gemv.fused_gateup_silu_downproj_half(
         x,
         gate_up_weight,
