@@ -471,6 +471,203 @@ constexpr int kPersistentThreads = 1024;
 constexpr int kPersistentWarps   = 32;  // 1024 / 32
 
 __launch_bounds__(1024, 1)
+__global__ void fused_post_attn_mlp_persistent_k2048_k6144_fwd_kernel(
+    const at::Half* __restrict__ residual,
+    const at::Half* __restrict__ attn_output,
+    const at::Half* __restrict__ norm_weight,
+    const at::Half* __restrict__ gate_up_weight,
+    const at::Half* __restrict__ down_proj_weight,
+    const at::Half* __restrict__ bias,
+    at::Half* __restrict__ hidden_out,
+    at::Half* __restrict__ out,
+    float eps,
+    bool has_bias,
+    int64_t gate_up_stride_wn,
+    int64_t down_proj_stride_wn) {
+    __shared__ __align__(16) __half residual_sh[kNosplitSpecializedK2048];
+    __shared__ __align__(16) __half x_small_sh[kNosplitSpecializedK2048];
+    __shared__ float warp_sums[kPersistentWarps];
+    __shared__ float inv_rms_sh;
+    __shared__ __align__(16) uint4 x_tile_sh[2][kAsyncVecsPerTileK6144];
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const __half* residual_half = reinterpret_cast<const __half*>(residual);
+    const __half* attn_half = reinterpret_cast<const __half*>(attn_output);
+    const __half* norm_half = reinterpret_cast<const __half*>(norm_weight);
+    const __half* gate_w_half = reinterpret_cast<const __half*>(gate_up_weight);
+    const __half* down_w_half = reinterpret_cast<const __half*>(down_proj_weight);
+    const __half* bias_half = reinterpret_cast<const __half*>(bias);
+    __half* hidden_half = reinterpret_cast<__half*>(hidden_out);
+    __half* out_half = reinterpret_cast<__half*>(out);
+    uint4* x_small_vec = reinterpret_cast<uint4*>(x_small_sh);
+    constexpr int vecs_k2048 = kNosplitSpecializedK2048 / kHalfPerVec128;  // 256
+
+    float thread_sum_sq = 0.0f;
+    for (int idx = threadIdx.x; idx < kNosplitSpecializedK2048; idx += kPersistentThreads) {
+        const __half summed = __hadd(residual_half[idx], attn_half[idx]);
+        residual_sh[idx] = summed;
+        const float summed_f = __half2float(summed);
+        thread_sum_sq += summed_f * summed_f;
+    }
+
+    thread_sum_sq = warp_sum(thread_sum_sq);
+    if (lane == 0) {
+        warp_sums[warp] = thread_sum_sq;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        float block_sum_sq = warp_sums[lane];
+        block_sum_sq = warp_sum(block_sum_sq);
+        if (lane == 0) {
+            inv_rms_sh = rsqrtf(block_sum_sq / static_cast<float>(kNosplitSpecializedK2048) + eps);
+        }
+    }
+    __syncthreads();
+
+    const float inv_rms = inv_rms_sh;
+    for (int idx = threadIdx.x; idx < kNosplitSpecializedK2048; idx += kPersistentThreads) {
+        const float summed_f = __half2float(residual_sh[idx]);
+        const float scale_f = __half2float(norm_half[idx]);
+        x_small_sh[idx] = __float2half(summed_f * inv_rms * scale_f);
+    }
+    __syncthreads();
+
+    // --- Phase 1: gate_up GEMV + SiLU fusion (grid-cycle) ---
+    for (int hidden_base = blockIdx.x * kPersistentWarps;
+         hidden_base < 6144;
+         hidden_base += gridDim.x * kPersistentWarps) {
+        const int hidden_idx = hidden_base + warp;
+        if (hidden_idx < 6144) {
+            const uint4* gate_row_vec = reinterpret_cast<const uint4*>(
+                gate_w_half + hidden_idx * gate_up_stride_wn);
+            const uint4* up_row_vec = reinterpret_cast<const uint4*>(
+                gate_w_half + (hidden_idx + 6144) * gate_up_stride_wn);
+            __half2 gate_acc0 = __float2half2_rn(0.0f);
+            __half2 gate_acc1 = __float2half2_rn(0.0f);
+            __half2 up_acc0 = __float2half2_rn(0.0f);
+            __half2 up_acc1 = __float2half2_rn(0.0f);
+
+            #pragma unroll
+            for (int vec_idx = lane; vec_idx < vecs_k2048; vec_idx += 64) {
+                const uint4 x_vec0 = x_small_vec[vec_idx];
+                const uint4 x_vec1 = x_small_vec[vec_idx + 32];
+                accumulate_hfma2_uint4(x_vec0, gate_row_vec[vec_idx], gate_acc0);
+                accumulate_hfma2_uint4(x_vec1, gate_row_vec[vec_idx + 32], gate_acc1);
+                accumulate_hfma2_uint4(x_vec0, up_row_vec[vec_idx], up_acc0);
+                accumulate_hfma2_uint4(x_vec1, up_row_vec[vec_idx + 32], up_acc1);
+            }
+
+            const float2 gate_f0 = __half22float2(gate_acc0);
+            const float2 gate_f1 = __half22float2(gate_acc1);
+            const float2 up_f0 = __half22float2(up_acc0);
+            const float2 up_f1 = __half22float2(up_acc1);
+            float gate_sum = gate_f0.x + gate_f0.y + gate_f1.x + gate_f1.y;
+            float up_sum = up_f0.x + up_f0.y + up_f1.x + up_f1.y;
+            gate_sum = warp_sum(gate_sum);
+            up_sum = warp_sum(up_sum);
+            if (lane == 0) {
+                hidden_half[hidden_idx] =
+                    __float2half(gate_sum / (1.0f + __expf(-gate_sum)) * up_sum);
+            }
+        }
+    }
+
+    // --- Hardware grid sync ---
+    cg::this_grid().sync();
+
+    // --- Phase 2: down_proj GEMV (hidden[6144] -> out[2048]) + residual epilogue ---
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    constexpr bool kUseCpAsync = true;
+#else
+    constexpr bool kUseCpAsync = false;
+#endif
+
+    const int row = blockIdx.x * kPersistentWarps + warp;
+
+    for (int vec_idx = threadIdx.x; vec_idx < kAsyncVecsPerTileK6144;
+         vec_idx += kPersistentThreads) {
+        if constexpr (kUseCpAsync) {
+            cp_async_cg_16(&x_tile_sh[0][vec_idx],
+                           reinterpret_cast<const uint4*>(hidden_half) + vec_idx);
+        } else {
+            x_tile_sh[0][vec_idx] =
+                reinterpret_cast<const uint4*>(hidden_half)[vec_idx];
+        }
+    }
+    if constexpr (kUseCpAsync) {
+        cp_async_commit_group();
+        cp_async_wait_group<0>();
+    }
+    __syncthreads();
+
+    float sum = 0.0f;
+    #pragma unroll
+    for (int tile_idx = 0; tile_idx < 6; ++tile_idx) {
+        const int stage = tile_idx & 1;
+        const int tile_start = tile_idx * kNosplitAsyncTileK6144;
+
+        if (tile_idx + 1 < 6) {
+            const int next_tile_start = tile_start + kNosplitAsyncTileK6144;
+            const uint4* x_next_vec =
+                reinterpret_cast<const uint4*>(hidden_half + next_tile_start);
+            for (int vec_idx = threadIdx.x; vec_idx < kAsyncVecsPerTileK6144;
+                 vec_idx += kPersistentThreads) {
+                if constexpr (kUseCpAsync) {
+                    cp_async_cg_16(&x_tile_sh[stage ^ 1][vec_idx], x_next_vec + vec_idx);
+                } else {
+                    x_tile_sh[stage ^ 1][vec_idx] = x_next_vec[vec_idx];
+                }
+            }
+            if constexpr (kUseCpAsync) {
+                cp_async_commit_group();
+            }
+        }
+
+        if (row < 2048) {
+            const uint4* x_sh_stage_vec = x_tile_sh[stage];
+            const uint4* w_row_vec = reinterpret_cast<const uint4*>(
+                down_w_half + row * down_proj_stride_wn + tile_start);
+            __half2 h2_acc0 = __float2half2_rn(0.0f);
+            __half2 h2_acc1 = __float2half2_rn(0.0f);
+
+            #pragma unroll
+            for (int vec_idx = lane; vec_idx < kAsyncVecsPerTileK6144; vec_idx += 64) {
+                const uint4 x_vec0 = x_sh_stage_vec[vec_idx];
+                const uint4 w_vec0 = w_row_vec[vec_idx];
+                const uint4 x_vec1 = x_sh_stage_vec[vec_idx + 32];
+                const uint4 w_vec1 = w_row_vec[vec_idx + 32];
+                accumulate_hfma2_uint4(x_vec0, w_vec0, h2_acc0);
+                accumulate_hfma2_uint4(x_vec1, w_vec1, h2_acc1);
+            }
+
+            const float2 f2_0 = __half22float2(h2_acc0);
+            const float2 f2_1 = __half22float2(h2_acc1);
+            sum += f2_0.x + f2_0.y + f2_1.x + f2_1.y;
+        }
+
+        if constexpr (kUseCpAsync) {
+            if (tile_idx + 1 < 6) {
+                cp_async_wait_group<0>();
+            }
+        }
+        __syncthreads();
+    }
+
+    if (row < 2048) {
+        sum = warp_sum(sum);
+        if (lane == 0) {
+            float result = sum + __half2float(residual_sh[row]);
+            if (has_bias) {
+                result += __half2float(bias_half[row]);
+            }
+            out_half[row] = __float2half(result);
+        }
+    }
+}
+
+__launch_bounds__(1024, 1)
 __global__ void fused_gateup_silu_downproj_persistent_k2048_k6144_fwd_kernel(
     const at::Half* __restrict__ x,
     const at::Half* __restrict__ gate_up_weight,
@@ -960,6 +1157,83 @@ torch::Tensor fused_gateup_silu_downproj_gridsync_profile_half_cuda(
 // ---------------------------------------------------------------------------
 // Persistent kernel host wrappers
 // ---------------------------------------------------------------------------
+
+torch::Tensor fused_post_attn_mlp_persistent_half_cuda(
+    const torch::Tensor& residual,
+    const torch::Tensor& attn_output,
+    const torch::Tensor& norm_weight,
+    const torch::Tensor& gate_up_weight,
+    const torch::Tensor& down_proj_weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& hidden_out,
+    const torch::Tensor& out,
+    double eps,
+    bool has_bias) {
+    TORCH_CHECK(
+        residual.is_cuda() && attn_output.is_cuda() && norm_weight.is_cuda()
+            && gate_up_weight.is_cuda() && down_proj_weight.is_cuda(),
+        "inputs must be CUDA");
+    TORCH_CHECK(hidden_out.is_cuda() && out.is_cuda(), "outputs must be CUDA");
+    TORCH_CHECK(residual.scalar_type() == torch::kFloat16, "persistent only supports fp16");
+    TORCH_CHECK(attn_output.scalar_type() == torch::kFloat16, "persistent only supports fp16");
+    TORCH_CHECK(norm_weight.scalar_type() == torch::kFloat16, "persistent only supports fp16");
+    TORCH_CHECK(gate_up_weight.scalar_type() == torch::kFloat16, "persistent fp16");
+    TORCH_CHECK(down_proj_weight.scalar_type() == torch::kFloat16, "persistent fp16");
+    TORCH_CHECK(residual.dim() == 1 && residual.numel() == kNosplitSpecializedK2048, "residual [2048]");
+    TORCH_CHECK(attn_output.dim() == 1 && attn_output.numel() == kNosplitSpecializedK2048, "attn_output [2048]");
+    TORCH_CHECK(norm_weight.dim() == 1 && norm_weight.numel() == kNosplitSpecializedK2048, "norm_weight [2048]");
+    TORCH_CHECK(gate_up_weight.dim() == 2 && gate_up_weight.size(0) == 12288 &&
+        gate_up_weight.size(1) == kNosplitSpecializedK2048 && gate_up_weight.stride(1) == 1,
+        "gate_up [12288,2048] contiguous");
+    TORCH_CHECK(down_proj_weight.dim() == 2 && down_proj_weight.size(0) == 2048 &&
+        down_proj_weight.size(1) == 6144 && down_proj_weight.stride(1) == 1,
+        "down_proj [2048,6144] contiguous");
+    TORCH_CHECK(hidden_out.dim() == 1 && hidden_out.numel() == 6144, "hidden [6144]");
+    TORCH_CHECK(out.dim() == 1 && out.numel() == 2048, "out [2048]");
+    TORCH_CHECK(!has_bias || (bias.is_cuda() && bias.scalar_type() == torch::kFloat16 &&
+        bias.dim() == 1 && bias.numel() == 2048 && bias.stride(0) == 1),
+        "bias [2048] contiguous when provided");
+
+    int device_idx = static_cast<int>(residual.device().index());
+    int num_sms = 0;
+    C10_CUDA_CHECK(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device_idx));
+
+    c10::cuda::CUDAGuard device_guard(residual.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    auto* residual_ptr = residual.data_ptr<at::Half>();
+    auto* attn_ptr = attn_output.data_ptr<at::Half>();
+    auto* norm_ptr = norm_weight.data_ptr<at::Half>();
+    auto* gu_ptr = gate_up_weight.data_ptr<at::Half>();
+    auto* dp_ptr = down_proj_weight.data_ptr<at::Half>();
+    auto* bias_ptr = has_bias ? bias.data_ptr<at::Half>() : nullptr;
+    auto* h_ptr = hidden_out.data_ptr<at::Half>();
+    auto* o_ptr = out.data_ptr<at::Half>();
+    float eps_f = static_cast<float>(eps);
+    int64_t gu_s0 = gate_up_weight.stride(0);
+    int64_t dp_s0 = down_proj_weight.stride(0);
+
+    void* args[] = {
+        &residual_ptr,
+        &attn_ptr,
+        &norm_ptr,
+        &gu_ptr,
+        &dp_ptr,
+        &bias_ptr,
+        &h_ptr,
+        &o_ptr,
+        &eps_f,
+        &has_bias,
+        &gu_s0,
+        &dp_s0,
+    };
+
+    C10_CUDA_CHECK(cudaLaunchCooperativeKernel(
+        reinterpret_cast<void*>(fused_post_attn_mlp_persistent_k2048_k6144_fwd_kernel),
+        num_sms, kPersistentThreads, args, 0, stream));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
 
 torch::Tensor fused_gateup_silu_downproj_persistent_half_cuda(
     const torch::Tensor& x,

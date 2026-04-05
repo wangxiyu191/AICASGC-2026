@@ -222,6 +222,20 @@ class OptimizedDecoderLayer(nn.Module):
                 )
             attn_output = gemv_out if gemv_out is not None else self.o_proj(attn_output)
 
+        with _nvtx_range("decode.post_attn_mlp_persistent_full", enable_decode_nvtx):
+            fused_post_attn_mlp_out = _fused_post_attn_mlp_persistent(
+                residual,
+                attn_output,
+                self.post_attn_layernorm_weight,
+                self.gate_up_weight,
+                self.down_proj_weight,
+                self.down_proj_bias,
+                self.rms_norm_eps,
+                prefer_small_triton=prefer_small_decode_triton,
+            )
+            if fused_post_attn_mlp_out is not None:
+                return fused_post_attn_mlp_out
+
         # 6. Residual + Post-attention LayerNorm
         gate_up = None
         with _nvtx_range("decode.post_attn_add_rmsnorm", enable_decode_nvtx):
@@ -347,6 +361,7 @@ _ENABLE_TRITON_SMALL_ADD_RMSNORM = os.environ.get("ENABLE_TRITON_SMALL_ADD_RMSNO
 _ENABLE_TRITON_PREFILL_FUSED_ADD_RMSNORM = os.environ.get("ENABLE_TRITON_PREFILL_FUSED_ADD_RMSNORM", "1") == "1"
 _ENABLE_CUDA_FUSED_ADD_RMSNORM = os.environ.get("ENABLE_CUDA_FUSED_ADD_RMSNORM", "0") == "1"
 _ENABLE_CUDA_FUSED_ADD_RMSNORM_GATEUP = os.environ.get("ENABLE_CUDA_FUSED_ADD_RMSNORM_GATEUP", "0") == "1"
+_ENABLE_CUDA_FUSED_POST_ATTN_MLP_PERSISTENT = os.environ.get("ENABLE_CUDA_FUSED_POST_ATTN_MLP_PERSISTENT", "0") == "1"
 _ENABLE_CUDA_FUSED_GATEUP_SILU_DOWNPROJ = os.environ.get("ENABLE_CUDA_FUSED_GATEUP_SILU_DOWNPROJ", "0") == "1"
 _ENABLE_CUDA_FUSED_GATEUP_SILU_DOWNPROJ_MEGA = os.environ.get("ENABLE_CUDA_FUSED_GATEUP_SILU_DOWNPROJ_MEGA", "0") == "1"
 _CUDA_FUSED_GATEUP_SILU_DOWNPROJ_VARIANT = os.environ.get(
@@ -735,6 +750,58 @@ def _fused_add_rmsnorm_gateup(
         None,
         eps,
     )
+
+
+def _fused_post_attn_mlp_persistent(
+    residual: torch.Tensor,
+    attn_output: torch.Tensor,
+    norm_weight: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_proj_weight: torch.Tensor,
+    down_proj_bias: torch.Tensor | None,
+    eps: float,
+    prefer_small_triton: bool = False,
+) -> torch.Tensor | None:
+    if (
+        not prefer_small_triton
+        or not _ENABLE_CUDA_FUSED_POST_ATTN_MLP_PERSISTENT
+        or residual.device.type != "cuda"
+        or attn_output.device.type != "cuda"
+        or norm_weight.device.type != "cuda"
+        or gate_up_weight.device.type != "cuda"
+        or down_proj_weight.device.type != "cuda"
+        or residual.dtype != torch.float16
+        or attn_output.dtype != torch.float16
+        or norm_weight.dtype != torch.float16
+        or gate_up_weight.dtype != torch.float16
+        or down_proj_weight.dtype != torch.float16
+        or residual.ndim < 2
+        or residual.shape[-2] != 1
+        or residual.shape != attn_output.shape
+        or residual.shape[-1] != 2048
+        or norm_weight.numel() != 2048
+        or gate_up_weight.shape != (12288, 2048)
+        or down_proj_weight.shape != (2048, 6144)
+        or residual.stride(-1) != 1
+        or attn_output.stride(-1) != 1
+        or norm_weight.stride(-1) != 1
+        or gate_up_weight.stride(-1) != 1
+        or down_proj_weight.stride(-1) != 1
+        or (down_proj_bias is not None and down_proj_bias.dtype != torch.float16)
+    ):
+        return None
+
+    import cuda_decode_gemv
+    _hidden_states, out = cuda_decode_gemv.fused_post_attn_mlp_persistent_half(
+        residual,
+        attn_output,
+        norm_weight,
+        gate_up_weight,
+        down_proj_weight,
+        down_proj_bias,
+        eps,
+    )
+    return out
 
 
 def _fused_silu_mul(
@@ -2337,22 +2404,27 @@ def set_small_decode_triton_enabled(model, enabled: bool) -> bool:
 def set_cuda_mlp_fusion_flags(
     *,
     add_rmsnorm_gateup: bool | None = None,
+    post_attn_mlp_persistent: bool | None = None,
     silu_downproj: bool | None = None,
     gateup_silu_downproj: bool | None = None,
     gateup_silu_downproj_mega: bool | None = None,
-) -> tuple[bool, bool, bool, bool]:
+) -> tuple[bool, bool, bool, bool, bool]:
     global _ENABLE_CUDA_FUSED_ADD_RMSNORM_GATEUP
+    global _ENABLE_CUDA_FUSED_POST_ATTN_MLP_PERSISTENT
     global _ENABLE_CUDA_FUSED_SILU_DOWNPROJ
     global _ENABLE_CUDA_FUSED_GATEUP_SILU_DOWNPROJ
     global _ENABLE_CUDA_FUSED_GATEUP_SILU_DOWNPROJ_MEGA
     previous = (
         _ENABLE_CUDA_FUSED_ADD_RMSNORM_GATEUP,
+        _ENABLE_CUDA_FUSED_POST_ATTN_MLP_PERSISTENT,
         _ENABLE_CUDA_FUSED_SILU_DOWNPROJ,
         _ENABLE_CUDA_FUSED_GATEUP_SILU_DOWNPROJ,
         _ENABLE_CUDA_FUSED_GATEUP_SILU_DOWNPROJ_MEGA,
     )
     if add_rmsnorm_gateup is not None:
         _ENABLE_CUDA_FUSED_ADD_RMSNORM_GATEUP = add_rmsnorm_gateup
+    if post_attn_mlp_persistent is not None:
+        _ENABLE_CUDA_FUSED_POST_ATTN_MLP_PERSISTENT = post_attn_mlp_persistent
     if silu_downproj is not None:
         _ENABLE_CUDA_FUSED_SILU_DOWNPROJ = silu_downproj
     if gateup_silu_downproj is not None:

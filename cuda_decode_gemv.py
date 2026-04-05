@@ -1256,6 +1256,69 @@ def fused_gateup_silu_downproj_half(
     return hidden_out.view(*x.shape[:-1], 6144), out_vec.view(*x.shape[:-1], n)
 
 
+def fused_post_attn_mlp_persistent_half(
+    residual: torch.Tensor,
+    attn_output: torch.Tensor,
+    norm_weight: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_proj_weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    eps: float,
+    workspace: dict | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if (
+        residual.device.type != "cuda"
+        or attn_output.device.type != "cuda"
+        or norm_weight.device.type != "cuda"
+        or gate_up_weight.device.type != "cuda"
+        or down_proj_weight.device.type != "cuda"
+        or residual.dtype != torch.float16
+        or attn_output.dtype != torch.float16
+        or norm_weight.dtype != torch.float16
+        or gate_up_weight.dtype != torch.float16
+        or down_proj_weight.dtype != torch.float16
+        or residual.ndim < 2
+        or residual.shape[-2] != 1
+        or residual.shape != attn_output.shape
+    ):
+        raise RuntimeError("fused_post_attn_mlp_persistent_half expects fp16 CUDA single-token decode tensors")
+
+    residual_vec = residual.reshape(-1).contiguous()
+    attn_vec = attn_output.reshape(-1).contiguous()
+    norm_vec = norm_weight.reshape(-1).contiguous()
+    n, _k = down_proj_weight.shape
+    if (
+        workspace is not None
+        and workspace.get("type") == "fused_post_attn_mlp_persistent"
+        and tuple(workspace["hidden_out"].shape) == (6144,)
+        and tuple(workspace["out"].shape) == (n,)
+        and workspace["hidden_out"].device == residual.device
+        and workspace["out"].device == residual.device
+        and workspace["hidden_out"].dtype == residual.dtype
+        and workspace["out"].dtype == residual.dtype
+    ):
+        hidden_out = workspace["hidden_out"]
+        out_vec = workspace["out"]
+    else:
+        hidden_out = torch.empty((6144,), dtype=residual.dtype, device=residual.device)
+        out_vec = torch.empty((n,), dtype=residual.dtype, device=residual.device)
+
+    ext = _load_ext()
+    ext.fused_post_attn_mlp_persistent_half(
+        residual_vec,
+        attn_vec,
+        norm_vec,
+        gate_up_weight,
+        down_proj_weight,
+        bias if bias is not None else torch.empty(0, device=residual.device, dtype=residual.dtype),
+        hidden_out,
+        out_vec,
+        eps,
+        bias is not None,
+    )
+    return hidden_out.view(*residual.shape[:-1], 6144), out_vec.view(*residual.shape[:-1], n)
+
+
 def fused_gateup_silu_downproj_mega_half(
     x: torch.Tensor,
     gate_up_weight: torch.Tensor,

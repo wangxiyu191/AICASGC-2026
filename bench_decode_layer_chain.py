@@ -365,79 +365,93 @@ def _run_layer_chain_graph(target_layer, payload):
             outputs["o_proj_input_simulated"] = attn_output
 
             attn_output = _decode_gemv(attn_output, target_layer.o_proj_weight, target_layer.o_proj_bias)
+            outputs["post_o_proj_output_simulated"] = attn_output
 
-            fused_gate_up = optimized_layer._fused_add_rmsnorm_gateup(
+            fused_post_attn_mlp_out = optimized_layer._fused_post_attn_mlp_persistent(
                 layer_input,
                 attn_output,
                 target_layer.post_attn_layernorm_weight,
                 target_layer.gate_up_weight,
+                target_layer.down_proj_weight,
+                target_layer.down_proj_bias,
                 target_layer.rms_norm_eps,
                 prefer_small_triton=prefer_small_triton,
             )
-            if fused_gate_up is None:
-                residual, hidden_states = optimized_layer._fused_add_rms_norm(
+            if fused_post_attn_mlp_out is not None:
+                hidden_states = fused_post_attn_mlp_out
+            else:
+                fused_gate_up = optimized_layer._fused_add_rmsnorm_gateup(
                     layer_input,
                     attn_output,
                     target_layer.post_attn_layernorm_weight,
+                    target_layer.gate_up_weight,
                     target_layer.rms_norm_eps,
                     prefer_small_triton=prefer_small_triton,
                 )
-                gate_up = None
-            else:
-                residual, gate_up = fused_gate_up
-                hidden_states = None
+                if fused_gate_up is None:
+                    residual, hidden_states = optimized_layer._fused_add_rms_norm(
+                        layer_input,
+                        attn_output,
+                        target_layer.post_attn_layernorm_weight,
+                        target_layer.rms_norm_eps,
+                        prefer_small_triton=prefer_small_triton,
+                    )
+                    gate_up = None
+                else:
+                    residual, gate_up = fused_gate_up
+                    hidden_states = None
 
-            fused_mlp_out = None
-            if hidden_states is not None:
-                outputs["mlp_input_simulated"] = hidden_states
-                fused_mlp_out = optimized_layer._fused_gateup_silu_downproj(
-                    hidden_states,
-                    target_layer.gate_up_weight,
-                    target_layer.down_proj_weight,
-                    target_layer.down_proj_bias,
-                    prefer_small_triton=prefer_small_triton,
-                )
+                fused_mlp_out = None
+                if hidden_states is not None:
+                    outputs["mlp_input_simulated"] = hidden_states
+                    fused_mlp_out = optimized_layer._fused_gateup_silu_downproj(
+                        hidden_states,
+                        target_layer.gate_up_weight,
+                        target_layer.down_proj_weight,
+                        target_layer.down_proj_bias,
+                        prefer_small_triton=prefer_small_triton,
+                    )
 
-            if fused_mlp_out is None:
-                if gate_up is None:
-                    gate_up = _decode_gemv(hidden_states, target_layer.gate_up_weight, None)
-                outputs["gate_up_simulated"] = gate_up
-                fused_down_proj = optimized_layer._fused_silu_downproj(
-                    gate_up,
-                    target_layer.down_proj_weight,
-                    target_layer.down_proj_bias,
-                    prefer_small_triton=prefer_small_triton,
-                )
-            else:
-                fused_down_proj = fused_mlp_out
+                if fused_mlp_out is None:
+                    if gate_up is None:
+                        gate_up = _decode_gemv(hidden_states, target_layer.gate_up_weight, None)
+                    outputs["gate_up_simulated"] = gate_up
+                    fused_down_proj = optimized_layer._fused_silu_downproj(
+                        gate_up,
+                        target_layer.down_proj_weight,
+                        target_layer.down_proj_bias,
+                        prefer_small_triton=prefer_small_triton,
+                    )
+                else:
+                    fused_down_proj = fused_mlp_out
 
-            if fused_mlp_out is None and fused_down_proj is None:
-                gate, up = gate_up.chunk(2, dim=-1)
-                hidden_states = optimized_layer._fused_silu_mul(
-                    gate,
-                    up,
-                    prefer_small_triton=prefer_small_triton,
-                )
-                outputs["down_proj_input_simulated"] = hidden_states
+                if fused_mlp_out is None and fused_down_proj is None:
+                    gate, up = gate_up.chunk(2, dim=-1)
+                    hidden_states = optimized_layer._fused_silu_mul(
+                        gate,
+                        up,
+                        prefer_small_triton=prefer_small_triton,
+                    )
+                    outputs["down_proj_input_simulated"] = hidden_states
 
-                residual_epilogue_bias = None
-                if (
-                    optimized_layer._ENABLE_DOWNPROJ_RESIDUAL_EPILOGUE
-                    and target_layer.down_proj_bias is None
-                ):
-                    residual_epilogue_bias = residual
-                down_proj_bias = target_layer.down_proj_bias if residual_epilogue_bias is None else residual_epilogue_bias
-                hidden_states = _decode_gemv(hidden_states, target_layer.down_proj_weight, down_proj_bias)
-            else:
-                residual_epilogue_bias = None
-                hidden_states = fused_down_proj
+                    residual_epilogue_bias = None
+                    if (
+                        optimized_layer._ENABLE_DOWNPROJ_RESIDUAL_EPILOGUE
+                        and target_layer.down_proj_bias is None
+                    ):
+                        residual_epilogue_bias = residual
+                    down_proj_bias = target_layer.down_proj_bias if residual_epilogue_bias is None else residual_epilogue_bias
+                    hidden_states = _decode_gemv(hidden_states, target_layer.down_proj_weight, down_proj_bias)
+                else:
+                    residual_epilogue_bias = None
+                    hidden_states = fused_down_proj
 
-            if residual_epilogue_bias is None:
-                hidden_states = optimized_layer._add(
-                    hidden_states,
-                    residual,
-                    prefer_small_triton=prefer_small_triton,
-                )
+                if residual_epilogue_bias is None:
+                    hidden_states = optimized_layer._add(
+                        hidden_states,
+                        residual,
+                        prefer_small_triton=prefer_small_triton,
+                    )
 
             outputs["q_after_rope"] = q
             outputs["final_hidden_states"] = hidden_states
@@ -455,7 +469,16 @@ def _run_layer_chain_graph(target_layer, payload):
     else:
         gate_up = outputs.get("gate_up_simulated")
         if gate_up is None:
-            gate_up = _decode_gemv(outputs["mlp_input_simulated"], target_layer.gate_up_weight, None)
+            mlp_input = outputs.get("mlp_input_simulated")
+            if mlp_input is None:
+                _, mlp_input = optimized_layer._fused_add_rms_norm(
+                    layer_input,
+                    outputs["post_o_proj_output_simulated"],
+                    target_layer.post_attn_layernorm_weight,
+                    target_layer.rms_norm_eps,
+                    prefer_small_triton=prefer_small_triton,
+                )
+            gate_up = _decode_gemv(mlp_input, target_layer.gate_up_weight, None)
         gate, up = gate_up.chunk(2, dim=-1)
         down_proj_input = optimized_layer._fused_silu_mul(
             gate,
@@ -542,6 +565,11 @@ def main():
         help="Enable experimental CUDA fusion for post_attn_add_rmsnorm -> gate_up during graph replay only.",
     )
     parser.add_argument(
+        "--enable-fused-post-attn-mlp-persistent",
+        action="store_true",
+        help="Enable experimental persistent CUDA fusion for post_attn_add_rmsnorm -> gate_up -> silu_mul -> down_proj -> residual_add during graph replay only.",
+    )
+    parser.add_argument(
         "--enable-fused-silu-downproj",
         action="store_true",
         help="Enable experimental CUDA fusion for silu_mul -> down_proj during graph replay only.",
@@ -582,6 +610,7 @@ def main():
     )
     capture_flag_restore = optimized_layer.set_cuda_mlp_fusion_flags(
         add_rmsnorm_gateup=False,
+        post_attn_mlp_persistent=False,
         silu_downproj=False,
         gateup_silu_downproj=False,
         gateup_silu_downproj_mega=False,
@@ -598,9 +627,10 @@ def main():
     finally:
         optimized_layer.set_cuda_mlp_fusion_flags(
             add_rmsnorm_gateup=capture_flag_restore[0],
-            silu_downproj=capture_flag_restore[1],
-            gateup_silu_downproj=capture_flag_restore[2],
-            gateup_silu_downproj_mega=capture_flag_restore[3],
+            post_attn_mlp_persistent=capture_flag_restore[1],
+            silu_downproj=capture_flag_restore[2],
+            gateup_silu_downproj=capture_flag_restore[3],
+            gateup_silu_downproj_mega=capture_flag_restore[4],
         )
 
     target_layer = vlm._model.model.language_model.layers[args.layer_idx]
@@ -611,6 +641,7 @@ def main():
     previous_small_decode_triton = set_small_decode_triton_enabled(vlm._model, True)
     optimized_layer.set_cuda_mlp_fusion_flags(
         add_rmsnorm_gateup=args.enable_fused_add_rmsnorm_gateup,
+        post_attn_mlp_persistent=args.enable_fused_post_attn_mlp_persistent,
         silu_downproj=args.enable_fused_silu_downproj,
         gateup_silu_downproj=args.enable_fused_gateup_silu_downproj,
         gateup_silu_downproj_mega=args.enable_fused_gateup_silu_downproj_mega,
@@ -623,9 +654,10 @@ def main():
     finally:
         optimized_layer.set_cuda_mlp_fusion_flags(
             add_rmsnorm_gateup=capture_flag_restore[0],
-            silu_downproj=capture_flag_restore[1],
-            gateup_silu_downproj=capture_flag_restore[2],
-            gateup_silu_downproj_mega=capture_flag_restore[3],
+            post_attn_mlp_persistent=capture_flag_restore[1],
+            silu_downproj=capture_flag_restore[2],
+            gateup_silu_downproj=capture_flag_restore[3],
+            gateup_silu_downproj_mega=capture_flag_restore[4],
         )
         set_small_decode_triton_enabled(vlm._model, previous_small_decode_triton)
 
@@ -674,6 +706,7 @@ def main():
             "viztrace_iters": int(args.viztrace_iters) if args.viztrace else 0,
             "viztrace_output": None if viztrace_output is None else str(viztrace_output),
             "enable_fused_add_rmsnorm_gateup": bool(args.enable_fused_add_rmsnorm_gateup),
+            "enable_fused_post_attn_mlp_persistent": bool(args.enable_fused_post_attn_mlp_persistent),
             "enable_fused_silu_downproj": bool(args.enable_fused_silu_downproj),
             "enable_fused_gateup_silu_downproj": bool(args.enable_fused_gateup_silu_downproj),
             "enable_fused_gateup_silu_downproj_mega": bool(args.enable_fused_gateup_silu_downproj_mega),
