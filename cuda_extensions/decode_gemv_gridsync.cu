@@ -37,6 +37,20 @@ enum SoftsyncProfileSlot : int {
     SS_PROF_KERNEL_DONE = 11,
 };
 
+// Persistent kernel profile slots (per-iteration granularity)
+constexpr int kPersistentProfileSlots = 9;
+enum PersistentProfileSlot : int {
+    PP_KERNEL_START       = 0,
+    PP_X_LOAD_DONE        = 1,
+    PP_GATEUP_ITER0_DONE  = 2,
+    PP_GATEUP_ITER1_DONE  = 3,  // stays 0 if block does only 1 iteration
+    PP_GRIDSYNC_START     = 4,
+    PP_GRIDSYNC_DONE      = 5,
+    PP_DOWN_HIDDEN_LOADED = 6,
+    PP_DOWN_COMPUTE_DONE  = 7,
+    PP_KERNEL_DONE        = 8,
+};
+
 __device__ __forceinline__ uint64_t read_globaltimer() {
     uint64_t ts;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(ts));
@@ -653,8 +667,8 @@ __global__ void fused_gateup_silu_downproj_persistent_profile_k2048_k6144_fwd_ke
 
     if constexpr (kProfile) {
         if (threadIdx.x == 0 && profile != nullptr) {
-            profile[static_cast<int64_t>(blockIdx.x) * kSoftsyncProfileSlots +
-                    SS_PROF_KERNEL_START] = read_globaltimer();
+            profile[static_cast<int64_t>(blockIdx.x) * kPersistentProfileSlots +
+                    PP_KERNEL_START] = read_globaltimer();
         }
     }
 
@@ -667,11 +681,13 @@ __global__ void fused_gateup_silu_downproj_persistent_profile_k2048_k6144_fwd_ke
 
     if constexpr (kProfile) {
         if (threadIdx.x == 0 && profile != nullptr) {
-            profile[static_cast<int64_t>(blockIdx.x) * kSoftsyncProfileSlots +
-                    SS_PROF_X_LOAD_DONE] = read_globaltimer();
+            profile[static_cast<int64_t>(blockIdx.x) * kPersistentProfileSlots +
+                    PP_X_LOAD_DONE] = read_globaltimer();
         }
     }
 
+    // --- gate_up GEMV with per-iteration profiling ---
+    int gate_up_iter = 0;
     for (int hidden_base = blockIdx.x * kPersistentWarps;
          hidden_base < 6144;
          hidden_base += gridDim.x * kPersistentWarps) {
@@ -709,14 +725,19 @@ __global__ void fused_gateup_silu_downproj_persistent_profile_k2048_k6144_fwd_ke
                     __float2half(gate_sum / (1.0f + __expf(-gate_sum)) * up_sum);
             }
         }
+        if constexpr (kProfile) {
+            if (threadIdx.x == 0 && profile != nullptr) {
+                profile[static_cast<int64_t>(blockIdx.x) * kPersistentProfileSlots +
+                        PP_GATEUP_ITER0_DONE + gate_up_iter] = read_globaltimer();
+            }
+        }
+        ++gate_up_iter;
     }
 
     if constexpr (kProfile) {
         if (threadIdx.x == 0 && profile != nullptr) {
-            profile[static_cast<int64_t>(blockIdx.x) * kSoftsyncProfileSlots +
-                    SS_PROF_GATE_UP_COMPUTE_DONE] = read_globaltimer();
-            profile[static_cast<int64_t>(blockIdx.x) * kSoftsyncProfileSlots +
-                    SS_PROF_BARRIER_START] = read_globaltimer();
+            profile[static_cast<int64_t>(blockIdx.x) * kPersistentProfileSlots +
+                    PP_GRIDSYNC_START] = read_globaltimer();
         }
     }
 
@@ -724,8 +745,8 @@ __global__ void fused_gateup_silu_downproj_persistent_profile_k2048_k6144_fwd_ke
 
     if constexpr (kProfile) {
         if (threadIdx.x == 0 && profile != nullptr) {
-            profile[static_cast<int64_t>(blockIdx.x) * kSoftsyncProfileSlots +
-                    SS_PROF_BARRIER_DONE] = read_globaltimer();
+            profile[static_cast<int64_t>(blockIdx.x) * kPersistentProfileSlots +
+                    PP_GRIDSYNC_DONE] = read_globaltimer();
         }
     }
 
@@ -755,8 +776,8 @@ __global__ void fused_gateup_silu_downproj_persistent_profile_k2048_k6144_fwd_ke
 
     if constexpr (kProfile) {
         if (threadIdx.x == 0 && profile != nullptr) {
-            profile[static_cast<int64_t>(blockIdx.x) * kSoftsyncProfileSlots +
-                    SS_PROF_HIDDEN_LOAD_DONE] = read_globaltimer();
+            profile[static_cast<int64_t>(blockIdx.x) * kPersistentProfileSlots +
+                    PP_DOWN_HIDDEN_LOADED] = read_globaltimer();
         }
     }
 
@@ -824,8 +845,10 @@ __global__ void fused_gateup_silu_downproj_persistent_profile_k2048_k6144_fwd_ke
 
     if constexpr (kProfile) {
         if (threadIdx.x == 0 && profile != nullptr) {
-            profile[static_cast<int64_t>(blockIdx.x) * kSoftsyncProfileSlots +
-                    SS_PROF_KERNEL_DONE] = read_globaltimer();
+            profile[static_cast<int64_t>(blockIdx.x) * kPersistentProfileSlots +
+                    PP_DOWN_COMPUTE_DONE] = read_globaltimer();
+            profile[static_cast<int64_t>(blockIdx.x) * kPersistentProfileSlots +
+                    PP_KERNEL_DONE] = read_globaltimer();
         }
     }
 }
@@ -1015,8 +1038,8 @@ torch::Tensor fused_gateup_silu_downproj_persistent_profile_half_cuda(
     int num_sms = 0;
     C10_CUDA_CHECK(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device_idx));
 
-    TORCH_CHECK(profile.numel() == static_cast<int64_t>(num_sms) * kSoftsyncProfileSlots,
-        "profile shape mismatch: expected ", num_sms * kSoftsyncProfileSlots,
+    TORCH_CHECK(profile.numel() == static_cast<int64_t>(num_sms) * kPersistentProfileSlots,
+        "profile shape mismatch: expected ", num_sms * kPersistentProfileSlots,
         " got ", profile.numel());
 
     c10::cuda::CUDAGuard device_guard(x.device());

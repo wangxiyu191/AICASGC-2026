@@ -1410,6 +1410,18 @@ SOFTSYNC_PROFILE_SLOT_NAMES = (
     "kernel_done",             # 11
 )
 
+PERSISTENT_PROFILE_SLOT_NAMES = (
+    "kernel_start",         # 0
+    "x_load_done",          # 1
+    "gateup_iter0_done",    # 2
+    "gateup_iter1_done",    # 3  (0 if block does only 1 iteration)
+    "gridsync_start",       # 4
+    "gridsync_done",        # 5
+    "down_hidden_loaded",   # 6
+    "down_compute_done",    # 7
+    "kernel_done",          # 8
+)
+
 
 def fused_gateup_silu_downproj_softsync_profile_half(
     x: torch.Tensor,
@@ -1683,7 +1695,7 @@ def fused_gateup_silu_downproj_persistent_profile_half(
         and workspace["hidden_out"].device == x.device
         and workspace["out"].device == x.device
         and workspace.get("profile") is not None
-        and workspace["profile"].shape == (grid_blocks, len(GRIDSYNC_PROFILE_SLOT_NAMES))
+        and workspace["profile"].shape == (grid_blocks, len(PERSISTENT_PROFILE_SLOT_NAMES))
         and workspace["profile"].device == x.device
         and workspace["profile"].dtype == torch.int64
     ):
@@ -1694,7 +1706,7 @@ def fused_gateup_silu_downproj_persistent_profile_half(
         hidden_out = torch.empty((6144,), dtype=x.dtype, device=x.device)
         out_vec = torch.empty((2048,), dtype=x.dtype, device=x.device)
         profile = torch.empty(
-            (grid_blocks, len(GRIDSYNC_PROFILE_SLOT_NAMES)),
+            (grid_blocks, len(PERSISTENT_PROFILE_SLOT_NAMES)),
             dtype=torch.int64,
             device=x.device,
         )
@@ -1711,7 +1723,7 @@ def fused_gateup_silu_downproj_persistent_profile_half(
     meta = {
         "kernel_name": "fused_gateup_silu_downproj_persistent_profile",
         "grid_blocks": grid_blocks,
-        "slot_names": list(GRIDSYNC_PROFILE_SLOT_NAMES),
+        "slot_names": list(PERSISTENT_PROFILE_SLOT_NAMES),
     }
     return hidden_out.view(*x.shape[:-1], 6144), out_vec.view(*x.shape[:-1], 2048), profile, meta
 
