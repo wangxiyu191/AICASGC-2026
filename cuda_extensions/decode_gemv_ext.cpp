@@ -255,6 +255,46 @@ torch::Tensor fused_gateup_silu_downproj_softsync_half_cuda(
     const torch::Tensor& hidden_out,
     const torch::Tensor& out);
 
+torch::Tensor fused_gateup_silu_downproj_softsync_profile_half_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& gate_up_weight,
+    const torch::Tensor& down_proj_weight,
+    const torch::Tensor& barrier_count,
+    const torch::Tensor& barrier_phase,
+    const torch::Tensor& hidden_out,
+    const torch::Tensor& out,
+    const torch::Tensor& profile);
+
+torch::Tensor fused_gateup_silu_downproj_gridsync_half_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& gate_up_weight,
+    const torch::Tensor& down_proj_weight,
+    const torch::Tensor& hidden_out,
+    const torch::Tensor& out);
+
+torch::Tensor fused_gateup_silu_downproj_gridsync_profile_half_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& gate_up_weight,
+    const torch::Tensor& down_proj_weight,
+    const torch::Tensor& hidden_out,
+    const torch::Tensor& out,
+    const torch::Tensor& profile);
+
+torch::Tensor fused_gateup_silu_downproj_persistent_half_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& gate_up_weight,
+    const torch::Tensor& down_proj_weight,
+    const torch::Tensor& hidden_out,
+    const torch::Tensor& out);
+
+torch::Tensor fused_gateup_silu_downproj_persistent_profile_half_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& gate_up_weight,
+    const torch::Tensor& down_proj_weight,
+    const torch::Tensor& hidden_out,
+    const torch::Tensor& out,
+    const torch::Tensor& profile);
+
 torch::Tensor splitk_matvec(
     const torch::Tensor& x,
     const torch::Tensor& weight,
@@ -658,6 +698,86 @@ torch::Tensor fused_gateup_silu_downproj_softsync_half(
         out);
 }
 
+torch::Tensor fused_gateup_silu_downproj_softsync_profile_half(
+    const torch::Tensor& x,
+    const torch::Tensor& gate_up_weight,
+    const torch::Tensor& down_proj_weight,
+    const torch::Tensor& barrier_count,
+    const torch::Tensor& barrier_phase,
+    const torch::Tensor& hidden_out,
+    const torch::Tensor& out,
+    const torch::Tensor& profile) {
+    return fused_gateup_silu_downproj_softsync_profile_half_cuda(
+        x,
+        gate_up_weight,
+        down_proj_weight,
+        barrier_count,
+        barrier_phase,
+        hidden_out,
+        out,
+        profile);
+}
+
+torch::Tensor fused_gateup_silu_downproj_gridsync_half(
+    const torch::Tensor& x,
+    const torch::Tensor& gate_up_weight,
+    const torch::Tensor& down_proj_weight,
+    const torch::Tensor& hidden_out,
+    const torch::Tensor& out) {
+    return fused_gateup_silu_downproj_gridsync_half_cuda(
+        x,
+        gate_up_weight,
+        down_proj_weight,
+        hidden_out,
+        out);
+}
+
+torch::Tensor fused_gateup_silu_downproj_gridsync_profile_half(
+    const torch::Tensor& x,
+    const torch::Tensor& gate_up_weight,
+    const torch::Tensor& down_proj_weight,
+    const torch::Tensor& hidden_out,
+    const torch::Tensor& out,
+    const torch::Tensor& profile) {
+    return fused_gateup_silu_downproj_gridsync_profile_half_cuda(
+        x,
+        gate_up_weight,
+        down_proj_weight,
+        hidden_out,
+        out,
+        profile);
+}
+
+torch::Tensor fused_gateup_silu_downproj_persistent_half(
+    const torch::Tensor& x,
+    const torch::Tensor& gate_up_weight,
+    const torch::Tensor& down_proj_weight,
+    const torch::Tensor& hidden_out,
+    const torch::Tensor& out) {
+    return fused_gateup_silu_downproj_persistent_half_cuda(
+        x,
+        gate_up_weight,
+        down_proj_weight,
+        hidden_out,
+        out);
+}
+
+torch::Tensor fused_gateup_silu_downproj_persistent_profile_half(
+    const torch::Tensor& x,
+    const torch::Tensor& gate_up_weight,
+    const torch::Tensor& down_proj_weight,
+    const torch::Tensor& hidden_out,
+    const torch::Tensor& out,
+    const torch::Tensor& profile) {
+    return fused_gateup_silu_downproj_persistent_profile_half_cuda(
+        x,
+        gate_up_weight,
+        down_proj_weight,
+        hidden_out,
+        out,
+        profile);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("splitk_matvec", &splitk_matvec);
     m.def("splitk_matvec_row4", &splitk_matvec_row4);
@@ -689,4 +809,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_gateup_silu_downproj_mega_half", &fused_gateup_silu_downproj_mega_half);
     m.def("fused_gateup_silu_downproj_mega_partial_half", &fused_gateup_silu_downproj_mega_partial_half);
     m.def("fused_gateup_silu_downproj_softsync_half", &fused_gateup_silu_downproj_softsync_half);
+    m.def("fused_gateup_silu_downproj_softsync_profile_half", &fused_gateup_silu_downproj_softsync_profile_half);
+    m.def("fused_gateup_silu_downproj_gridsync_half", &fused_gateup_silu_downproj_gridsync_half);
+    m.def("fused_gateup_silu_downproj_gridsync_profile_half", &fused_gateup_silu_downproj_gridsync_profile_half);
+    m.def("fused_gateup_silu_downproj_persistent_half", &fused_gateup_silu_downproj_persistent_half);
+    m.def("fused_gateup_silu_downproj_persistent_profile_half", &fused_gateup_silu_downproj_persistent_profile_half);
 }

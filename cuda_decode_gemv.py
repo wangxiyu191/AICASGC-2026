@@ -1395,6 +1395,327 @@ def fused_gateup_silu_downproj_softsync_half(
     return hidden_out.view(*x.shape[:-1], 6144), out_vec.view(*x.shape[:-1], 2048)
 
 
+SOFTSYNC_PROFILE_SLOT_NAMES = (
+    "kernel_start",            # 0
+    "x_load_done",             # 1
+    "gate_up_compute_done",    # 2
+    "barrier_start",           # 3
+    "barrier_done",            # 4
+    "hidden_load_done",        # 5
+    "tile0_load_done",         # 6
+    "tile0_compute_done",      # 7
+    "tile1_load_done",         # 8
+    "tile1_compute_done",      # 9
+    "tile2_compute_done",      # 10
+    "kernel_done",             # 11
+)
+
+
+def fused_gateup_silu_downproj_softsync_profile_half(
+    x: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_proj_weight: torch.Tensor,
+    workspace: dict | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+    """Run softsync fused gateup+silu+downproj with per-block phase profiling.
+
+    Returns (hidden_out, out, profile, meta).
+    profile shape: [grid_blocks, len(SOFTSYNC_PROFILE_SLOT_NAMES)] (int64 timestamps in ns).
+    """
+    if (
+        x.device.type != "cuda"
+        or gate_up_weight.device.type != "cuda"
+        or down_proj_weight.device.type != "cuda"
+        or x.dtype != torch.float16
+        or gate_up_weight.dtype != torch.float16
+        or down_proj_weight.dtype != torch.float16
+        or x.ndim < 2
+        or x.shape[-2] != 1
+    ):
+        raise RuntimeError("softsync_profile_half expects fp16 CUDA single-token decode tensors")
+
+    x_vec = x.reshape(-1).contiguous()
+    grid_blocks = 2048 // 8  # 256
+
+    if (
+        workspace is not None
+        and workspace.get("type") == "softsync_profile"
+        and tuple(workspace["barrier_count"].shape) == (1,)
+        and tuple(workspace["barrier_phase"].shape) == (1,)
+        and tuple(workspace["hidden_out"].shape) == (6144,)
+        and tuple(workspace["out"].shape) == (2048,)
+        and workspace["barrier_count"].device == x.device
+        and workspace["barrier_phase"].device == x.device
+        and workspace["hidden_out"].device == x.device
+        and workspace["out"].device == x.device
+        and workspace.get("profile") is not None
+        and workspace["profile"].shape == (grid_blocks, len(SOFTSYNC_PROFILE_SLOT_NAMES))
+        and workspace["profile"].device == x.device
+        and workspace["profile"].dtype == torch.int64
+    ):
+        barrier_count = workspace["barrier_count"]
+        barrier_phase = workspace["barrier_phase"]
+        hidden_out = workspace["hidden_out"]
+        out_vec = workspace["out"]
+        profile = workspace["profile"]
+    else:
+        barrier_count = torch.zeros((1,), dtype=torch.int32, device=x.device)
+        barrier_phase = torch.zeros((1,), dtype=torch.int32, device=x.device)
+        hidden_out = torch.empty((6144,), dtype=x.dtype, device=x.device)
+        out_vec = torch.empty((2048,), dtype=x.dtype, device=x.device)
+        profile = torch.empty(
+            (grid_blocks, len(SOFTSYNC_PROFILE_SLOT_NAMES)),
+            dtype=torch.int64,
+            device=x.device,
+        )
+
+    barrier_count.zero_()
+    barrier_phase.zero_()
+    ext = _load_ext()
+    ext.fused_gateup_silu_downproj_softsync_profile_half(
+        x_vec,
+        gate_up_weight,
+        down_proj_weight,
+        barrier_count,
+        barrier_phase,
+        hidden_out,
+        out_vec,
+        profile,
+    )
+    meta = {
+        "kernel_name": "fused_gateup_silu_downproj_softsync_profile",
+        "grid_blocks": grid_blocks,
+        "slot_names": list(SOFTSYNC_PROFILE_SLOT_NAMES),
+    }
+    return hidden_out.view(*x.shape[:-1], 6144), out_vec.view(*x.shape[:-1], 2048), profile, meta
+
+
+# ---------------------------------------------------------------------------
+# __grid_sync() versions: use cooperative_groups::this_grid().sync()
+# No barrier_count/barrier_phase tensors needed.
+# ---------------------------------------------------------------------------
+
+GRIDSYNC_PROFILE_SLOT_NAMES = SOFTSYNC_PROFILE_SLOT_NAMES
+
+
+def fused_gateup_silu_downproj_gridsync_half(
+    x: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_proj_weight: torch.Tensor,
+    workspace: dict | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if (
+        x.device.type != "cuda"
+        or gate_up_weight.device.type != "cuda"
+        or down_proj_weight.device.type != "cuda"
+        or x.dtype != torch.float16
+        or gate_up_weight.dtype != torch.float16
+        or down_proj_weight.dtype != torch.float16
+        or x.ndim < 2
+        or x.shape[-2] != 1
+    ):
+        raise RuntimeError("fused_gateup_silu_downproj_gridsync_half expects fp16 CUDA single-token decode tensors")
+
+    x_vec = x.reshape(-1).contiguous()
+    if (
+        workspace is not None
+        and workspace.get("type") == "fused_gateup_silu_downproj_gridsync"
+        and tuple(workspace["hidden_out"].shape) == (6144,)
+        and tuple(workspace["out"].shape) == (2048,)
+        and workspace["hidden_out"].device == x.device
+        and workspace["out"].device == x.device
+    ):
+        hidden_out = workspace["hidden_out"]
+        out_vec = workspace["out"]
+    else:
+        hidden_out = torch.empty((6144,), dtype=x.dtype, device=x.device)
+        out_vec = torch.empty((2048,), dtype=x.dtype, device=x.device)
+
+    ext = _load_ext()
+    ext.fused_gateup_silu_downproj_gridsync_half(
+        x_vec,
+        gate_up_weight,
+        down_proj_weight,
+        hidden_out,
+        out_vec,
+    )
+    return hidden_out.view(*x.shape[:-1], 6144), out_vec.view(*x.shape[:-1], 2048)
+
+
+def fused_gateup_silu_downproj_gridsync_profile_half(
+    x: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_proj_weight: torch.Tensor,
+    workspace: dict | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+    """Run gridsync fused gateup+silu+downproj with per-block phase profiling.
+
+    Returns (hidden_out, out, profile, meta).
+    profile shape: [grid_blocks, len(GRIDSYNC_PROFILE_SLOT_NAMES)] (int64 timestamps in ns).
+    """
+    if (
+        x.device.type != "cuda"
+        or gate_up_weight.device.type != "cuda"
+        or down_proj_weight.device.type != "cuda"
+        or x.dtype != torch.float16
+        or gate_up_weight.dtype != torch.float16
+        or down_proj_weight.dtype != torch.float16
+        or x.ndim < 2
+        or x.shape[-2] != 1
+    ):
+        raise RuntimeError("gridsync_profile_half expects fp16 CUDA single-token decode tensors")
+
+    x_vec = x.reshape(-1).contiguous()
+    grid_blocks = 2048 // 8  # 256
+
+    if (
+        workspace is not None
+        and workspace.get("type") == "gridsync_profile"
+        and tuple(workspace["hidden_out"].shape) == (6144,)
+        and tuple(workspace["out"].shape) == (2048,)
+        and workspace["hidden_out"].device == x.device
+        and workspace["out"].device == x.device
+        and workspace.get("profile") is not None
+        and workspace["profile"].shape == (grid_blocks, len(GRIDSYNC_PROFILE_SLOT_NAMES))
+        and workspace["profile"].device == x.device
+        and workspace["profile"].dtype == torch.int64
+    ):
+        hidden_out = workspace["hidden_out"]
+        out_vec = workspace["out"]
+        profile = workspace["profile"]
+    else:
+        hidden_out = torch.empty((6144,), dtype=x.dtype, device=x.device)
+        out_vec = torch.empty((2048,), dtype=x.dtype, device=x.device)
+        profile = torch.empty(
+            (grid_blocks, len(GRIDSYNC_PROFILE_SLOT_NAMES)),
+            dtype=torch.int64,
+            device=x.device,
+        )
+
+    ext = _load_ext()
+    ext.fused_gateup_silu_downproj_gridsync_profile_half(
+        x_vec,
+        gate_up_weight,
+        down_proj_weight,
+        hidden_out,
+        out_vec,
+        profile,
+    )
+    meta = {
+        "kernel_name": "fused_gateup_silu_downproj_gridsync_profile",
+        "grid_blocks": grid_blocks,
+        "slot_names": list(GRIDSYNC_PROFILE_SLOT_NAMES),
+    }
+    return hidden_out.view(*x.shape[:-1], 6144), out_vec.view(*x.shape[:-1], 2048), profile, meta
+
+
+def fused_gateup_silu_downproj_persistent_half(
+    x: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_proj_weight: torch.Tensor,
+    workspace: dict | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if (
+        x.device.type != "cuda"
+        or gate_up_weight.device.type != "cuda"
+        or down_proj_weight.device.type != "cuda"
+        or x.dtype != torch.float16
+        or gate_up_weight.dtype != torch.float16
+        or down_proj_weight.dtype != torch.float16
+        or x.ndim < 2
+        or x.shape[-2] != 1
+    ):
+        raise RuntimeError("fused_gateup_silu_downproj_persistent_half expects fp16 CUDA single-token decode tensors")
+
+    x_vec = x.reshape(-1).contiguous()
+    if (
+        workspace is not None
+        and workspace.get("type") == "fused_gateup_silu_downproj_persistent"
+        and tuple(workspace["hidden_out"].shape) == (6144,)
+        and tuple(workspace["out"].shape) == (2048,)
+        and workspace["hidden_out"].device == x.device
+        and workspace["out"].device == x.device
+    ):
+        hidden_out = workspace["hidden_out"]
+        out_vec = workspace["out"]
+    else:
+        hidden_out = torch.empty((6144,), dtype=x.dtype, device=x.device)
+        out_vec = torch.empty((2048,), dtype=x.dtype, device=x.device)
+
+    ext = _load_ext()
+    ext.fused_gateup_silu_downproj_persistent_half(
+        x_vec,
+        gate_up_weight,
+        down_proj_weight,
+        hidden_out,
+        out_vec,
+    )
+    return hidden_out.view(*x.shape[:-1], 6144), out_vec.view(*x.shape[:-1], 2048)
+
+
+def fused_gateup_silu_downproj_persistent_profile_half(
+    x: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_proj_weight: torch.Tensor,
+    workspace: dict | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+    if (
+        x.device.type != "cuda"
+        or gate_up_weight.device.type != "cuda"
+        or down_proj_weight.device.type != "cuda"
+        or x.dtype != torch.float16
+        or gate_up_weight.dtype != torch.float16
+        or down_proj_weight.dtype != torch.float16
+        or x.ndim < 2
+        or x.shape[-2] != 1
+    ):
+        raise RuntimeError("persistent_profile_half expects fp16 CUDA single-token decode tensors")
+
+    x_vec = x.reshape(-1).contiguous()
+    props = torch.cuda.get_device_properties(x.device)
+    grid_blocks = props.multi_processor_count
+
+    if (
+        workspace is not None
+        and workspace.get("type") == "persistent_profile"
+        and tuple(workspace["hidden_out"].shape) == (6144,)
+        and tuple(workspace["out"].shape) == (2048,)
+        and workspace["hidden_out"].device == x.device
+        and workspace["out"].device == x.device
+        and workspace.get("profile") is not None
+        and workspace["profile"].shape == (grid_blocks, len(GRIDSYNC_PROFILE_SLOT_NAMES))
+        and workspace["profile"].device == x.device
+        and workspace["profile"].dtype == torch.int64
+    ):
+        hidden_out = workspace["hidden_out"]
+        out_vec = workspace["out"]
+        profile = workspace["profile"]
+    else:
+        hidden_out = torch.empty((6144,), dtype=x.dtype, device=x.device)
+        out_vec = torch.empty((2048,), dtype=x.dtype, device=x.device)
+        profile = torch.empty(
+            (grid_blocks, len(GRIDSYNC_PROFILE_SLOT_NAMES)),
+            dtype=torch.int64,
+            device=x.device,
+        )
+
+    ext = _load_ext()
+    ext.fused_gateup_silu_downproj_persistent_profile_half(
+        x_vec,
+        gate_up_weight,
+        down_proj_weight,
+        hidden_out,
+        out_vec,
+        profile,
+    )
+    meta = {
+        "kernel_name": "fused_gateup_silu_downproj_persistent_profile",
+        "grid_blocks": grid_blocks,
+        "slot_names": list(GRIDSYNC_PROFILE_SLOT_NAMES),
+    }
+    return hidden_out.view(*x.shape[:-1], 6144), out_vec.view(*x.shape[:-1], 2048), profile, meta
+
+
 def nosplit_matvec_half_profile(
     x: torch.Tensor,
     weight: torch.Tensor,
