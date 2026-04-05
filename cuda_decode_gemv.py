@@ -998,6 +998,115 @@ def nosplit_matvec_half_dualcopy_routed(
     return out_vec.view(*x.shape[:-1], n)
 
 
+def nosplit_matvec_half_partition(
+    x: torch.Tensor,
+    weight_buf: torch.Tensor,
+    bias: torch.Tensor | None,
+    chunk_classes: torch.Tensor,
+    sm_class_lo: int,
+    sm_class_hi: int,
+    n_rows: int,
+    workspace: dict | None = None,
+) -> torch.Tensor:
+    """Partition-aware GEMV for k=2048 with interleaved weight layout."""
+    if (
+        x.device.type != "cuda"
+        or weight_buf.device.type != "cuda"
+        or x.dtype != torch.float16
+        or weight_buf.dtype != torch.float16
+        or x.ndim < 2
+        or x.shape[-2] != 1
+    ):
+        raise RuntimeError("nosplit_matvec_half_partition expects fp16 CUDA single-token decode tensors")
+
+    x_vec = x.reshape(-1).contiguous()
+    if (
+        workspace is not None
+        and workspace.get("type") == "nosplit_partition"
+        and tuple(workspace["out"].shape) == (n_rows,)
+        and workspace["out"].device == x.device
+        and workspace["out"].dtype == x.dtype
+    ):
+        out_vec = workspace["out"]
+    else:
+        out_vec = torch.empty((n_rows,), dtype=x.dtype, device=x.device)
+        if workspace is not None:
+            workspace["type"] = "nosplit_partition"
+            workspace["out"] = out_vec
+
+    ext = _load_ext()
+    # Convert to signed int64 for pybind11 (C++ int64_t)
+    _lo = sm_class_lo if sm_class_lo < (1 << 63) else sm_class_lo - (1 << 64)
+    _hi = sm_class_hi if sm_class_hi < (1 << 63) else sm_class_hi - (1 << 64)
+    ext.nosplit_matvec_half_partition(
+        x_vec,
+        weight_buf,
+        bias if bias is not None else torch.empty(0, device=x.device, dtype=x.dtype),
+        out_vec,
+        chunk_classes,
+        _lo,
+        _hi,
+        n_rows,
+        bias is not None,
+    )
+    return out_vec.view(*x.shape[:-1], n_rows)
+
+
+def nosplit_matvec_half_partition_v2(
+    x: torch.Tensor,
+    weight_buf: torch.Tensor,
+    bias: torch.Tensor | None,
+    chunk_class_bits: int,
+    sm_class_lo: int,
+    sm_class_hi: int,
+    n_rows: int,
+    workspace: dict | None = None,
+) -> torch.Tensor:
+    """Partition-aware GEMV v2 for k=2048 — zero extra memory reads."""
+    if (
+        x.device.type != "cuda"
+        or weight_buf.device.type != "cuda"
+        or x.dtype != torch.float16
+        or weight_buf.dtype != torch.float16
+        or x.ndim < 2
+        or x.shape[-2] != 1
+    ):
+        raise RuntimeError("nosplit_matvec_half_partition_v2 expects fp16 CUDA single-token decode tensors")
+
+    x_vec = x.reshape(-1).contiguous()
+    if (
+        workspace is not None
+        and workspace.get("type") == "nosplit_partition_v2"
+        and tuple(workspace["out"].shape) == (n_rows,)
+        and workspace["out"].device == x.device
+        and workspace["out"].dtype == x.dtype
+    ):
+        out_vec = workspace["out"]
+    else:
+        out_vec = torch.empty((n_rows,), dtype=x.dtype, device=x.device)
+        if workspace is not None:
+            workspace["type"] = "nosplit_partition_v2"
+            workspace["out"] = out_vec
+
+    ext = _load_ext()
+    # Convert to signed int64 for pybind11 (C++ int64_t)
+    _lo = sm_class_lo if sm_class_lo < (1 << 63) else sm_class_lo - (1 << 64)
+    _hi = sm_class_hi if sm_class_hi < (1 << 63) else sm_class_hi - (1 << 64)
+    _cc = chunk_class_bits if chunk_class_bits < (1 << 63) else chunk_class_bits - (1 << 64)
+    ext.nosplit_matvec_half_partition_v2(
+        x_vec,
+        weight_buf,
+        bias if bias is not None else torch.empty(0, device=x.device, dtype=x.dtype),
+        out_vec,
+        _cc,
+        _lo,
+        _hi,
+        n_rows,
+        bias is not None,
+    )
+    return out_vec.view(*x.shape[:-1], n_rows)
+
+
 def fused_add_rmsnorm_gateup_half(
     residual: torch.Tensor,
     x: torch.Tensor,

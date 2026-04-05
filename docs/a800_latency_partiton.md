@@ -49,6 +49,8 @@ page_class(addr) = ((addr >> 13) & 1) ^ ((addr >> 17) & 1)
 
 **分类结果** (|delta| min=136.2, max=148.0, 分离极其干净，无歧义):
 
+> **注意**: 以下 SM 分类列表是在**特定 A800 卡**上测得的示例值。SM 分类是**硬件实例相关**的，不同 GPU 卡的分类表不同。实际使用时必须通过 `hbm_latency_partition.probe_sm_classes()` 运行时探测。
+
 - **sm_class = 0 (Group A, 56 SMs)**: page_class=0 时快路径 (~451 cycles), page_class=1 时慢路径 (~593 cycles)
   ```
   [1, 3, 4, 7, 9, 10, 12, 14, 16, 17, 20, 21, 22, 23, 28, 30,
@@ -65,20 +67,19 @@ page_class(addr) = ((addr >> 13) & 1) ^ ((addr >> 17) & 1)
    104, 105, 106, 107]
   ```
 
-**Bitfield 表示** (sm_class=1 的 SM 对应 bit=1):
+**Bitfield 表示** (sm_class=1 的 SM 对应 bit=1, 此为示例值):
 ```python
+# 示例值，实际值因卡而异，需运行时探测
 SM_CLASS_BITFIELD = 0x0F3FC6550C03600F9569AF0CA965
 ```
 
-**快速查询**:
+**快速查询** (bitfield 作为 kernel 参数传入，运行时从探测结果填充):
 ```c
 // sm_class(smid): 返回 0 或 1
-int sm_class(int smid) {
-    // 108-bit lookup table, sm_class=1 的 bit 置 1
-    static const uint64_t lo = 0x9569AF0CA965ULL;  // SM 0-63
-    static const uint64_t hi = 0x0F3FC6550C03600FULL;  // SM 64-107 (高44位)
-    if (smid < 64) return (lo >> smid) & 1;
-    return (hi >> (smid - 64)) & 1;
+// sm_class_lo / sm_class_hi 由运行时探测得到，作为 kernel 参数传入
+int sm_class(int smid, uint64_t sm_class_lo, uint64_t sm_class_hi) {
+    if (smid < 64) return (sm_class_lo >> smid) & 1;
+    return (sm_class_hi >> (smid - 64)) & 1;
 }
 ```
 

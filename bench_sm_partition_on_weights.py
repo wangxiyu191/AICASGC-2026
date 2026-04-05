@@ -26,24 +26,14 @@ import numpy as np
 import cuda_decode_gemv
 from benchmark import get_system_info
 
-# ---------- SM classification from our analysis ----------
-SM_CLASS_A = [1, 3, 4, 7, 9, 10, 12, 14, 16, 17, 20, 21, 22, 23, 28, 30,
-              33, 34, 36, 39, 41, 43, 45, 46, 52, 53, 54, 55, 56, 57, 58, 59,
-              60, 63, 66, 67, 68, 69, 70, 71, 72, 73, 76, 77, 78, 79, 81, 83,
-              85, 87, 88, 91, 92, 93, 102, 103]
+# ---------- SM classification: probed at runtime ----------
+# SM classification is hardware-specific and changes across GPU cards.
+# Use hbm_latency_partition.probe_sm_classes() to determine at runtime.
+SM_CLASS_A = None  # populated in main()
+SM_CLASS_B = None  # populated in main()
+SM_CLASS_MAP = {}  # smid -> 0 or 1, populated in main()
 
-SM_CLASS_B = [0, 2, 5, 6, 8, 11, 13, 15, 18, 19, 24, 25, 26, 27, 29, 31,
-              32, 35, 37, 38, 40, 42, 44, 47, 48, 49, 50, 51, 61, 62, 64, 65,
-              74, 75, 80, 82, 84, 86, 89, 90, 94, 95, 96, 97, 98, 99, 100, 101,
-              104, 105, 106, 107]
-
-SM_CLASS_MAP = {}  # smid -> 0 or 1
-for s in SM_CLASS_A:
-    SM_CLASS_MAP[s] = 0
-for s in SM_CLASS_B:
-    SM_CLASS_MAP[s] = 1
-
-NUM_SMS = 108
+NUM_SMS = None  # populated in main()
 CHUNK_BYTES = 1024 * 1024  # 1 MiB
 STRIDE_BYTES = 256
 ELEM_SIZE = 8  # int64
@@ -248,6 +238,18 @@ def main():
     device = torch.device("cuda")
     props = torch.cuda.get_device_properties(device)
 
+    # Probe SM classification at runtime (hardware-specific)
+    global SM_CLASS_A, SM_CLASS_B, SM_CLASS_MAP, NUM_SMS
+    from hbm_latency_partition import probe_sm_classes
+    sm_result = probe_sm_classes(device=device)
+    SM_CLASS_A = list(sm_result.sm_class_0)
+    SM_CLASS_B = list(sm_result.sm_class_1)
+    SM_CLASS_MAP = dict(sm_result.sm_class_map)
+    NUM_SMS = props.multi_processor_count
+    print(f"Device: {props.name}, {NUM_SMS} SMs")
+    print(f"  sm_class=0 ({len(SM_CLASS_A)} SMs), sm_class=1 ({len(SM_CLASS_B)} SMs)")
+    print(f"  mean separation: {sm_result.mean_separation:.1f} cycles")
+
     print(f"Loading model from {args.model_path} ...")
     from transformers import AutoModelForImageTextToText
     model = AutoModelForImageTextToText.from_pretrained(
@@ -323,7 +325,7 @@ def main():
     print(f"{'='*100}")
     print(f"Total chunks probed: {overall_page_class_total}")
     print(f"Page class formula correct: {overall_page_class_ok}/{overall_page_class_total}")
-    print(f"Unique SMs observed: {len(overall_sm_seen)}/108")
+    print(f"Unique SMs observed: {len(overall_sm_seen)}/{NUM_SMS}")
 
     # Per-SM verification
     sm_observations = {}  # smid -> list of (chunk_idx, weight_name, delta)

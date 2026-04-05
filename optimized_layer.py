@@ -120,7 +120,9 @@ class OptimizedDecoderLayer(nn.Module):
 
         # 2. Fused QKV (1 GEMM instead of 3)
         with _nvtx_range("decode.qkv_proj", enable_decode_nvtx):
-            qkv = _cuda_nosplit_gemv(hidden_states, self.qkv_weight, None)
+            qkv = _cuda_partition_gemv(hidden_states, f"layer{self.layer_idx}.qkv")
+            if qkv is None:
+                qkv = _cuda_nosplit_gemv(hidden_states, self.qkv_weight, None)
             if qkv is None:
                 qkv = F.linear(hidden_states, self.qkv_weight)
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -210,7 +212,9 @@ class OptimizedDecoderLayer(nn.Module):
             attn_output = attn_output.reshape(*input_shape, -1)
             if not attn_output.is_contiguous():
                 attn_output = attn_output.contiguous()
-            gemv_out = _cuda_nosplit_gemv(attn_output, self.o_proj_weight, self.o_proj_bias)
+            gemv_out = _cuda_partition_gemv(attn_output, f"layer{self.layer_idx}.o_proj")
+            if gemv_out is None:
+                gemv_out = _cuda_nosplit_gemv(attn_output, self.o_proj_weight, self.o_proj_bias)
             if gemv_out is None:
                 gemv_out = _triton_decode_gemv(
                     attn_output, self.o_proj_weight, self.o_proj_bias,
@@ -253,7 +257,9 @@ class OptimizedDecoderLayer(nn.Module):
                     prefer_small_triton=prefer_small_decode_triton,
                 )
             if fused_mlp_out is None and gate_up is None:
-                gate_up = _cuda_nosplit_gemv(hidden_states, self.gate_up_weight, None)
+                gate_up = _cuda_partition_gemv(hidden_states, f"layer{self.layer_idx}.gate_up")
+                if gate_up is None:
+                    gate_up = _cuda_nosplit_gemv(hidden_states, self.gate_up_weight, None)
                 if gate_up is None:
                     gate_up = F.linear(hidden_states, self.gate_up_weight)
 
@@ -364,6 +370,8 @@ _TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_NUM_STAGES = int(os.environ.get("TRITON_
 _ENABLE_TRITON_SMALL_DECODE_STATIC_KV = os.environ.get("ENABLE_TRITON_SMALL_DECODE_STATIC_KV", "1") == "1"
 _ENABLE_TRITON_SMALL_DECODE_GEMV = os.environ.get("ENABLE_TRITON_SMALL_DECODE_GEMV", "1") == "1"
 _ENABLE_CUDA_NOSPLIT_GEMV = os.environ.get("ENABLE_CUDA_NOSPLIT_GEMV", "0") == "1"
+_ENABLE_PARTITION_GEMV = os.environ.get("ENABLE_PARTITION_GEMV", "0") == "1"
+_PARTITION_DATA = None  # Set by evaluation_wrapper after probing
 _ENABLE_DECODE_NVTX = os.environ.get("ENABLE_DECODE_NVTX", "0") == "1"
 
 
@@ -974,6 +982,34 @@ def _cuda_nosplit_gemv(
 
     import cuda_decode_gemv
     return cuda_decode_gemv.nosplit_matvec_half(x, weight, bias)
+
+
+def _cuda_partition_gemv(
+    x: torch.Tensor,
+    layer_key: str,
+) -> torch.Tensor | None:
+    """Partition-aware GEMV for k=2048 with interleaved weight layout.
+
+    Returns None if partition data not available (caller falls back).
+    """
+    if (
+        not _ENABLE_PARTITION_GEMV
+        or _PARTITION_DATA is None
+        or layer_key not in _PARTITION_DATA["weights"]
+        or x.device.type != "cuda"
+        or x.dtype != torch.float16
+        or x.ndim < 2
+        or x.shape[-2] != 1
+    ):
+        return None
+
+    wd = _PARTITION_DATA["weights"][layer_key]
+    import cuda_decode_gemv
+    return cuda_decode_gemv.nosplit_matvec_half_partition(
+        x, wd["buf"], None, wd["chunk_classes"],
+        _PARTITION_DATA["sm_class_lo"], _PARTITION_DATA["sm_class_hi"],
+        wd["n_rows"],
+    )
 
 
 def _static_cache_single_token_update(

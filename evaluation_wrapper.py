@@ -1237,6 +1237,9 @@ class VLMModel:
         # Replace decoder layers with fused versions
         self._replace_decoder_layers()
 
+        # Initialize HBM partition-aware GEMV if enabled
+        self._init_partition_gemv()
+
         # Prefill-specific path optimizations
         self._optimize_prefill_path()
 
@@ -1273,6 +1276,85 @@ class VLMModel:
             self._optimizations_applied.append(f"fused_layers:{count}")
         except Exception as e:
             print(f"[VLMModel] Warning: Failed to replace decoder layers: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _init_partition_gemv(self):
+        """Initialize HBM partition-aware GEMV for k=2048 weights."""
+        if os.environ.get("ENABLE_PARTITION_GEMV", "0") != "1":
+            return
+        import time as _time
+        t0 = _time.perf_counter()
+        try:
+            import optimized_layer
+            from hbm_latency_partition import (
+                create_partition_buffer, pack_interleaved_weight,
+                compute_interleaved_size,
+            )
+
+            model_core = getattr(self._model, "model", None)
+            lang_model = getattr(model_core, "language_model", model_core) if model_core is not None else None
+            if lang_model is None or not hasattr(lang_model, "layers"):
+                print("[VLMModel] Partition GEMV: no decoder layers found, skipping")
+                return
+
+            weight_shapes = []
+            weight_refs = []
+            for layer in lang_model.layers:
+                if not hasattr(layer, "qkv_weight"):
+                    continue
+                for name, attr_name in [("qkv", "qkv_weight"), ("o_proj", "o_proj_weight"), ("gate_up", "gate_up_weight")]:
+                    w = getattr(layer, attr_name, None)
+                    if w is not None and w.shape[1] == 2048:
+                        weight_shapes.append(tuple(w.shape))
+                        weight_refs.append((layer.layer_idx, name, w))
+
+            if not weight_shapes:
+                print("[VLMModel] Partition GEMV: no k=2048 weights found, skipping")
+                return
+
+            print(f"[VLMModel] Partition GEMV: packing {len(weight_shapes)} weights...")
+            pd = create_partition_buffer(weight_shapes, device=str(self._device))
+
+            partition_weights = {}
+            for i, (layer_idx, name, w) in enumerate(weight_refs):
+                n_rows, k = weight_shapes[i]
+                buf_size = compute_interleaved_size(n_rows, k)
+                buf_offset_halves = pd["offsets"][i] // 2
+                buf_slice = pd["buffer"][buf_offset_halves: buf_offset_halves + buf_size // 2]
+                pack_interleaved_weight(w, buf_slice, pd["chunk_classes_list"][i])
+                key = f"layer{layer_idx}.{name}"
+                partition_weights[key] = {
+                    "buf": buf_slice,
+                    "chunk_classes": pd["chunk_classes_list"][i].to(self._device),
+                    "n_rows": n_rows,
+                }
+
+            optimized_layer._PARTITION_DATA = {
+                "sm_class_lo": pd["sm_class_lo"],
+                "sm_class_hi": pd["sm_class_hi"],
+                "weights": partition_weights,
+                "_buffer": pd["buffer"],
+            }
+
+            # Register an atexit handler (runs LIFO, so first-registered runs last)
+            # that hard-exits to avoid CUDA segfault during Python module teardown
+            # when the large partition buffer storage gets freed after CUDA context
+            # is already destroyed.
+            import atexit
+            def _hard_exit_to_avoid_cuda_segfault():
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(0)
+            atexit.register(_hard_exit_to_avoid_cuda_segfault)
+
+            elapsed = _time.perf_counter() - t0
+            total_mb = sum(compute_interleaved_size(*s) for s in weight_shapes) / (1024 * 1024)
+            print(f"[VLMModel] Partition GEMV: {len(partition_weights)} weights packed "
+                  f"({total_mb:.0f} MB buffer) in {elapsed:.2f}s")
+            self._optimizations_applied.append(f"partition_gemv:{len(partition_weights)}")
+        except Exception as e:
+            print(f"[VLMModel] Warning: Failed to init partition GEMV: {e}")
             import traceback
             traceback.print_exc()
 

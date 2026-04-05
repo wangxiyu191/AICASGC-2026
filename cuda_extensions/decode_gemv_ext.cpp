@@ -85,6 +85,28 @@ torch::Tensor nosplit_matvec_half_dualcopy_routed_cuda(
     int64_t route_mode,
     int64_t smid_threshold);
 
+torch::Tensor nosplit_matvec_half_partition_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& weight_buf,
+    const torch::Tensor& bias,
+    const torch::Tensor& out,
+    const torch::Tensor& chunk_classes,
+    int64_t sm_class_lo,
+    int64_t sm_class_hi,
+    int64_t n_rows,
+    bool has_bias);
+
+torch::Tensor nosplit_matvec_half_partition_v2_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& weight_buf,
+    const torch::Tensor& bias,
+    const torch::Tensor& out,
+    int64_t chunk_class_bits,
+    int64_t sm_class_lo,
+    int64_t sm_class_hi,
+    int64_t n_rows,
+    bool has_bias);
+
 torch::Tensor nosplit_matvec_half_profile_cuda(
     const torch::Tensor& x,
     const torch::Tensor& weight,
@@ -347,6 +369,50 @@ torch::Tensor nosplit_matvec_half_dualcopy_routed(
         smid_threshold);
 }
 
+torch::Tensor nosplit_matvec_half_partition(
+    const torch::Tensor& x,
+    const torch::Tensor& weight_buf,
+    const torch::Tensor& bias,
+    const torch::Tensor& out,
+    const torch::Tensor& chunk_classes,
+    int64_t sm_class_lo,
+    int64_t sm_class_hi,
+    int64_t n_rows,
+    bool has_bias) {
+    return nosplit_matvec_half_partition_cuda(
+        x,
+        weight_buf,
+        bias,
+        out,
+        chunk_classes,
+        sm_class_lo,
+        sm_class_hi,
+        n_rows,
+        has_bias);
+}
+
+torch::Tensor nosplit_matvec_half_partition_v2(
+    const torch::Tensor& x,
+    const torch::Tensor& weight_buf,
+    const torch::Tensor& bias,
+    const torch::Tensor& out,
+    int64_t chunk_class_bits,
+    int64_t sm_class_lo,
+    int64_t sm_class_hi,
+    int64_t n_rows,
+    bool has_bias) {
+    return nosplit_matvec_half_partition_v2_cuda(
+        x,
+        weight_buf,
+        bias,
+        out,
+        chunk_class_bits,
+        sm_class_lo,
+        sm_class_hi,
+        n_rows,
+        has_bias);
+}
+
 torch::Tensor nosplit_matvec_half_profile(
     const torch::Tensor& x,
     const torch::Tensor& weight,
@@ -603,6 +669,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("nosplit_hfma2_matvec_half", &nosplit_hfma2_matvec_half);
     m.def("nosplit_matvec_half_variant", &nosplit_matvec_half_variant);
     m.def("nosplit_matvec_half_dualcopy_routed", &nosplit_matvec_half_dualcopy_routed);
+    m.def("nosplit_matvec_half_partition", &nosplit_matvec_half_partition);
+    m.def("nosplit_matvec_half_partition_v2", &nosplit_matvec_half_partition_v2);
     m.def("nosplit_matvec_half_profile", &nosplit_matvec_half_profile);
     m.def("nosplit_matvec_half_profile_variant", &nosplit_matvec_half_profile_variant);
     m.def("nosplit_matvec_half_profile_xwarp_detail", &nosplit_matvec_half_profile_xwarp_detail);

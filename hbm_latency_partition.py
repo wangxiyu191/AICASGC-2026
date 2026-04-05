@@ -121,6 +121,55 @@ def _analyse_latency(latency_1d: np.ndarray, pc_table: np.ndarray):
 # ---------------------------------------------------------------------------
 # Public API  (1) -- probe SM classes
 # ---------------------------------------------------------------------------
+def _run_one_probe_pass(buf_int64: torch.Tensor, num_sms: int,
+                        flush_mb: int):
+    """Run a single pointer-chase probe on *num_sms* contiguous 1MiB regions.
+
+    Returns (signs, smids, deltas) where:
+      signs[block_idx] = 0 if delta<0, else 1
+      smids[block_idx] = SM ID that ran that block
+      deltas[block_idx] = raw delta value
+    """
+    starts = _build_sequential_chains(buf_int64, num_sms)
+    torch.cuda.synchronize()
+    flush_buf = _build_flush_buffer(num_sms, flush_mb, buf_int64.device)
+    latency, smid_t, _, _ = cuda_decode_gemv.l2_sequential_pointer_chase_trace(
+        buf_int64, starts, flush_buf,
+        chain_len=_CHAIN_LEN_1MIB, workspace={},
+    )
+    torch.cuda.synchronize()
+
+    lat_cpu = latency.cpu().numpy()[:, 1:]
+    smid_cpu = smid_t.cpu().numpy()
+    pc = _PAGE_CLASS_TABLE[1:]
+
+    signs = {}
+    smids = {}
+    deltas = {}
+    for i in range(num_sms):
+        m0, m1 = _analyse_latency(lat_cpu[i], pc)
+        d = m0 - m1
+        smids[i] = int(smid_cpu[i])
+        signs[i] = 0 if d < 0 else 1
+        deltas[i] = d
+    return signs, smids, deltas
+
+
+def _compute_chunk_pairs(base_addr: int, num_sms: int,
+                         offset_mib: int = 0):
+    """Return list of (block_idx_a, block_idx_b) sharing a 2MiB chunk."""
+    chunk_to_idxs: dict[int, list[int]] = {}
+    for i in range(num_sms):
+        addr = base_addr + (i + offset_mib) * _CHUNK_1MIB
+        chunk = addr // _CHUNK_2MIB
+        chunk_to_idxs.setdefault(chunk, []).append(i)
+    pairs = []
+    for idxs in chunk_to_idxs.values():
+        if len(idxs) == 2:
+            pairs.append(tuple(idxs))
+    return pairs
+
+
 def probe_sm_classes(
     *,
     device: torch.device | str = "cuda",
@@ -128,11 +177,11 @@ def probe_sm_classes(
 ) -> SmClassResult:
     """Probe all SMs to determine their sm_class (0 or 1).
 
-    Replicates the approach from ``bench_sequential_stride_latency.py``:
-    each of the *num_sms* blocks gets its own contiguous 1MiB region inside
-    a single large buffer (num_sms * 1MiB).  Because the regions sit in
-    one contiguous CUDA allocation they share a uniform effective
-    chunk_class, eliminating the need for 2MiB alignment per block.
+    Uses a **two-pass** approach to eliminate chunk_class interference:
+    within each 2MiB chunk two SMs share the same chunk_class, so XOR-ing
+    their delta signs gives ``sm_class(a) XOR sm_class(b)`` (chunk_class
+    cancels).  Two passes with a 1MiB offset produce overlapping pairs
+    that form a connected chain across all SMs, enabling full propagation.
 
     Parameters
     ----------
@@ -145,51 +194,84 @@ def probe_sm_classes(
     -------
     SmClassResult
     """
+    from collections import deque
+
     device = torch.device(device)
     num_sms = torch.cuda.get_device_properties(device).multi_processor_count
 
-    # ---- allocate: one 1MiB region per SM, contiguously packed ----
-    buf = torch.empty(num_sms * _ELEMS_1MIB, dtype=torch.int64, device=device)
-    starts = _build_sequential_chains(buf, num_sms)
-    torch.cuda.synchronize()
+    # Allocate (num_sms + 1) x 1MiB so we can do two offset passes.
+    buf = torch.empty((num_sms + 1) * _ELEMS_1MIB, dtype=torch.int64,
+                       device=device)
+    base_addr = buf.data_ptr()
 
-    # ---- probe ----
-    flush_buf = _build_flush_buffer(num_sms, flush_mb, device)
-    workspace: dict = {}
-    latency, smid_t, _, _ = cuda_decode_gemv.l2_sequential_pointer_chase_trace(
-        buf, starts, flush_buf,
-        chain_len=_CHAIN_LEN_1MIB, workspace=workspace,
-    )
-    torch.cuda.synchronize()
+    # ---- Pass 1: chains at offsets [0, num_sms) MiB ----
+    buf_p1 = buf[:num_sms * _ELEMS_1MIB]
+    signs1, smids1, deltas1 = _run_one_probe_pass(buf_p1, num_sms, flush_mb)
 
-    lat_cpu = latency.cpu().numpy()[:, 1:]   # skip first access
-    smid_cpu = smid_t.cpu().numpy()
-    pc = _PAGE_CLASS_TABLE[1:]
+    # ---- Pass 2: chains at offsets [1, num_sms+1) MiB ----
+    buf_p2 = buf[_ELEMS_1MIB:]
+    signs2, smids2, deltas2 = _run_one_probe_pass(buf_p2, num_sms, flush_mb)
 
-    # ---- classify ----
-    # delta = mean(lat on page_class=0) - mean(lat on page_class=1).
-    # sign(delta) = sm_class XOR effective_chunk_class (uniform constant C).
-    deltas: dict[int, float] = {}
-    for i in range(num_sms):
-        m0, m1 = _analyse_latency(lat_cpu[i], pc)
-        deltas[int(smid_cpu[i])] = m0 - m1
+    # ---- Build pair constraints from both passes ----
+    pairs1 = _compute_chunk_pairs(base_addr, num_sms, offset_mib=0)
+    pairs2 = _compute_chunk_pairs(base_addr, num_sms, offset_mib=1)
 
-    grp_neg = sorted(s for s in deltas if deltas[s] < 0)
-    grp_pos = sorted(s for s in deltas if deltas[s] >= 0)
+    # Adjacency on SM IDs: (neighbor_smid, relative_class)
+    adj: dict[int, list[tuple[int, int]]] = {}
+    all_smids = set()
 
-    # Convention: the *majority* group is sm_class 0 (56 SMs on A800-108SM).
-    if len(grp_neg) >= len(grp_pos):
-        cls0, cls1 = grp_neg, grp_pos
-    else:
-        cls0, cls1 = grp_pos, grp_neg
+    for a, b in pairs1:
+        sa, sb = smids1[a], smids1[b]
+        rel = signs1[a] ^ signs1[b]  # 0 = same sm_class, 1 = different
+        adj.setdefault(sa, []).append((sb, rel))
+        adj.setdefault(sb, []).append((sa, rel))
+        all_smids.update([sa, sb])
 
-    sm_class_map: dict[int, int] = {s: 0 for s in cls0}
-    sm_class_map.update({s: 1 for s in cls1})
+    for a, b in pairs2:
+        sa, sb = smids2[a], smids2[b]
+        rel = signs2[a] ^ signs2[b]
+        adj.setdefault(sa, []).append((sb, rel))
+        adj.setdefault(sb, []).append((sa, rel))
+        all_smids.update([sa, sb])
 
-    mean_sep = float(np.mean([abs(v) for v in deltas.values()]))
+    # ---- BFS to propagate relative sm_class ----
+    relative_cls: dict[int, int] = {}
+    start_smid = smids1[0]
+    relative_cls[start_smid] = 0
+    queue: deque[int] = deque([start_smid])
+
+    while queue:
+        curr = queue.popleft()
+        for neighbor, rel in adj.get(curr, []):
+            if neighbor not in relative_cls:
+                relative_cls[neighbor] = relative_cls[curr] ^ rel
+                queue.append(neighbor)
+
+    # Handle any SMs not reached by BFS (shouldn't happen but be safe).
+    for smid in all_smids:
+        if smid not in relative_cls:
+            # Fallback: use pass1 sign directly (old behaviour).
+            for i in range(num_sms):
+                if smids1[i] == smid:
+                    relative_cls[smid] = signs1[i]
+                    break
+
+    # ---- Majority convention: larger group = sm_class 0 ----
+    grp0 = sorted(s for s, c in relative_cls.items() if c == 0)
+    grp1 = sorted(s for s, c in relative_cls.items() if c == 1)
+
+    if len(grp1) > len(grp0):
+        # Flip so majority is class 0.
+        grp0, grp1 = grp1, grp0
+        relative_cls = {s: 1 - c for s, c in relative_cls.items()}
+
+    sm_class_map: dict[int, int] = dict(relative_cls)
+
+    # Mean separation from pass 1 raw deltas.
+    mean_sep = float(np.mean([abs(v) for v in deltas1.values()]))
     return SmClassResult(
-        sm_class_0=sorted(cls0),
-        sm_class_1=sorted(cls1),
+        sm_class_0=sorted(grp0),
+        sm_class_1=sorted(grp1),
         sm_class_map=sm_class_map,
         num_sms=num_sms,
         mean_separation=mean_sep,
@@ -450,6 +532,169 @@ def probe_all_chunk_classes(
 
 
 # ---------------------------------------------------------------------------
+# Interleaved partition layout for k=2048 GEMV
+# ---------------------------------------------------------------------------
+_PC0_PAGES = [0, 2, 4, 6, 8, 10, 12, 14, 17, 19, 21, 23, 25, 27, 29, 31]
+_PC1_PAGES = [1, 3, 5, 7, 9, 11, 13, 15, 16, 18, 20, 22, 24, 26, 28, 30]
+_PAIRS_PER_CHUNK = 128   # row-pairs per 2MB chunk (128 pages per copy × 1 pair/page)
+_PAGES_PER_CHUNK = 256   # 2MB / 8KB
+_HALVES_PER_PAGE = 4096  # 8KB / 2 bytes
+_HALVES_PER_ROW = 2048   # k=2048
+
+
+def compute_interleaved_size(n_rows: int, k: int = 2048) -> int:
+    """Compute interleaved buffer size in bytes (2MB aligned)."""
+    assert k == 2048, f"only k=2048 supported, got k={k}"
+    row_pairs = (n_rows + 1) // 2
+    chunks_needed = (row_pairs + _PAIRS_PER_CHUNK - 1) // _PAIRS_PER_CHUNK
+    return chunks_needed * _CHUNK_2MIB
+
+
+def create_partition_buffer(
+    weight_shapes: List[tuple],
+    device: str = "cuda",
+) -> dict:
+    """Allocate a unified buffer and probe SM/chunk classes.
+
+    Parameters
+    ----------
+    weight_shapes : list of (N, K) tuples
+        Shapes of weights to be packed. All must have K=2048.
+    device : str
+        CUDA device.
+
+    Returns
+    -------
+    dict with keys:
+        sm_class_lo, sm_class_hi : int  (uint64 bitfields)
+        sm_class_map : dict
+        buffer : torch.Tensor  (fp16, flat, on GPU)
+        chunk_classes_list : list of torch.Tensor  (int32, on CPU, per weight)
+        offsets : list of int  (byte offset of each weight region)
+    """
+    device = torch.device(device)
+
+    # 1. Compute per-weight sizes and total
+    sizes = []
+    offsets = []
+    total_bytes = 0
+    for n, k in weight_shapes:
+        sz = compute_interleaved_size(n, k)
+        offsets.append(total_bytes)
+        sizes.append(sz)
+        total_bytes += sz
+
+    # 2. Allocate one big buffer
+    total_halves = total_bytes // 2
+    buf = torch.empty(total_halves, dtype=torch.float16, device=device)
+
+    # 3. Probe SM classes
+    sm_result = probe_sm_classes(device=device)
+
+    # 4. Build sm_class bitfields
+    sm_class_lo = 0  # bits 0-63
+    sm_class_hi = 0  # bits 64+
+    for smid, cls in sm_result.sm_class_map.items():
+        if smid < 64:
+            sm_class_lo |= (cls << smid)
+        else:
+            sm_class_hi |= (cls << (smid - 64))
+
+    # 5. Probe chunk classes for the entire buffer
+    all_cc = probe_all_chunk_classes(buf, sm_result.sm_class_map)
+
+    # 6. Map chunk classes to per-weight arrays
+    base_addr = buf.data_ptr()
+    misalign = base_addr % _CHUNK_2MIB
+    skip_bytes = ((_CHUNK_2MIB - misalign) % _CHUNK_2MIB)
+
+    chunk_classes_list = []
+    for i, (n, k) in enumerate(weight_shapes):
+        offset = offsets[i]
+        sz = sizes[i]
+        num_chunks = sz // _CHUNK_2MIB
+        first_chunk = (offset + skip_bytes) // _CHUNK_2MIB
+        cc_arr = torch.tensor(
+            [all_cc[first_chunk + j].chunk_class for j in range(num_chunks)],
+            dtype=torch.int32,
+        )
+        chunk_classes_list.append(cc_arr)
+
+    return {
+        "sm_class_lo": sm_class_lo,
+        "sm_class_hi": sm_class_hi,
+        "sm_class_map": sm_result.sm_class_map,
+        "buffer": buf,
+        "chunk_classes_list": chunk_classes_list,
+        "offsets": offsets,
+    }
+
+
+def pack_interleaved_weight(
+    weight: torch.Tensor,
+    buf: torch.Tensor,
+    chunk_classes: torch.Tensor,
+) -> None:
+    """Pack a [N, K=2048] weight into an interleaved dual-copy layout.
+
+    Both Copy A and Copy B contain identical data, placed on complementary
+    page_class pages so each SM class reads only from its fast pages.
+
+    Parameters
+    ----------
+    weight : torch.Tensor
+        [N, K] fp16, row-major, contiguous.
+    buf : torch.Tensor
+        Flat fp16 buffer (sub-region of the unified buffer), size >= compute_interleaved_size(N, K).
+    chunk_classes : torch.Tensor
+        [num_chunks] int32, chunk_class per 2MB chunk.
+    """
+    assert weight.is_cuda and weight.is_contiguous()
+    assert weight.dtype == torch.float16
+    n, k = weight.shape
+    assert k == _HALVES_PER_ROW
+
+    num_pairs = (n + 1) // 2
+    num_chunks = chunk_classes.numel()
+    cc_cpu = chunk_classes.cpu().numpy()
+
+    for pair_idx in range(num_pairs):
+        chunk_idx = pair_idx // _PAIRS_PER_CHUNK
+        pair_in_chunk = pair_idx % _PAIRS_PER_CHUNK
+        period = pair_in_chunk // 16
+        intra = pair_in_chunk % 16
+        cc = int(cc_cpu[chunk_idx])
+
+        # Copy A: pages where page_class == cc (fast for SM class 0)
+        # Copy B: pages where page_class == cc^1 (fast for SM class 1)
+        lut_a = _PC0_PAGES if cc == 0 else _PC1_PAGES
+        lut_b = _PC1_PAGES if cc == 0 else _PC0_PAGES
+
+        page_a = period * 32 + lut_a[intra]
+        page_b = period * 32 + lut_b[intra]
+
+        abs_page_a = chunk_idx * _PAGES_PER_CHUNK + page_a
+        abs_page_b = chunk_idx * _PAGES_PER_CHUNK + page_b
+
+        row0 = pair_idx * 2
+        row1 = pair_idx * 2 + 1
+
+        # Write Copy A
+        dst_offset_a = abs_page_a * _HALVES_PER_PAGE
+        if row0 < n:
+            buf[dst_offset_a: dst_offset_a + _HALVES_PER_ROW] = weight[row0]
+        if row1 < n:
+            buf[dst_offset_a + _HALVES_PER_ROW: dst_offset_a + _HALVES_PER_PAGE] = weight[row1]
+
+        # Write Copy B (same data, different page)
+        dst_offset_b = abs_page_b * _HALVES_PER_PAGE
+        if row0 < n:
+            buf[dst_offset_b: dst_offset_b + _HALVES_PER_ROW] = weight[row0]
+        if row1 < n:
+            buf[dst_offset_b + _HALVES_PER_ROW: dst_offset_b + _HALVES_PER_PAGE] = weight[row1]
+
+
+# ---------------------------------------------------------------------------
 # CLI self-test
 # ---------------------------------------------------------------------------
 def _self_test():
@@ -461,16 +706,9 @@ def _self_test():
     print(f"Device: {props.name}, {props.multi_processor_count} SMs")
     print()
 
-    # Known ground truth from CSV analysis (A800-80GB-PCIe, 108 SMs)
-    _EXPECTED_CLS0 = {1, 3, 4, 7, 9, 10, 12, 14, 16, 17, 20, 21, 22, 23,
-                      28, 30, 33, 34, 36, 39, 41, 43, 45, 46, 52, 53, 54,
-                      55, 56, 57, 58, 59, 60, 63, 66, 67, 68, 69, 70, 71,
-                      72, 73, 76, 77, 78, 79, 81, 83, 85, 87, 88, 91, 92,
-                      93, 102, 103}
-    _EXPECTED_CLS1 = {0, 2, 5, 6, 8, 11, 13, 15, 18, 19, 24, 25, 26, 27,
-                      29, 31, 32, 35, 37, 38, 40, 42, 44, 47, 48, 49, 50,
-                      51, 61, 62, 64, 65, 74, 75, 80, 82, 84, 86, 89, 90,
-                      94, 95, 96, 97, 98, 99, 100, 101, 104, 105, 106, 107}
+    # Known ground truth from CSV analysis -- REMOVED.
+    # SM classification is hardware-specific and changes across GPU cards.
+    # Use probe_sm_classes() at runtime to determine the actual classification.
 
     # --- (1) probe_sm_classes ---
     print("=" * 70)
@@ -483,19 +721,10 @@ def _self_test():
     assert sm.mean_separation > _SEPARATION_THRESHOLD, \
         f"Separation too low ({sm.mean_separation:.1f}), expected >50"
 
-    # Validate against ground truth (A800-108SM)
-    if props.multi_processor_count == 108:
-        actual_cls0 = set(sm.sm_class_0)
-        actual_cls1 = set(sm.sm_class_1)
-        assert len(actual_cls0) == 56 and len(actual_cls1) == 52, \
-            f"Expected 56/52 split, got {len(actual_cls0)}/{len(actual_cls1)}"
-        assert actual_cls0 == _EXPECTED_CLS0, \
-            f"sm_class=0 mismatch: extra={actual_cls0 - _EXPECTED_CLS0}, " \
-            f"missing={_EXPECTED_CLS0 - actual_cls0}"
-        assert actual_cls1 == _EXPECTED_CLS1, \
-            f"sm_class=1 mismatch: extra={actual_cls1 - _EXPECTED_CLS1}, " \
-            f"missing={_EXPECTED_CLS1 - actual_cls1}"
-        print("  Ground truth match: OK")
+    # Sanity check: total SM count matches hardware
+    total_sms = len(sm.sm_class_0) + len(sm.sm_class_1)
+    assert total_sms == props.multi_processor_count, \
+        f"Probed {total_sms} SMs but device has {props.multi_processor_count}"
 
     print("  PASS")
     print()

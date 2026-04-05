@@ -740,6 +740,194 @@ __global__ void nosplit_matvec_k2048_row2_hfma2_fwd_kernel(
     }
 }
 
+// Page-class LUT for interleaved partition layout.
+// Within each 256KB period (32 pages), pages with page_class==0 and ==1.
+__device__ constexpr int kPc0Pages[16] = {0,2,4,6,8,10,12,14,17,19,21,23,25,27,29,31};
+__device__ constexpr int kPc1Pages[16] = {1,3,5,7,9,11,13,15,16,18,20,22,24,26,28,30};
+
+// HBM partition-aware k=2048 row2 GEMV kernel.
+// Identical compute to k2048_row2_hfma2_fwd_kernel, but uses interleaved
+// memory layout where each SM reads only from its "fast" 8KB pages.
+__global__ void nosplit_matvec_k2048_row2_partition_fwd_kernel(
+    const at::Half* __restrict__ x,
+    const at::Half* __restrict__ weight_buf,   // flat interleaved 2x buffer
+    const at::Half* __restrict__ bias,
+    at::Half* __restrict__ out,
+    const int32_t* __restrict__ chunk_classes, // chunk_class per 2MB chunk
+    int64_t sm_class_lo,                       // SM class bitfield bits 0-63
+    int64_t sm_class_hi,                       // SM class bitfield bits 64-107
+    int n,
+    bool has_bias) {
+    __shared__ __half x_sh[kNosplitSpecializedK2048];
+    __shared__ int s_abs_page;  // absolute page index computed by thread 0
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row_base = blockIdx.x * 2;
+    const int row = row_base + warp;
+
+    const __half* x_half = reinterpret_cast<const __half*>(x);
+
+    const uint4* x_global_vec = reinterpret_cast<const uint4*>(x_half);
+    uint4* x_sh_vec = reinterpret_cast<uint4*>(x_sh);
+
+    constexpr int vecs_k2048 = kNosplitSpecializedK2048 / kHalfPerVec128;
+
+    // Load x vector into shared memory (same as standard kernel).
+    if (threadIdx.x < vecs_k2048 / 4) {
+        x_sh_vec[threadIdx.x] = x_global_vec[threadIdx.x];
+        x_sh_vec[threadIdx.x + vecs_k2048 / 4] = x_global_vec[threadIdx.x + vecs_k2048 / 4];
+        x_sh_vec[threadIdx.x + vecs_k2048 / 2] = x_global_vec[threadIdx.x + vecs_k2048 / 2];
+        x_sh_vec[threadIdx.x + (vecs_k2048 * 3) / 4] = x_global_vec[threadIdx.x + (vecs_k2048 * 3) / 4];
+    }
+
+    // Thread 0 computes the interleaved page address for this block's row-pair.
+    if (threadIdx.x == 0) {
+        const int smid = read_smid_int();
+        const int sm_cls = (smid < 64)
+            ? static_cast<int>((static_cast<uint64_t>(sm_class_lo) >> smid) & 1)
+            : static_cast<int>((static_cast<uint64_t>(sm_class_hi) >> (smid - 64)) & 1);
+
+        const int pair_idx = blockIdx.x;       // global row-pair index
+        const int chunk_idx = pair_idx >> 7;   // / 128
+        const int pair_in_chunk = pair_idx & 127;
+        const int cc = chunk_classes[chunk_idx];
+        const int target_pc = sm_cls ^ cc;
+
+        const int* lut = (target_pc == 0) ? kPc0Pages : kPc1Pages;
+        const int period = pair_in_chunk >> 4;     // / 16
+        const int intra  = pair_in_chunk & 15;
+        const int page_in_chunk = period * 32 + lut[intra];
+
+        s_abs_page = (chunk_idx << 8) + page_in_chunk;  // chunk_idx * 256 + page_in_chunk
+    }
+    __syncthreads();
+
+    if (row < n) {
+        // Compute weight row address from interleaved layout.
+        // Each page = 8KB = 4096 halves. Row-pair occupies 1 page, each row = 2048 halves.
+        const __half* w_buf_half = reinterpret_cast<const __half*>(weight_buf);
+        const uint4* w_row_vec = reinterpret_cast<const uint4*>(
+            w_buf_half + static_cast<int64_t>(s_abs_page) * 4096 + warp * 2048);
+
+        __half2 h2_acc0 = __float2half2_rn(0.0f);
+        __half2 h2_acc1 = __float2half2_rn(0.0f);
+
+        #pragma unroll
+        for (int vec_idx = lane; vec_idx < vecs_k2048; vec_idx += 64) {
+            const uint4 x_vec0 = x_sh_vec[vec_idx];
+            const uint4 w_vec0 = w_row_vec[vec_idx];
+            const uint4 x_vec1 = x_sh_vec[vec_idx + 32];
+            const uint4 w_vec1 = w_row_vec[vec_idx + 32];
+            accumulate_hfma2_uint4(x_vec0, w_vec0, h2_acc0);
+            accumulate_hfma2_uint4(x_vec1, w_vec1, h2_acc1);
+        }
+
+        const float2 f2_0 = __half22float2(h2_acc0);
+        const float2 f2_1 = __half22float2(h2_acc1);
+        float sum = f2_0.x + f2_0.y + f2_1.x + f2_1.y;
+        sum = warp_sum(sum);
+        if (lane == 0) {
+            float result = sum;
+            if (has_bias) {
+                result += __half2float(reinterpret_cast<const __half*>(bias)[row]);
+            }
+            reinterpret_cast<__half*>(out)[row] = __float2half(result);
+        }
+    }
+}
+
+// V2 HBM partition-aware k=2048 row2 GEMV kernel.
+// Eliminates ALL global/constant memory reads for page address computation.
+// Key optimizations vs V1:
+//   1) chunk_class_bits: uint64 bitfield kernel arg replaces chunk_classes[] global read
+//   2) Arithmetic formula replaces device constant LUT (kPc0Pages/kPc1Pages)
+//   3) Every thread computes page address independently from registers (no shmem, no shuffle)
+//   4) Only ONE __syncthreads for x loading — identical to standard kernel
+__global__ void nosplit_matvec_k2048_row2_partition_v2_fwd_kernel(
+    const at::Half* __restrict__ x,
+    const at::Half* __restrict__ weight_buf,   // flat interleaved 2x buffer
+    const at::Half* __restrict__ bias,
+    at::Half* __restrict__ out,
+    int64_t chunk_class_bits,                  // bitfield: bit i = chunk_class of chunk i
+    int64_t sm_class_lo,                       // SM class bitfield bits 0-63
+    int64_t sm_class_hi,                       // SM class bitfield bits 64-107
+    int n,
+    bool has_bias) {
+    __shared__ __half x_sh[kNosplitSpecializedK2048];
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row_base = blockIdx.x * 2;
+    const int row = row_base + warp;
+
+    const __half* x_half = reinterpret_cast<const __half*>(x);
+
+    const uint4* x_global_vec = reinterpret_cast<const uint4*>(x_half);
+    uint4* x_sh_vec = reinterpret_cast<uint4*>(x_sh);
+
+    constexpr int vecs_k2048 = kNosplitSpecializedK2048 / kHalfPerVec128;
+
+    // Load x vector into shared memory (same as standard kernel).
+    if (threadIdx.x < vecs_k2048 / 4) {
+        x_sh_vec[threadIdx.x] = x_global_vec[threadIdx.x];
+        x_sh_vec[threadIdx.x + vecs_k2048 / 4] = x_global_vec[threadIdx.x + vecs_k2048 / 4];
+        x_sh_vec[threadIdx.x + vecs_k2048 / 2] = x_global_vec[threadIdx.x + vecs_k2048 / 2];
+        x_sh_vec[threadIdx.x + (vecs_k2048 * 3) / 4] = x_global_vec[threadIdx.x + (vecs_k2048 * 3) / 4];
+    }
+
+    // Compute interleaved page address entirely from registers (zero extra memory).
+    const int smid = read_smid_int();
+    const int sm_cls = (smid < 64)
+        ? static_cast<int>((static_cast<uint64_t>(sm_class_lo) >> smid) & 1)
+        : static_cast<int>((static_cast<uint64_t>(sm_class_hi) >> (smid - 64)) & 1);
+
+    const int pair_idx = blockIdx.x;
+    const int chunk_idx = pair_idx >> 7;           // / 128 pairs per 2MB chunk
+    const int pair_in_chunk = pair_idx & 127;
+    const int cc = static_cast<int>((static_cast<uint64_t>(chunk_class_bits) >> chunk_idx) & 1);
+    const int target_pc = sm_cls ^ cc;
+
+    const int period = pair_in_chunk >> 4;         // / 16
+    const int intra  = pair_in_chunk & 15;
+    // Arithmetic formula equivalent to kPc0Pages[intra] / kPc1Pages[intra]:
+    const int page_in_chunk = period * 32 + intra * 2 + ((intra >> 3) ^ target_pc);
+    const int abs_page = (chunk_idx << 8) + page_in_chunk;
+
+    __syncthreads();  // Wait for x loading (same as standard kernel, NO extra sync)
+
+    if (row < n) {
+        const __half* w_buf_half = reinterpret_cast<const __half*>(weight_buf);
+        const uint4* w_row_vec = reinterpret_cast<const uint4*>(
+            w_buf_half + static_cast<int64_t>(abs_page) * 4096 + warp * 2048);
+
+        __half2 h2_acc0 = __float2half2_rn(0.0f);
+        __half2 h2_acc1 = __float2half2_rn(0.0f);
+
+        #pragma unroll
+        for (int vec_idx = lane; vec_idx < vecs_k2048; vec_idx += 64) {
+            const uint4 x_vec0 = x_sh_vec[vec_idx];
+            const uint4 w_vec0 = w_row_vec[vec_idx];
+            const uint4 x_vec1 = x_sh_vec[vec_idx + 32];
+            const uint4 w_vec1 = w_row_vec[vec_idx + 32];
+            accumulate_hfma2_uint4(x_vec0, w_vec0, h2_acc0);
+            accumulate_hfma2_uint4(x_vec1, w_vec1, h2_acc1);
+        }
+
+        const float2 f2_0 = __half22float2(h2_acc0);
+        const float2 f2_1 = __half22float2(h2_acc1);
+        float sum = f2_0.x + f2_0.y + f2_1.x + f2_1.y;
+        sum = warp_sum(sum);
+        if (lane == 0) {
+            float result = sum;
+            if (has_bias) {
+                result += __half2float(reinterpret_cast<const __half*>(bias)[row]);
+            }
+            reinterpret_cast<__half*>(out)[row] = __float2half(result);
+        }
+    }
+}
+
 template <bool kProfile>
 __global__ void nosplit_matvec_k6144_hfma2_fwd_kernel(
     const at::Half* __restrict__ x,
@@ -4632,6 +4820,101 @@ torch::Tensor nosplit_matvec_half_dualcopy_routed_cuda(
         static_cast<int>(route_mode),
         static_cast<int>(smid_threshold),
         weight_a.stride(0),
+        n,
+        has_bias);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+torch::Tensor nosplit_matvec_half_partition_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& weight_buf,
+    const torch::Tensor& bias,
+    const torch::Tensor& out,
+    const torch::Tensor& chunk_classes,
+    int64_t sm_class_lo,
+    int64_t sm_class_hi,
+    int64_t n_rows,
+    bool has_bias) {
+    TORCH_CHECK(x.is_cuda(), "x must be CUDA");
+    TORCH_CHECK(weight_buf.is_cuda(), "weight_buf must be CUDA");
+    TORCH_CHECK(out.is_cuda(), "out must be CUDA");
+    TORCH_CHECK(chunk_classes.is_cuda(), "chunk_classes must be CUDA");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat16, "partition matvec only supports fp16");
+    TORCH_CHECK(weight_buf.scalar_type() == torch::kFloat16, "partition matvec only supports fp16 weight_buf");
+    TORCH_CHECK(out.scalar_type() == torch::kFloat16, "out must be fp16");
+    TORCH_CHECK(chunk_classes.scalar_type() == torch::kInt, "chunk_classes must be int32");
+    TORCH_CHECK(x.dim() == 1, "x must be flattened [K]");
+    TORCH_CHECK(x.size(0) == kNosplitSpecializedK2048, "partition matvec requires K=2048");
+    TORCH_CHECK(weight_buf.is_contiguous(), "weight_buf must be contiguous");
+    TORCH_CHECK(chunk_classes.is_contiguous(), "chunk_classes must be contiguous");
+    TORCH_CHECK(n_rows > 0, "n_rows must be > 0");
+    TORCH_CHECK(out.numel() >= n_rows, "out too small");
+    if (has_bias) {
+        TORCH_CHECK(bias.is_cuda(), "bias must be CUDA when present");
+        TORCH_CHECK(bias.numel() >= n_rows, "bias size mismatch");
+    }
+
+    const int n = static_cast<int>(n_rows);
+    const int grid_blocks = (n + 1) / 2;
+
+    c10::cuda::CUDAGuard device_guard(x.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    nosplit_matvec_k2048_row2_partition_fwd_kernel<<<grid_blocks, kRow2Threads, 0, stream>>>(
+        x.data_ptr<at::Half>(),
+        weight_buf.data_ptr<at::Half>(),
+        has_bias ? bias.data_ptr<at::Half>() : nullptr,
+        out.data_ptr<at::Half>(),
+        chunk_classes.data_ptr<int32_t>(),
+        sm_class_lo,
+        sm_class_hi,
+        n,
+        has_bias);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+torch::Tensor nosplit_matvec_half_partition_v2_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& weight_buf,
+    const torch::Tensor& bias,
+    const torch::Tensor& out,
+    int64_t chunk_class_bits,
+    int64_t sm_class_lo,
+    int64_t sm_class_hi,
+    int64_t n_rows,
+    bool has_bias) {
+    TORCH_CHECK(x.is_cuda(), "x must be CUDA");
+    TORCH_CHECK(weight_buf.is_cuda(), "weight_buf must be CUDA");
+    TORCH_CHECK(out.is_cuda(), "out must be CUDA");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat16, "partition v2 matvec only supports fp16");
+    TORCH_CHECK(weight_buf.scalar_type() == torch::kFloat16, "partition v2 matvec only supports fp16 weight_buf");
+    TORCH_CHECK(out.scalar_type() == torch::kFloat16, "out must be fp16");
+    TORCH_CHECK(x.dim() == 1, "x must be flattened [K]");
+    TORCH_CHECK(x.size(0) == kNosplitSpecializedK2048, "partition v2 matvec requires K=2048");
+    TORCH_CHECK(weight_buf.is_contiguous(), "weight_buf must be contiguous");
+    TORCH_CHECK(n_rows > 0, "n_rows must be > 0");
+    TORCH_CHECK(out.numel() >= n_rows, "out too small");
+    if (has_bias) {
+        TORCH_CHECK(bias.is_cuda(), "bias must be CUDA when present");
+        TORCH_CHECK(bias.numel() >= n_rows, "bias size mismatch");
+    }
+
+    const int n = static_cast<int>(n_rows);
+    const int grid_blocks = (n + 1) / 2;
+
+    c10::cuda::CUDAGuard device_guard(x.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    nosplit_matvec_k2048_row2_partition_v2_fwd_kernel<<<grid_blocks, kRow2Threads, 0, stream>>>(
+        x.data_ptr<at::Half>(),
+        weight_buf.data_ptr<at::Half>(),
+        has_bias ? bias.data_ptr<at::Half>() : nullptr,
+        out.data_ptr<at::Half>(),
+        chunk_class_bits,
+        sm_class_lo,
+        sm_class_hi,
         n,
         has_bias);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
