@@ -94,7 +94,10 @@ if [ -d "$SCRIPT_DIR/cuda_extensions" ]; then
         decode_attention_ext.cpp \
         decode_attention_kernel.cu \
         decode_gemv_ext.cpp \
-        decode_gemv_kernel.cu
+        decode_gemv_kernel.cu \
+        decode_gemv_gridsync.cu \
+        decode_gemv_gridsync.o \
+        decode_gemv_gridsync_dlink.o
     do
         if [ -f "$SCRIPT_DIR/cuda_extensions/$ext_file" ]; then
             cp "$SCRIPT_DIR/cuda_extensions/$ext_file" "$TEMP_DIR/cuda_extensions/"
