@@ -192,3 +192,74 @@ def grouped_prefix_cachepos_splitkv_qhead(
         out,
     )
     return out.unsqueeze(2).transpose(1, 2)
+
+
+def _v4_launch_config(seq_len: int) -> int:
+    """Return split_k for v4 tiled kernel."""
+    if seq_len < 512:
+        return 16
+    elif seq_len < 1024:
+        return 16
+    else:
+        return 32
+
+
+def decode_attn_v4_splitkv(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scaling: float,
+    num_key_value_groups: int,
+    cache_position: torch.Tensor,
+    split_k: int | None = None,
+    workspace: dict | None = None,
+) -> torch.Tensor | None:
+    if (
+        num_key_value_groups != 2
+        or q.device.type != "cuda"
+        or k.device.type != "cuda"
+        or v.device.type != "cuda"
+        or cache_position.device.type != "cuda"
+        or q.shape[0] != 1
+        or q.shape[2] != 1
+        or q.shape[-1] != 128
+        or q.dtype != torch.float16
+    ):
+        return None
+
+    seq_len = k.shape[2]
+    if split_k is None:
+        split_k = _v4_launch_config(seq_len)
+
+    head_dim = q.shape[-1]
+    layout = _workspace_layout(
+        num_kv_heads=k.shape[1],
+        num_key_value_groups=num_key_value_groups,
+        head_dim=head_dim,
+        split_k=split_k,
+    )
+    if (
+        workspace is not None
+        and workspace.get("split_k") == split_k
+        and tuple(workspace["partial_acc"].shape) == layout["partial_acc_shape"]
+        and tuple(workspace["partial_stats"].shape) == layout["partial_stats_shape"]
+        and tuple(workspace["out"].shape) == layout["out_shape"]
+        and workspace["out"].dtype == q.dtype
+        and workspace["partial_acc"].device == q.device
+    ):
+        partial_acc = workspace["partial_acc"]
+        partial_stats = workspace["partial_stats"]
+        out = workspace["out"]
+    else:
+        partial_acc = torch.empty(layout["partial_acc_shape"], dtype=torch.float32, device=q.device)
+        partial_stats = torch.empty(layout["partial_stats_shape"], dtype=torch.float32, device=q.device)
+        out = torch.empty(layout["out_shape"], dtype=q.dtype, device=q.device)
+
+    ext = _load_ext()
+    ext.decode_attn_v4_splitkv(
+        q, k, v, cache_position,
+        float(scaling),
+        partial_acc, partial_stats, out,
+        int(num_key_value_groups),
+    )
+    return out.unsqueeze(2).transpose(1, 2)

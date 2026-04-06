@@ -2,7 +2,6 @@
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
-
 setup(
     name="cuda_decode_attention_ext",
     ext_modules=[
@@ -11,6 +10,7 @@ setup(
             sources=[
                 "decode_attention_ext.cpp",
                 "decode_attention_kernel.cu",
+                "decode_attention_v4_kernel.cu",
             ],
             extra_compile_args={
                 "cxx": ["-O3"],
