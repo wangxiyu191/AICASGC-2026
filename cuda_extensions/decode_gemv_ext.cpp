@@ -265,6 +265,14 @@ torch::Tensor fused_gateup_silu_downproj_softsync_profile_half_cuda(
     const torch::Tensor& out,
     const torch::Tensor& profile);
 
+torch::Tensor decode_attn_persistent_half_cuda(
+    const torch::Tensor& q,
+    const torch::Tensor& k_cache,
+    const torch::Tensor& v_cache,
+    const torch::Tensor& cache_position,
+    const torch::Tensor& out,
+    double scale);
+
 torch::Tensor fused_gateup_silu_downproj_gridsync_half_cuda(
     const torch::Tensor& x,
     const torch::Tensor& gate_up_weight,
@@ -730,6 +738,17 @@ torch::Tensor fused_gateup_silu_downproj_softsync_profile_half(
         profile);
 }
 
+torch::Tensor decode_attn_persistent_half(
+    const torch::Tensor& q,
+    const torch::Tensor& k_cache,
+    const torch::Tensor& v_cache,
+    const torch::Tensor& cache_position,
+    const torch::Tensor& out,
+    double scale) {
+    return decode_attn_persistent_half_cuda(
+        q, k_cache, v_cache, cache_position, out, scale);
+}
+
 torch::Tensor fused_gateup_silu_downproj_gridsync_half(
     const torch::Tensor& x,
     const torch::Tensor& gate_up_weight,
@@ -851,4 +870,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_post_attn_mlp_persistent_half", &fused_post_attn_mlp_persistent_half);
     m.def("fused_gateup_silu_downproj_persistent_half", &fused_gateup_silu_downproj_persistent_half);
     m.def("fused_gateup_silu_downproj_persistent_profile_half", &fused_gateup_silu_downproj_persistent_profile_half);
+    m.def("decode_attn_persistent_half", &decode_attn_persistent_half);
 }

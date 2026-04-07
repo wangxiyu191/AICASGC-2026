@@ -382,6 +382,7 @@ _ENABLE_CUDA_FUSED_QK_NORM_ROPE = os.environ.get("ENABLE_CUDA_FUSED_QK_NORM_ROPE
 _ENABLE_TRITON_SMALL_DECODE_ATTENTION = os.environ.get("ENABLE_TRITON_SMALL_DECODE_ATTENTION", "1") == "1"
 _ENABLE_TRITON_SMALL_DECODE_ATTENTION_DOT = os.environ.get("ENABLE_TRITON_SMALL_DECODE_ATTENTION_DOT", "1") == "1"
 _ENABLE_TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV = os.environ.get("ENABLE_TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV", "1") == "1"
+_ENABLE_CUDA_PERSISTENT_ATTENTION = os.environ.get("ENABLE_CUDA_PERSISTENT_ATTENTION", "0") == "1"
 _TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_SPLIT_K = int(os.environ.get("TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_SPLIT_K", "0"))
 _TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_BLOCK_N = int(os.environ.get("TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_BLOCK_N", "0"))
 _TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_NUM_WARPS = int(os.environ.get("TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_NUM_WARPS", "0"))
@@ -1196,6 +1197,30 @@ def _small_decode_attention(
         prefer_small_triton=prefer_small_triton,
     ):
         return None
+
+    if (
+        _ENABLE_CUDA_PERSISTENT_ATTENTION
+        and prefer_small_triton
+        and cache_position is not None
+        and cache_position.device.type == "cuda"
+        and cache_position.ndim == 1
+        and cache_position.numel() == 1
+        and q.dtype == torch.float16
+        and k.dtype == torch.float16
+        and v.dtype == torch.float16
+        and q.shape[-1] == 128
+        and num_key_value_groups == 2
+    ):
+        import cuda_decode_gemv
+        out = cuda_decode_gemv.decode_attn_persistent_half(
+            q,
+            k,
+            v,
+            cache_position,
+            scale=scaling,
+            workspace=splitkv_workspace,
+        )
+        return out
 
     out = _small_decode_attention_grouped_prefix_cachepos_splitkv(
         q,

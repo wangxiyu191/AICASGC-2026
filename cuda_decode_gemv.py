@@ -2231,3 +2231,73 @@ def nosplit_matvec_half_profile_xwarp_sms2_balanced_cta_trace(
         "variant": "k6144_n8k1024_xwarp_w_async_sms2_balanced",
     }
     return out_vec.view(*x.shape[:-1], n), trace, smid, row_base, meta
+
+
+def decode_attn_persistent_half(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cache_position: torch.Tensor,
+    scale: float,
+    workspace: dict | None = None,
+) -> torch.Tensor:
+    """Persistent cooperative-groups decode attention (1024 threads, 1 block/SM).
+
+    All 32 warps participate in attention via block-internal 16-way split-KV
+    with shared memory reduction.  No external partial buffers needed.
+
+    Args:
+        q: [1, num_q_heads, 1, head_dim] or [1, num_q_heads, head_dim] query tensor (fp16)
+        k_cache: [1, num_kv_heads, max_seq_len, head_dim] key cache (fp16)
+        v_cache: [1, num_kv_heads, max_seq_len, head_dim] value cache (fp16)
+        cache_position: [1] int64 tensor with current position (seq_len = pos + 1)
+        scale: attention scale (1/sqrt(head_dim))
+        workspace: optional pre-allocated output buffer
+    Returns:
+        out: [1, num_q_heads, 1, head_dim] attention output (fp16)
+    """
+    if (
+        q.device.type != "cuda"
+        or k_cache.device.type != "cuda"
+        or v_cache.device.type != "cuda"
+        or q.dtype != torch.float16
+        or k_cache.dtype != torch.float16
+        or v_cache.dtype != torch.float16
+    ):
+        raise RuntimeError("decode_attn_persistent_half expects fp16 CUDA tensors")
+
+    # Normalize q shape to [num_q_heads, head_dim]
+    if q.ndim == 4:
+        num_q_heads, head_dim = q.shape[1], q.shape[3]
+        q_2d = q.view(num_q_heads, head_dim).contiguous()
+    elif q.ndim == 3:
+        num_q_heads, head_dim = q.shape[1], q.shape[2]
+        q_2d = q.view(num_q_heads, head_dim).contiguous()
+    else:
+        raise RuntimeError("q must be 3D or 4D")
+
+    if (
+        workspace is not None
+        and workspace.get("type") == "decode_attn_persistent"
+        and workspace["out"].device == q.device
+    ):
+        out_2d = workspace["out"]
+    else:
+        out_2d = torch.empty(
+            (num_q_heads, head_dim),
+            dtype=torch.float16, device=q.device,
+        )
+        if workspace is not None:
+            workspace["type"] = "decode_attn_persistent"
+            workspace["out"] = out_2d
+
+    ext = _load_ext()
+    ext.decode_attn_persistent_half(
+        q_2d,
+        k_cache,
+        v_cache,
+        cache_position,
+        out_2d,
+        scale,
+    )
+    return out_2d.view(1, num_q_heads, 1, head_dim)

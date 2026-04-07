@@ -405,6 +405,17 @@ def _cuda_v4_splitkv(q, k, v, attention_mask, scaling, num_key_value_groups, cac
     return out
 
 
+def _cuda_persistent(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position):
+    import cuda_decode_gemv
+    out = cuda_decode_gemv.decode_attn_persistent_half(
+        q, k, v, cache_position,
+        scale=scaling,
+    )
+    if out is None:
+        raise RuntimeError("CUDA persistent attention returned None")
+    return out.transpose(1, 2)
+
+
 def _triton_current(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position):
     out = optimized_layer._small_decode_attention(
         q,
@@ -550,6 +561,7 @@ def _run_benchmarks(
         "cuda_grouped_cachepos_splitkv": _cuda_grouped_cachepos_splitkv,
         "cuda_qhead_grouped_cachepos_splitkv": _cuda_qhead_grouped_cachepos_splitkv,
         "cuda_v4_splitkv": _cuda_v4_splitkv,
+        "cuda_persistent": _cuda_persistent,
         "triton_current": _triton_current,
         "sdpa_enable_gqa_mask": lambda q, k, v, attention_mask, scaling, num_key_value_groups, _cache_position: _sdpa_gqa_mask(q, k, v, attention_mask, scaling, num_key_value_groups),
         "sdpa_enable_gqa_valid_prefix": lambda q, k, v, attention_mask, scaling, num_key_value_groups, _cache_position: _sdpa_gqa_valid_only(q, k, v, attention_mask, scaling, num_key_value_groups),

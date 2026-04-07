@@ -1050,11 +1050,302 @@ __global__ void fused_gateup_silu_downproj_persistent_profile_k2048_k6144_fwd_ke
     }
 }
 
+// ---------------------------------------------------------------------------
+// Persistent attention kernel: 1 block per SM, 1024 threads (32 warps)
+// All 32 warps participate in attention.  Grid cycles over q-heads (not
+// kv-heads) for maximum SM utilization.  Within each block, 32 warps split
+// the KV sequence, then tree-reduce in shared memory (5 rounds for 32-way).
+//
+// Layout: 1 block per q-head, all 32 warps split KV for that head.
+// Two blocks sharing a kv-group read the same K/V → L2 cache reuse.
+// ---------------------------------------------------------------------------
+
+constexpr int kAttnHeadDim      = 128;
+constexpr int kAttnWarpSize     = 32;
+constexpr int kAttnThreadGroup  = 4;
+constexpr int kAttnGroupsPerWarp = kAttnWarpSize / kAttnThreadGroup;  // 8
+constexpr int kAttnDimsPerThread = kAttnHeadDim / kAttnThreadGroup;   // 32
+constexpr int kAttnTileSteps    = 8;
+constexpr int kAttnTileN        = kAttnGroupsPerWarp * kAttnTileSteps; // 64
+constexpr float kAttnNegLarge   = -1.0e20f;
+
+constexpr int kAttnGqaRatio       = 2;
+constexpr int kAttnInternalSplits = kPersistentWarps;  // 32 (all warps)
+
+__launch_bounds__(1024, 1)
+__global__ void decode_attn_persistent_fwd_kernel(
+    const __half* __restrict__ q,
+    const __half* __restrict__ k_cache,
+    const __half* __restrict__ v_cache,
+    const int64_t* __restrict__ cache_position,
+    __half* __restrict__ out,
+    int64_t q_stride_h,
+    int64_t k_stride_h, int64_t k_stride_s,
+    int64_t v_stride_h, int64_t v_stride_s,
+    int64_t out_stride_h,
+    float scale,
+    int max_seq_len,
+    int num_kv_heads) {
+
+    // Shared memory for within-block tree-reduction of 32 warp partials
+    __shared__ float smem_acc[kPersistentWarps][kAttnHeadDim];  // 16384B
+    __shared__ float smem_m[kPersistentWarps];                  // 128B
+    __shared__ float smem_l[kPersistentWarps];                  // 128B
+
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5;     // 0..31
+    const int lane = tid & 31;
+
+    // Thread-group layout within each warp (same as v4)
+    const int group_id   = lane / kAttnThreadGroup;    // 0..7
+    const int group_lane = lane % kAttnThreadGroup;    // 0..3
+    const int dim_offset = group_lane * kAttnDimsPerThread;  // 0,32,64,96
+
+    const int valid_len = min(
+        static_cast<int>(cache_position[0] + 1), max_seq_len);
+
+    const int num_q_heads = num_kv_heads * kAttnGqaRatio;
+
+    // ===== Grid-cycle over q-heads (all 32 warps on same q-head) ===========
+    for (int q_head_idx = blockIdx.x; q_head_idx < num_q_heads;
+         q_head_idx += gridDim.x) {
+
+        const int kv_head_idx = q_head_idx / kAttnGqaRatio;
+
+        // All 32 warps split the KV sequence
+        const int chunk_size  = (valid_len + kAttnInternalSplits - 1) / kAttnInternalSplits;
+        const int chunk_start = warp * chunk_size;
+        const int chunk_end   = min(chunk_start + chunk_size, valid_len);
+
+        // Load Q for this q-head
+        float q_reg[kAttnDimsPerThread];
+        {
+            const __half* qp = q + q_head_idx * q_stride_h + dim_offset;
+            #pragma unroll
+            for (int i = 0; i < kAttnDimsPerThread; i += 8) {
+                uint4 d = __ldg(reinterpret_cast<const uint4*>(qp + i));
+                const __half* h = reinterpret_cast<const __half*>(&d);
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) q_reg[i + j] = __half2float(h[j]);
+            }
+        }
+
+        // Online softmax state
+        float m_val = kAttnNegLarge;
+        float l_val = 0.0f;
+        float acc[kAttnDimsPerThread];
+        #pragma unroll
+        for (int i = 0; i < kAttnDimsPerThread; ++i) acc[i] = 0.0f;
+
+        const __half* k_base = k_cache + kv_head_idx * k_stride_h;
+        const __half* v_base = v_cache + kv_head_idx * v_stride_h;
+
+        // Tiled two-pass attention over this warp's chunk
+        if (chunk_start < chunk_end) {
+            for (int tile_start = chunk_start; tile_start < chunk_end;
+                 tile_start += kAttnTileN) {
+                const int tile_end = min(tile_start + kAttnTileN, chunk_end);
+
+                // Pass 1: Q·K scores
+                float local_scores[kAttnTileSteps];
+                float tile_max = kAttnNegLarge;
+
+                #pragma unroll
+                for (int step = 0; step < kAttnTileSteps; ++step) {
+                    const int t = tile_start + step * kAttnGroupsPerWarp + group_id;
+                    const bool valid = (t < tile_end);
+                    float dot = 0.0f;
+                    if (valid) {
+                        const __half* kp = k_base + t * k_stride_s + dim_offset;
+                        #pragma unroll
+                        for (int i = 0; i < kAttnDimsPerThread; i += 8) {
+                            uint4 d = __ldg(reinterpret_cast<const uint4*>(kp + i));
+                            const __half* h = reinterpret_cast<const __half*>(&d);
+                            #pragma unroll
+                            for (int j = 0; j < 8; ++j)
+                                dot += q_reg[i + j] * __half2float(h[j]);
+                        }
+                    }
+                    dot += __shfl_xor_sync(0xffffffff, dot, 1);
+                    dot += __shfl_xor_sync(0xffffffff, dot, 2);
+                    float score = valid ? (dot * scale) : kAttnNegLarge;
+                    local_scores[step] = score;
+                    tile_max = fmaxf(tile_max, score);
+                }
+
+                // Cross-group max
+                tile_max = fmaxf(tile_max,
+                    __shfl_xor_sync(0xffffffff, tile_max, 4));
+                tile_max = fmaxf(tile_max,
+                    __shfl_xor_sync(0xffffffff, tile_max, 8));
+                tile_max = fmaxf(tile_max,
+                    __shfl_xor_sync(0xffffffff, tile_max, 16));
+
+                // Rescale running state
+                float new_m = fmaxf(m_val, tile_max);
+                float alpha = expf(m_val - new_m);
+                #pragma unroll
+                for (int i = 0; i < kAttnDimsPerThread; ++i) acc[i] *= alpha;
+                l_val *= alpha;
+                m_val = new_m;
+
+                // Pass 2: V accumulate
+                #pragma unroll
+                for (int step = 0; step < kAttnTileSteps; ++step) {
+                    const int t = tile_start + step * kAttnGroupsPerWarp + group_id;
+                    const bool valid = (t < tile_end);
+                    if (valid) {
+                        float p = expf(local_scores[step] - m_val);
+                        l_val += p;
+                        const __half* vp = v_base + t * v_stride_s + dim_offset;
+                        #pragma unroll
+                        for (int i = 0; i < kAttnDimsPerThread; i += 8) {
+                            uint4 d = __ldg(reinterpret_cast<const uint4*>(vp + i));
+                            const __half* h = reinterpret_cast<const __half*>(&d);
+                            #pragma unroll
+                            for (int j = 0; j < 8; ++j)
+                                acc[i + j] += p * __half2float(h[j]);
+                        }
+                    }
+                }
+            }
+        }
+        // Empty chunk: initial values (m=-inf, l=0, acc=0) are correct
+
+        // --- Intra-warp merge: 8 thread groups → 1 via shuffle ---
+        #pragma unroll
+        for (int xor_mask = kAttnThreadGroup; xor_mask < kAttnWarpSize;
+             xor_mask <<= 1) {
+            float pm = __shfl_xor_sync(0xffffffff, m_val, xor_mask);
+            float pl = __shfl_xor_sync(0xffffffff, l_val, xor_mask);
+            float nm  = fmaxf(m_val, pm);
+            float s_me = expf(m_val - nm);
+            float s_pa = expf(pm - nm);
+            #pragma unroll
+            for (int i = 0; i < kAttnDimsPerThread; ++i) {
+                float pa_v = __shfl_xor_sync(0xffffffff, acc[i], xor_mask);
+                acc[i] = acc[i] * s_me + pa_v * s_pa;
+            }
+            l_val = l_val * s_me + pl * s_pa;
+            m_val = nm;
+        }
+
+        // --- Write per-warp partial to shared memory ---
+        if (group_id == 0) {
+            #pragma unroll
+            for (int i = 0; i < kAttnDimsPerThread; ++i) {
+                smem_acc[warp][dim_offset + i] = acc[i];
+            }
+            if (group_lane == 0) {
+                smem_m[warp] = m_val;
+                smem_l[warp] = l_val;
+            }
+        }
+        __syncthreads();
+
+        // --- Tree reduction: 32 → 1 in 5 rounds ---
+        constexpr int kDimsPerLane = kAttnHeadDim / kAttnWarpSize;  // 4
+        #pragma unroll
+        for (int stride = kAttnInternalSplits / 2; stride >= 1; stride >>= 1) {
+            if (warp < stride) {
+                const int src = warp + stride;
+                const float pm = smem_m[src];
+                const float pl = smem_l[src];
+                const float my_m = smem_m[warp];
+                const float my_l = smem_l[warp];
+                const float nm = fmaxf(my_m, pm);
+                const float s_me = expf(my_m - nm);
+                const float s_pa = expf(pm - nm);
+                #pragma unroll
+                for (int i = 0; i < kDimsPerLane; ++i) {
+                    const float my_a = smem_acc[warp][lane * kDimsPerLane + i];
+                    const float pa_v = smem_acc[src][lane * kDimsPerLane + i];
+                    smem_acc[warp][lane * kDimsPerLane + i] = my_a * s_me + pa_v * s_pa;
+                }
+                if (lane == 0) {
+                    smem_m[warp] = nm;
+                    smem_l[warp] = my_l * s_me + pl * s_pa;
+                }
+            }
+            __syncthreads();
+        }
+
+        // --- Warp 0 writes final output ---
+        if (warp == 0) {
+            const float inv_l = (smem_l[0] > 0.0f) ? (1.0f / smem_l[0]) : 0.0f;
+            __half* op = out + q_head_idx * out_stride_h;
+            #pragma unroll
+            for (int i = 0; i < kDimsPerLane; ++i) {
+                op[lane * kDimsPerLane + i] =
+                    __float2half(smem_acc[0][lane * kDimsPerLane + i] * inv_l);
+            }
+        }
+        __syncthreads();  // sync before next grid-cycle iteration
+    }
+}
+
 }  // anonymous namespace
 
 // ---------------------------------------------------------------------------
 // Host-side launch wrappers (linked from decode_gemv_ext.cpp)
 // ---------------------------------------------------------------------------
+
+torch::Tensor decode_attn_persistent_half_cuda(
+    const torch::Tensor& q,
+    const torch::Tensor& k_cache,
+    const torch::Tensor& v_cache,
+    const torch::Tensor& cache_position,
+    const torch::Tensor& out,
+    double scale) {
+
+    TORCH_CHECK(q.is_cuda() && k_cache.is_cuda() && v_cache.is_cuda(),
+        "inputs must be CUDA");
+    TORCH_CHECK(q.scalar_type() == torch::kFloat16, "persistent attn fp16 only");
+    TORCH_CHECK(q.dim() == 2 && q.size(1) == 128,
+        "q must be [num_q_heads, 128]");
+
+    const int64_t num_kv_heads = k_cache.size(1);
+    const int64_t max_seq_len  = k_cache.size(2);
+
+    int device_idx = static_cast<int>(q.device().index());
+    int num_sms = 0;
+    C10_CUDA_CHECK(cudaDeviceGetAttribute(
+        &num_sms, cudaDevAttrMultiProcessorCount, device_idx));
+
+    c10::cuda::CUDAGuard device_guard(q.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    auto qp  = reinterpret_cast<const __half*>(q.data_ptr<at::Half>());
+    auto kp  = reinterpret_cast<const __half*>(k_cache.data_ptr<at::Half>());
+    auto vp  = reinterpret_cast<const __half*>(v_cache.data_ptr<at::Half>());
+    auto op  = reinterpret_cast<__half*>(out.data_ptr<at::Half>());
+    auto* cp = cache_position.data_ptr<int64_t>();
+
+    float scale_f = static_cast<float>(scale);
+    int max_sl = static_cast<int>(max_seq_len);
+    int n_kv   = static_cast<int>(num_kv_heads);
+
+    int64_t q_s0 = q.stride(0);
+    int64_t k_s1 = k_cache.stride(1), k_s2 = k_cache.stride(2);
+    int64_t v_s1 = v_cache.stride(1), v_s2 = v_cache.stride(2);
+    int64_t o_s0 = out.stride(0);
+
+    // Standalone attention: no grid sync needed, use regular launch.
+    // Grid = num_q_heads (one block per q-head) for maximum SM utilization.
+    const int num_q_heads = static_cast<int>(q.size(0));
+    const int grid = num_q_heads;
+    decode_attn_persistent_fwd_kernel<<<grid, kPersistentThreads, 0, stream>>>(
+        qp, kp, vp, cp, op,
+        q_s0,
+        k_s1, k_s2,
+        v_s1, v_s2,
+        o_s0,
+        scale_f,
+        max_sl,
+        n_kv);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
 
 torch::Tensor fused_gateup_silu_downproj_gridsync_half_cuda(
     const torch::Tensor& x,
