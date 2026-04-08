@@ -1098,6 +1098,8 @@ class VLMModel:
 
         # Wrap model
         self._wrapped_model = ModelWrapper(self._model)
+        if os.environ.get("ENABLE_CUDA_FUSED_O_PROJ_POST_ATTN_MLP_PERSISTENT", "0") == "1":
+            self._optimizations_applied.append("decode:o_proj_post_attn_mlp_persistent")
         if os.environ.get("ENABLE_CUDA_FUSED_POST_ATTN_MLP_PERSISTENT", "0") == "1":
             self._optimizations_applied.append("decode:post_attn_mlp_persistent")
         if os.environ.get("ENABLE_CUDA_FUSED_GATEUP_SILU_DOWNPROJ", "0") == "1":
