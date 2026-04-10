@@ -395,9 +395,9 @@ _ENABLE_CUDA_FUSED_SILU_DOWNPROJ = os.environ.get("ENABLE_CUDA_FUSED_SILU_DOWNPR
 _ENABLE_CUDA_ADD = os.environ.get("ENABLE_CUDA_ADD", "0") == "1"
 _ENABLE_DOWNPROJ_RESIDUAL_EPILOGUE = os.environ.get("ENABLE_DOWNPROJ_RESIDUAL_EPILOGUE", "0") == "1"
 _ENABLE_TRITON_SMALL_QK_NORM_ROPE = os.environ.get("ENABLE_TRITON_SMALL_QK_NORM_ROPE", "1") == "1"
-_ENABLE_TRITON_PREFILL_FUSED_RMS_NORM_ROPE = os.environ.get("ENABLE_TRITON_PREFILL_FUSED_RMS_NORM_ROPE", "0") == "1"
+_ENABLE_TRITON_PREFILL_FUSED_RMS_NORM_ROPE = os.environ.get("ENABLE_TRITON_PREFILL_FUSED_RMS_NORM_ROPE", "1") == "1"
 _ENABLE_TRITON_SMALL_FUSED_QK_NORM_ROPE = os.environ.get("ENABLE_TRITON_SMALL_FUSED_QK_NORM_ROPE", "0") == "1"
-_ENABLE_TRITON_PREFILL_FUSED_QK_NORM_ROPE = os.environ.get("ENABLE_TRITON_PREFILL_FUSED_QK_NORM_ROPE", "0") == "1"
+_ENABLE_TRITON_PREFILL_FUSED_QK_NORM_ROPE = os.environ.get("ENABLE_TRITON_PREFILL_FUSED_QK_NORM_ROPE", "1") == "1"
 _ENABLE_CUDA_FUSED_QK_NORM_ROPE = os.environ.get("ENABLE_CUDA_FUSED_QK_NORM_ROPE", "0") == "1"
 _ENABLE_TRITON_SMALL_DECODE_ATTENTION = os.environ.get("ENABLE_TRITON_SMALL_DECODE_ATTENTION", "1") == "1"
 _ENABLE_TRITON_SMALL_DECODE_ATTENTION_DOT = os.environ.get("ENABLE_TRITON_SMALL_DECODE_ATTENTION_DOT", "1") == "1"
@@ -519,7 +519,7 @@ def _fused_rms_norm_rope(
         return _apply_rotary_emb(_rms_norm(x, weight, eps), cos, sin)
 
     m = batch * seq_len
-    x_3d = x.reshape(m, nheads, D)
+    x_3d = x.contiguous().reshape(m, nheads, D)
     cos_2d = cos.reshape(m, D)
     sin_2d = sin.reshape(m, D)
     out_3d = torch.empty_like(x_3d)
@@ -632,8 +632,8 @@ def _fused_qk_rms_norm_rope(
         return None
 
     m = batch * seq_len
-    q_3d = q.reshape(m, q_heads, d)
-    k_3d = k.reshape(m, kv_heads, d)
+    q_3d = q.contiguous().reshape(m, q_heads, d)
+    k_3d = k.contiguous().reshape(m, kv_heads, d)
     cos_2d = cos.reshape(m, d)
     sin_2d = sin.reshape(m, d)
     q_out = torch.empty_like(q_3d)
@@ -1903,12 +1903,12 @@ def _fused_rms_norm_rope_fwd_kernel(
     w0 = tl.load(W + rk, mask=mask_half, other=0.0).to(tl.float32)
     w1 = tl.load(W + HALF_D + rk, mask=mask_half, other=0.0).to(tl.float32)
     cs_base = m * stride_cos_m
-    cos = tl.load(COS + cs_base + rk, mask=mask_half, other=0.0).to(OUT.dtype.element_ty)
-    sin = tl.load(SIN + cs_base + rk, mask=mask_half, other=0.0).to(OUT.dtype.element_ty)
+    cos = tl.load(COS + cs_base + rk, mask=mask_half, other=0.0).to(tl.float32)
+    sin = tl.load(SIN + cs_base + rk, mask=mask_half, other=0.0).to(tl.float32)
 
-    # Match the native decode path more closely: RMSNorm writes fp16, then RoPE consumes fp16.
-    n0 = (x0 * rstd * w0).to(OUT.dtype.element_ty)
-    n1 = (x1 * rstd * w1).to(OUT.dtype.element_ty)
+    # RMSNorm in fp32, cast to fp16 to match separate-kernel roundtrip, then RoPE in fp32.
+    n0 = (x0 * rstd * w0).to(OUT.dtype.element_ty).to(tl.float32)
+    n1 = (x1 * rstd * w1).to(OUT.dtype.element_ty).to(tl.float32)
     out0 = n0 * cos - n1 * sin
     out1 = n1 * cos + n0 * sin
     tl.store(OUT + m * stride_x_m + h * stride_x_h + rk, out0.to(OUT.dtype.element_ty), mask=mask_half)
@@ -1949,8 +1949,8 @@ def _fused_qk_rms_norm_rope_fwd_kernel(
     rk = tl.arange(0, BLOCK_HALF)
     mask_half = rk < HALF_D
     cs_base = m * stride_cos_m
-    cos = tl.load(COS + cs_base + rk, mask=mask_half, other=0.0).to(Q_OUT.dtype.element_ty)
-    sin = tl.load(SIN + cs_base + rk, mask=mask_half, other=0.0).to(Q_OUT.dtype.element_ty)
+    cos = tl.load(COS + cs_base + rk, mask=mask_half, other=0.0).to(tl.float32)
+    sin = tl.load(SIN + cs_base + rk, mask=mask_half, other=0.0).to(tl.float32)
 
     k_base = K + m * stride_k_m + kv_h * stride_k_h
     k = tl.load(k_base + cols, mask=mask, other=0.0).to(tl.float32)
@@ -1960,10 +1960,10 @@ def _fused_qk_rms_norm_rope_fwd_kernel(
     k1 = tl.load(k_base + HALF_D + rk, mask=mask_half, other=0.0).to(tl.float32)
     kw0 = tl.load(K_W + rk, mask=mask_half, other=0.0).to(tl.float32)
     kw1 = tl.load(K_W + HALF_D + rk, mask=mask_half, other=0.0).to(tl.float32)
-    kn0 = (k0 * k_rstd * kw0).to(K_OUT.dtype.element_ty)
-    kn1 = (k1 * k_rstd * kw1).to(K_OUT.dtype.element_ty)
-    tl.store(K_OUT + m * stride_k_m + kv_h * stride_k_h + rk, kn0 * cos - kn1 * sin, mask=mask_half)
-    tl.store(K_OUT + m * stride_k_m + kv_h * stride_k_h + HALF_D + rk, kn1 * cos + kn0 * sin, mask=mask_half)
+    kn0 = (k0 * k_rstd * kw0).to(K_OUT.dtype.element_ty).to(tl.float32)
+    kn1 = (k1 * k_rstd * kw1).to(K_OUT.dtype.element_ty).to(tl.float32)
+    tl.store(K_OUT + m * stride_k_m + kv_h * stride_k_h + rk, (kn0 * cos - kn1 * sin).to(K_OUT.dtype.element_ty), mask=mask_half)
+    tl.store(K_OUT + m * stride_k_m + kv_h * stride_k_h + HALF_D + rk, (kn1 * cos + kn0 * sin).to(K_OUT.dtype.element_ty), mask=mask_half)
 
     for group_idx in range(GROUPS):
         q_h = q_head_base + group_idx
@@ -1975,10 +1975,10 @@ def _fused_qk_rms_norm_rope_fwd_kernel(
         q1 = tl.load(q_base + HALF_D + rk, mask=mask_half, other=0.0).to(tl.float32)
         qw0 = tl.load(Q_W + rk, mask=mask_half, other=0.0).to(tl.float32)
         qw1 = tl.load(Q_W + HALF_D + rk, mask=mask_half, other=0.0).to(tl.float32)
-        qn0 = (q0 * q_rstd * qw0).to(Q_OUT.dtype.element_ty)
-        qn1 = (q1 * q_rstd * qw1).to(Q_OUT.dtype.element_ty)
-        tl.store(Q_OUT + m * stride_q_m + q_h * stride_q_h + rk, qn0 * cos - qn1 * sin, mask=mask_half)
-        tl.store(Q_OUT + m * stride_q_m + q_h * stride_q_h + HALF_D + rk, qn1 * cos + qn0 * sin, mask=mask_half)
+        qn0 = (q0 * q_rstd * qw0).to(Q_OUT.dtype.element_ty).to(tl.float32)
+        qn1 = (q1 * q_rstd * qw1).to(Q_OUT.dtype.element_ty).to(tl.float32)
+        tl.store(Q_OUT + m * stride_q_m + q_h * stride_q_h + rk, (qn0 * cos - qn1 * sin).to(Q_OUT.dtype.element_ty), mask=mask_half)
+        tl.store(Q_OUT + m * stride_q_m + q_h * stride_q_h + HALF_D + rk, (qn1 * cos + qn0 * sin).to(Q_OUT.dtype.element_ty), mask=mask_half)
 
 
 @triton.jit

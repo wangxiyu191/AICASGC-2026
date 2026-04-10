@@ -1711,7 +1711,6 @@ class VLMModel:
                 orig_language_model_forward = language_model.forward
                 prefill_text_cache_position_cache = {}
                 prefill_text_rotary_cache = {}
-
                 def _cached_prefill_cache_position(device: torch.device, seq_len: int):
                     key = (str(device), int(seq_len))
                     cached = prefill_text_cache_position_cache.get(key)
