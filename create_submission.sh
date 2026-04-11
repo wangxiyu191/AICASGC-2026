@@ -50,6 +50,7 @@ build_cuda_extension() {
 
 build_cuda_extension "setup.py" "cuda_decode_attention_ext*.so"
 build_cuda_extension "setup_decode_gemv.py" "cuda_decode_gemv_ext*.so"
+build_cuda_extension "setup_decode_small_ops.py" "cuda_decode_small_ops_ext*.so"
 
 # Create temporary directory for staging
 TEMP_DIR=$(mktemp -d)
@@ -77,7 +78,7 @@ if [ -f "$SCRIPT_DIR/optimized_layer.py" ]; then
 fi
 
 # Include CUDA Python wrappers if they exist
-for py_file in cuda_decode_gemv.py cuda_decode_attention.py; do
+for py_file in cuda_decode_gemv.py cuda_decode_attention.py cuda_decode_small_ops.py; do
     if [ -f "$SCRIPT_DIR/$py_file" ]; then
         cp "$SCRIPT_DIR/$py_file" "$TEMP_DIR/"
         echo "Including $py_file"
@@ -91,11 +92,14 @@ if [ -d "$SCRIPT_DIR/cuda_extensions" ]; then
         README.md \
         setup.py \
         setup_decode_gemv.py \
+        setup_decode_small_ops.py \
         decode_attention_ext.cpp \
         decode_attention_kernel.cu \
         decode_gemv_ext.cpp \
         decode_gemv_kernel.cu \
         decode_gemv_gridsync.cu \
+        decode_small_ops_ext.cpp \
+        decode_small_ops_kernel.cu \
         decode_gemv_gridsync.o \
         decode_gemv_gridsync_dlink.o
     do
@@ -125,6 +129,47 @@ done
 # Create the ZIP file
 cd "$TEMP_DIR"
 zip -r "$SCRIPT_DIR/$OUTPUT_NAME" ./*
+
+# Verify key runtime modules exist in the packaged tree.
+python3 - "$SCRIPT_DIR/$OUTPUT_NAME" <<'PY'
+import importlib.util
+import sys
+import tempfile
+import zipfile
+from pathlib import Path
+
+zip_path = Path(sys.argv[1])
+required_files = [
+    "evaluation_wrapper.py",
+    "optimized_layer.py",
+    "cuda_decode_attention.py",
+    "cuda_decode_gemv.py",
+    "cuda_decode_small_ops.py",
+    "cuda_extensions/setup.py",
+    "cuda_extensions/setup_decode_gemv.py",
+    "cuda_extensions/setup_decode_small_ops.py",
+]
+with zipfile.ZipFile(zip_path) as zf:
+    names = set(zf.namelist())
+missing = [name for name in required_files if name not in names]
+if missing:
+    raise SystemExit(f"Packaged ZIP is missing required files: {missing}")
+
+required_modules = [
+    "evaluation_wrapper",
+    "optimized_layer",
+    "cuda_decode_attention",
+    "cuda_decode_gemv",
+    "cuda_decode_small_ops",
+]
+with tempfile.TemporaryDirectory() as td:
+    with zipfile.ZipFile(zip_path) as zf:
+        zf.extractall(td)
+    sys.path.insert(0, td)
+    missing_modules = [name for name in required_modules if importlib.util.find_spec(name) is None]
+    if missing_modules:
+        raise SystemExit(f"Packaged ZIP is missing importable modules: {missing_modules}")
+PY
 
 echo "Created: $SCRIPT_DIR/$OUTPUT_NAME"
 echo "Contents:"
