@@ -112,6 +112,74 @@ __global__ void fused_qk_rms_norm_rope_fwd_kernel(
     }
 }
 
+__global__ void fused_q_rope_kv_cache_update_fwd_kernel(
+    const at::Half* __restrict__ q,
+    const at::Half* __restrict__ k,
+    const at::Half* __restrict__ v,
+    const at::Half* __restrict__ q_weight,
+    const at::Half* __restrict__ k_weight,
+    const at::Half* __restrict__ cos,
+    const at::Half* __restrict__ sin,
+    const int64_t* __restrict__ cache_position,
+    at::Half* __restrict__ q_out,
+    at::Half* __restrict__ k_cache,
+    at::Half* __restrict__ v_cache,
+    int64_t q_stride_m,
+    int64_t q_stride_h,
+    int64_t k_stride_m,
+    int64_t k_stride_h,
+    int64_t v_stride_m,
+    int64_t v_stride_h,
+    int64_t cos_stride_m,
+    int64_t q_out_stride_m,
+    int64_t q_out_stride_h,
+    int64_t k_cache_stride_h,
+    int64_t k_cache_stride_s,
+    int64_t v_cache_stride_h,
+    int64_t v_cache_stride_s,
+    int kv_heads,
+    float eps) {
+    const int group_idx = blockIdx.x;
+    const int m = group_idx / kv_heads;
+    const int kv_h = group_idx % kv_heads;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int64_t pos = cache_position[0];
+
+    const __half* cos_row = reinterpret_cast<const __half*>(cos + m * cos_stride_m);
+    const __half* sin_row = reinterpret_cast<const __half*>(sin + m * cos_stride_m);
+    const __half* q_weight_half = reinterpret_cast<const __half*>(q_weight);
+    const __half* k_weight_half = reinterpret_cast<const __half*>(k_weight);
+    const __half* q_half = reinterpret_cast<const __half*>(q);
+    const __half* k_half = reinterpret_cast<const __half*>(k);
+    const __half* v_half = reinterpret_cast<const __half*>(v);
+    __half* q_out_half = reinterpret_cast<__half*>(q_out);
+    __half* k_cache_half = reinterpret_cast<__half*>(k_cache);
+    __half* v_cache_half = reinterpret_cast<__half*>(v_cache);
+
+    if (warp == 0) {
+        const __half* k_in = k_half + m * k_stride_m + kv_h * k_stride_h;
+        __half* k_dst = k_cache_half + kv_h * k_cache_stride_h + pos * k_cache_stride_s;
+        fused_rms_norm_rope_one_head(k_in, k_weight_half, cos_row, sin_row, k_dst, eps, lane);
+
+        const __half* v_in = v_half + m * v_stride_m + kv_h * v_stride_h;
+        __half* v_dst = v_cache_half + kv_h * v_cache_stride_h + pos * v_cache_stride_s;
+        #pragma unroll
+        for (int idx = lane; idx < kHeadDim; idx += kWarpSize) {
+            v_dst[idx] = v_in[idx];
+        }
+        return;
+    }
+
+    const int q_group = warp - 1;
+    if (q_group < kSupportedGroups) {
+        const int q_h = kv_h * kSupportedGroups + q_group;
+        const __half* q_in = q_half + m * q_stride_m + q_h * q_stride_h;
+        __half* q_dst = q_out_half + m * q_out_stride_m + q_h * q_out_stride_h;
+        fused_rms_norm_rope_one_head(q_in, q_weight_half, cos_row, sin_row, q_dst, eps, lane);
+    }
+}
+
 }  // namespace
 
 void fused_qk_rms_norm_rope_cuda(
@@ -183,6 +251,116 @@ void fused_qk_rms_norm_rope_cuda(
         k.stride(0),
         k.stride(1),
         cos.stride(0),
+        kv_heads,
+        static_cast<float>(eps));
+    C10_CUDA_CHECK(cudaGetLastError());
+}
+
+void fused_q_rope_kv_cache_update_cuda(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const torch::Tensor& q_weight,
+    const torch::Tensor& k_weight,
+    const torch::Tensor& cos,
+    const torch::Tensor& sin,
+    const torch::Tensor& q_out,
+    const torch::Tensor& k_cache,
+    const torch::Tensor& v_cache,
+    const torch::Tensor& cache_position,
+    double eps) {
+    TORCH_CHECK(q.is_cuda(), "q must be CUDA");
+    TORCH_CHECK(k.is_cuda(), "k must be CUDA");
+    TORCH_CHECK(v.is_cuda(), "v must be CUDA");
+    TORCH_CHECK(q_weight.is_cuda(), "q_weight must be CUDA");
+    TORCH_CHECK(k_weight.is_cuda(), "k_weight must be CUDA");
+    TORCH_CHECK(cos.is_cuda(), "cos must be CUDA");
+    TORCH_CHECK(sin.is_cuda(), "sin must be CUDA");
+    TORCH_CHECK(q_out.is_cuda(), "q_out must be CUDA");
+    TORCH_CHECK(k_cache.is_cuda(), "k_cache must be CUDA");
+    TORCH_CHECK(v_cache.is_cuda(), "v_cache must be CUDA");
+    TORCH_CHECK(cache_position.is_cuda(), "cache_position must be CUDA");
+    TORCH_CHECK(q.scalar_type() == torch::kFloat16, "q must be fp16");
+    TORCH_CHECK(k.scalar_type() == torch::kFloat16, "k must be fp16");
+    TORCH_CHECK(v.scalar_type() == torch::kFloat16, "v must be fp16");
+    TORCH_CHECK(q_weight.scalar_type() == torch::kFloat16, "q_weight must be fp16");
+    TORCH_CHECK(k_weight.scalar_type() == torch::kFloat16, "k_weight must be fp16");
+    TORCH_CHECK(cos.scalar_type() == torch::kFloat16, "cos must be fp16");
+    TORCH_CHECK(sin.scalar_type() == torch::kFloat16, "sin must be fp16");
+    TORCH_CHECK(q_out.scalar_type() == torch::kFloat16, "q_out must be fp16");
+    TORCH_CHECK(k_cache.scalar_type() == torch::kFloat16, "k_cache must be fp16");
+    TORCH_CHECK(v_cache.scalar_type() == torch::kFloat16, "v_cache must be fp16");
+    TORCH_CHECK(cache_position.scalar_type() == torch::kLong, "cache_position must be int64");
+    TORCH_CHECK(q.dim() == 3, "q must be [M, QH, D]");
+    TORCH_CHECK(k.dim() == 3, "k must be [M, KVH, D]");
+    TORCH_CHECK(v.dim() == 3, "v must be [M, KVH, D]");
+    TORCH_CHECK(cos.dim() == 2, "cos must be [M, D]");
+    TORCH_CHECK(sin.dim() == 2, "sin must be [M, D]");
+    TORCH_CHECK(k_cache.dim() == 4, "k_cache must be [B, KVH, T, D]");
+    TORCH_CHECK(v_cache.dim() == 4, "v_cache must be [B, KVH, T, D]");
+    TORCH_CHECK(cache_position.dim() == 1 && cache_position.numel() == 1, "cache_position must be [1]");
+    TORCH_CHECK(q.size(0) == 1, "q M must be 1");
+    TORCH_CHECK(k.size(0) == 1, "k M must be 1");
+    TORCH_CHECK(v.size(0) == 1, "v M must be 1");
+    TORCH_CHECK(q.size(0) == k.size(0) && k.size(0) == v.size(0), "q/k/v M mismatch");
+    TORCH_CHECK(k.sizes() == v.sizes(), "k/v shape mismatch");
+    TORCH_CHECK(q.size(2) == kHeadDim, "q head_dim must be 128");
+    TORCH_CHECK(k.size(2) == kHeadDim, "k head_dim must be 128");
+    TORCH_CHECK(v.size(2) == kHeadDim, "v head_dim must be 128");
+    TORCH_CHECK(cos.size(0) == q.size(0) && cos.size(1) == kHeadDim, "cos shape mismatch");
+    TORCH_CHECK(sin.size(0) == q.size(0) && sin.size(1) == kHeadDim, "sin shape mismatch");
+    TORCH_CHECK(q.size(1) == k.size(1) * kSupportedGroups, "q_heads must equal 2 * kv_heads");
+    TORCH_CHECK(q_weight.numel() == kHeadDim, "q_weight shape mismatch");
+    TORCH_CHECK(k_weight.numel() == kHeadDim, "k_weight shape mismatch");
+    TORCH_CHECK(k_cache.size(0) == 1 && v_cache.size(0) == 1, "cache batch must be 1");
+    TORCH_CHECK(k_cache.size(1) == k.size(1), "k_cache kv_heads mismatch");
+    TORCH_CHECK(v_cache.size(1) == v.size(1), "v_cache kv_heads mismatch");
+    TORCH_CHECK(k_cache.size(3) == kHeadDim, "k_cache head_dim mismatch");
+    TORCH_CHECK(v_cache.size(3) == kHeadDim, "v_cache head_dim mismatch");
+    TORCH_CHECK(q.is_contiguous(), "q must be contiguous");
+    TORCH_CHECK(k.is_contiguous(), "k must be contiguous");
+    TORCH_CHECK(v.is_contiguous(), "v must be contiguous");
+    TORCH_CHECK(cos.is_contiguous(), "cos must be contiguous");
+    TORCH_CHECK(sin.is_contiguous(), "sin must be contiguous");
+    TORCH_CHECK(q_weight.is_contiguous(), "q_weight must be contiguous");
+    TORCH_CHECK(k_weight.is_contiguous(), "k_weight must be contiguous");
+    TORCH_CHECK(q_out.is_contiguous(), "q_out must be contiguous");
+    TORCH_CHECK(k_cache.is_contiguous(), "k_cache must be contiguous");
+    TORCH_CHECK(v_cache.is_contiguous(), "v_cache must be contiguous");
+    TORCH_CHECK(cache_position.is_contiguous(), "cache_position must be contiguous");
+    TORCH_CHECK(q_out.sizes() == q.sizes(), "q_out shape mismatch");
+
+    c10::cuda::CUDAGuard device_guard(q.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    const int m = static_cast<int>(q.size(0));
+    const int kv_heads = static_cast<int>(k.size(1));
+    const dim3 grid(m * kv_heads);
+    fused_q_rope_kv_cache_update_fwd_kernel<<<grid, kThreadsPerBlock, 0, stream>>>(
+        reinterpret_cast<const at::Half*>(q.data_ptr<at::Half>()),
+        reinterpret_cast<const at::Half*>(k.data_ptr<at::Half>()),
+        reinterpret_cast<const at::Half*>(v.data_ptr<at::Half>()),
+        reinterpret_cast<const at::Half*>(q_weight.data_ptr<at::Half>()),
+        reinterpret_cast<const at::Half*>(k_weight.data_ptr<at::Half>()),
+        reinterpret_cast<const at::Half*>(cos.data_ptr<at::Half>()),
+        reinterpret_cast<const at::Half*>(sin.data_ptr<at::Half>()),
+        cache_position.data_ptr<int64_t>(),
+        reinterpret_cast<at::Half*>(q_out.data_ptr<at::Half>()),
+        reinterpret_cast<at::Half*>(k_cache.data_ptr<at::Half>()),
+        reinterpret_cast<at::Half*>(v_cache.data_ptr<at::Half>()),
+        q.stride(0),
+        q.stride(1),
+        k.stride(0),
+        k.stride(1),
+        v.stride(0),
+        v.stride(1),
+        cos.stride(0),
+        q_out.stride(0),
+        q_out.stride(1),
+        k_cache.stride(1),
+        k_cache.stride(2),
+        v_cache.stride(1),
+        v_cache.stride(2),
         kv_heads,
         static_cast<float>(eps));
     C10_CUDA_CHECK(cudaGetLastError());

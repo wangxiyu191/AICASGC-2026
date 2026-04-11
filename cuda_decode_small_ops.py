@@ -17,6 +17,11 @@ import torch
 _ROOT = Path(__file__).resolve().parent
 _SRC_DIR = _ROOT / "cuda_extensions"
 _MODULE_NAME = "cuda_decode_small_ops_ext"
+_BUILD_SOURCES = (
+    _SRC_DIR / "setup_decode_small_ops.py",
+    _SRC_DIR / "decode_small_ops_ext.cpp",
+    _SRC_DIR / "decode_small_ops_kernel.cu",
+)
 
 
 def _find_prebuilt_ext() -> Path | None:
@@ -27,11 +32,18 @@ def _find_prebuilt_ext() -> Path | None:
     return None
 
 
+def _needs_rebuild(prebuilt_ext: Path | None) -> bool:
+    if prebuilt_ext is None:
+        return True
+    ext_mtime = prebuilt_ext.stat().st_mtime
+    return any(src.exists() and src.stat().st_mtime > ext_mtime for src in _BUILD_SOURCES)
+
+
 @lru_cache(maxsize=1)
 def _load_ext():
     os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.0")
     prebuilt_ext = _find_prebuilt_ext()
-    if prebuilt_ext is None:
+    if _needs_rebuild(prebuilt_ext):
         env = dict(os.environ)
         env.setdefault("TORCH_CUDA_ARCH_LIST", "8.0")
         env["PATH"] = f"/usr/local/cuda/bin:{env.get('PATH', '')}"
@@ -119,6 +131,98 @@ def fused_qk_rms_norm_rope(
         eps,
     )
     return q_out.view_as(q_in), k_out.view_as(k_in)
+
+
+def fused_q_rope_kv_cache_update(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    eps: float,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cache_position: torch.Tensor,
+) -> torch.Tensor:
+    if (
+        q.device.type != "cuda"
+        or k.device.type != "cuda"
+        or v.device.type != "cuda"
+        or q_weight.device.type != "cuda"
+        or k_weight.device.type != "cuda"
+        or cos.device.type != "cuda"
+        or sin.device.type != "cuda"
+        or k_cache.device.type != "cuda"
+        or v_cache.device.type != "cuda"
+        or cache_position.device.type != "cuda"
+        or q.dtype != torch.float16
+        or k.dtype != torch.float16
+        or v.dtype != torch.float16
+        or q_weight.dtype != torch.float16
+        or k_weight.dtype != torch.float16
+        or cos.dtype != torch.float16
+        or sin.dtype != torch.float16
+        or k_cache.dtype != torch.float16
+        or v_cache.dtype != torch.float16
+        or cache_position.dtype != torch.long
+    ):
+        raise RuntimeError("fused_q_rope_kv_cache_update expects fp16 CUDA tensors and int64 cache_position")
+
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        raise RuntimeError("fused_q_rope_kv_cache_update expects q/k/v as [B, S, H, D]")
+    if q.shape[:2] != k.shape[:2] or k.shape != v.shape:
+        raise RuntimeError("q/k/v shapes must match decode layout")
+    if q.shape[0] != 1 or q.shape[1] != 1 or k.shape[0] != 1 or k.shape[1] != 1:
+        raise RuntimeError("fused_q_rope_kv_cache_update currently supports single-token decode only")
+    if q.shape[-1] != 128 or k.shape[-1] != 128 or v.shape[-1] != 128:
+        raise RuntimeError("fused_q_rope_kv_cache_update currently supports only head_dim=128")
+    if q.shape[2] != k.shape[2] * 2:
+        raise RuntimeError("fused_q_rope_kv_cache_update currently supports q_heads == 2 * kv_heads")
+    if q_weight.numel() != 128 or k_weight.numel() != 128:
+        raise RuntimeError("fused_q_rope_kv_cache_update expects q/k norm weights of shape [128]")
+    if cos.shape != q.shape[:2] + (128,) or sin.shape != q.shape[:2] + (128,):
+        raise RuntimeError("fused_q_rope_kv_cache_update expects cos/sin shaped [B, S, 128]")
+    if k_cache.ndim != 4 or v_cache.ndim != 4:
+        raise RuntimeError("fused_q_rope_kv_cache_update expects k_cache/v_cache as [B, KVH, T, D]")
+    if k_cache.shape[0] != 1 or v_cache.shape[0] != 1:
+        raise RuntimeError("fused_q_rope_kv_cache_update currently supports batch=1 cache")
+    if k_cache.shape[1] != k.shape[2] or v_cache.shape[1] != v.shape[2]:
+        raise RuntimeError("cache kv-head count mismatch")
+    if k_cache.shape[-1] != 128 or v_cache.shape[-1] != 128:
+        raise RuntimeError("cache head_dim mismatch")
+    if cache_position.ndim != 1 or cache_position.numel() != 1:
+        raise RuntimeError("cache_position must be shape [1]")
+
+    q_in = q.contiguous()
+    k_in = k.contiguous()
+    v_in = v.contiguous()
+    cos_in = cos.contiguous()
+    sin_in = sin.contiguous()
+    q_3d = q_in.reshape(1, q_in.shape[2], 128)
+    k_3d = k_in.reshape(1, k_in.shape[2], 128)
+    v_3d = v_in.reshape(1, v_in.shape[2], 128)
+    cos_2d = cos_in.reshape(1, 128)
+    sin_2d = sin_in.reshape(1, 128)
+    q_out = torch.empty_like(q_3d)
+
+    ext = _load_ext()
+    ext.fused_q_rope_kv_cache_update(
+        q_3d,
+        k_3d,
+        v_3d,
+        q_weight.contiguous(),
+        k_weight.contiguous(),
+        cos_2d,
+        sin_2d,
+        q_out,
+        k_cache,
+        v_cache,
+        cache_position.contiguous(),
+        eps,
+    )
+    return q_out.view_as(q_in)
 
 
 def fused_silu_mul(

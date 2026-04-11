@@ -129,47 +129,73 @@ class OptimizedDecoderLayer(nn.Module):
 
         # 3. QK-Norm + RoPE (before transpose — natural layout for cos/sin broadcast)
         cos, sin = position_embeddings
-        with _nvtx_range("decode.qk_norm_rope", enable_decode_nvtx):
-            q_view = q.view(hidden_shape_q)
-            k_view = k.view(hidden_shape_kv)
-            fused_qk = _fused_qk_rms_norm_rope(
-                q_view,
-                k_view,
-                self.q_norm_weight,
-                self.k_norm_weight,
-                self.rms_norm_eps,
-                cos,
-                sin,
-                prefer_small_triton=prefer_small_decode_triton,
-            )
-            if fused_qk is None:
-                q_view = _fused_rms_norm_rope(
-                    q_view,
+        fused_q_kv_cache = None
+        if (
+            (_ENABLE_CUDA_FUSED_Q_ROPE_KV_CACHE or _ENABLE_TRITON_SMALL_DECODE_Q_ROPE_KV_CACHE)
+            and past_key_values is not None
+            and not prefill_static_cache_no_mask
+        ):
+            with _nvtx_range("decode.q_rope_kv_cache", enable_decode_nvtx):
+                fused_q_kv_cache = _fused_q_rope_kv_cache_update(
+                    q.view(hidden_shape_q),
+                    k.view(hidden_shape_kv),
+                    v.view(hidden_shape_kv),
                     self.q_norm_weight,
+                    self.k_norm_weight,
                     self.rms_norm_eps,
                     cos,
                     sin,
+                    past_key_values,
+                    self.layer_idx,
+                    cache_position,
                     prefer_small_triton=prefer_small_decode_triton,
                 )
-                k_view = _fused_rms_norm_rope(
+        with _nvtx_range("decode.qk_norm_rope", enable_decode_nvtx):
+            if fused_q_kv_cache is not None:
+                q_view, attn_key_states, attn_value_states = fused_q_kv_cache
+            else:
+                q_view = q.view(hidden_shape_q)
+                k_view = k.view(hidden_shape_kv)
+                fused_qk = _fused_qk_rms_norm_rope(
+                    q_view,
                     k_view,
+                    self.q_norm_weight,
                     self.k_norm_weight,
                     self.rms_norm_eps,
                     cos,
                     sin,
                     prefer_small_triton=prefer_small_decode_triton,
                 )
-            else:
-                q_view, k_view = fused_qk
+                if fused_qk is None:
+                    q_view = _fused_rms_norm_rope(
+                        q_view,
+                        self.q_norm_weight,
+                        self.rms_norm_eps,
+                        cos,
+                        sin,
+                        prefer_small_triton=prefer_small_decode_triton,
+                    )
+                    k_view = _fused_rms_norm_rope(
+                        k_view,
+                        self.k_norm_weight,
+                        self.rms_norm_eps,
+                        cos,
+                        sin,
+                        prefer_small_triton=prefer_small_decode_triton,
+                    )
+                else:
+                    q_view, k_view = fused_qk
             q = q_view.transpose(1, 2)
-            k = k_view.transpose(1, 2)
-            v = v.view(hidden_shape_kv).transpose(1, 2)
+            if fused_q_kv_cache is None:
+                k = k_view.transpose(1, 2)
+                v = v.view(hidden_shape_kv).transpose(1, 2)
 
         # 4. KV Cache
-        attn_key_states = k
-        attn_value_states = v
+        if fused_q_kv_cache is None:
+            attn_key_states = k
+            attn_value_states = v
         cache_kwargs = None
-        if past_key_values is not None:
+        if past_key_values is not None and fused_q_kv_cache is None:
             cache_kwargs = {
                 "sin": sin.unsqueeze(1), "cos": cos.unsqueeze(1),
                 "cache_position": cache_position,
@@ -413,6 +439,8 @@ _TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_BLOCK_N = int(os.environ.get("TRITON_SMA
 _TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_NUM_WARPS = int(os.environ.get("TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_NUM_WARPS", "0"))
 _TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_NUM_STAGES = int(os.environ.get("TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_NUM_STAGES", "0"))
 _ENABLE_TRITON_SMALL_DECODE_STATIC_KV = os.environ.get("ENABLE_TRITON_SMALL_DECODE_STATIC_KV", "1") == "1"
+_ENABLE_CUDA_FUSED_Q_ROPE_KV_CACHE = os.environ.get("ENABLE_CUDA_FUSED_Q_ROPE_KV_CACHE", "1") == "1"
+_ENABLE_TRITON_SMALL_DECODE_Q_ROPE_KV_CACHE = os.environ.get("ENABLE_TRITON_SMALL_DECODE_Q_ROPE_KV_CACHE", "0") == "1"
 _ENABLE_TRITON_SMALL_DECODE_GEMV = os.environ.get("ENABLE_TRITON_SMALL_DECODE_GEMV", "1") == "1"
 _ENABLE_CUDA_NOSPLIT_GEMV = os.environ.get("ENABLE_CUDA_NOSPLIT_GEMV", "0") == "1"
 _ENABLE_PARTITION_GEMV = os.environ.get("ENABLE_PARTITION_GEMV", "0") == "1"
@@ -668,6 +696,159 @@ def _fused_qk_rms_norm_rope(
         BLOCK_HALF=triton.next_power_of_2(half_d),
     )
     return q_out.view_as(q), k_out.view_as(k)
+
+
+def _fused_q_rope_kv_cache_update(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    eps: float,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    past_key_values,
+    layer_idx: int,
+    cache_position: torch.Tensor | None,
+    prefer_small_triton: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """Decode-only fusion: q norm+rope, k norm+rope->cache, v->cache."""
+    allow_cuda = prefer_small_triton and _ENABLE_CUDA_FUSED_Q_ROPE_KV_CACHE
+    allow_triton = prefer_small_triton and _ENABLE_TRITON_SMALL_DECODE_Q_ROPE_KV_CACHE
+    if (
+        not prefer_small_triton
+        or not _ENABLE_TRITON_SMALL_DECODE_STATIC_KV
+        or (not allow_cuda and not allow_triton)
+        or q.device.type != "cuda"
+        or k.device.type != "cuda"
+        or v.device.type != "cuda"
+        or q_weight.device.type != "cuda"
+        or k_weight.device.type != "cuda"
+        or cos.device.type != "cuda"
+        or sin.device.type != "cuda"
+        or not isinstance(past_key_values, StaticCache)
+        or cache_position is None
+        or cache_position.device.type != "cuda"
+        or cache_position.ndim != 1
+        or cache_position.numel() != 1
+        or q.ndim != 4
+        or k.ndim != 4
+        or v.ndim != 4
+        or q.shape[0] != 1
+        or k.shape[0] != 1
+        or v.shape[0] != 1
+        or q.shape[1] != 1
+        or k.shape[1] != 1
+        or v.shape[1] != 1
+        or q.shape[:2] != k.shape[:2]
+        or k.shape != v.shape
+        or q.shape[-1] != 128
+        or k.shape[-1] != 128
+        or v.shape[-1] != 128
+        or q.stride(-1) != 1
+        or k.stride(-1) != 1
+        or v.stride(-1) != 1
+        or q_weight.stride(-1) != 1
+        or k_weight.stride(-1) != 1
+        or cos.stride(-1) != 1
+        or sin.stride(-1) != 1
+    ):
+        return None
+
+    layer = past_key_values.layers[layer_idx]
+    if not isinstance(layer, StaticLayer):
+        return None
+    if not layer.is_initialized:
+        layer.lazy_initialization(k.transpose(1, 2), v.transpose(1, 2))
+    if (
+        layer.keys is None
+        or layer.values is None
+        or layer.keys.device.type != "cuda"
+        or layer.values.device.type != "cuda"
+    ):
+        return None
+
+    batch, seq_len, q_heads, d = q.shape
+    kv_heads = k.shape[2]
+    if batch != 1 or seq_len != 1 or kv_heads <= 0 or q_heads % kv_heads != 0:
+        return None
+    groups = q_heads // kv_heads
+    if groups <= 0 or groups > 4:
+        return None
+
+    if (
+        allow_cuda
+        and d == 128
+        and groups == 2
+        and layer.keys.stride(-1) == 1
+        and layer.values.stride(-1) == 1
+    ):
+        import cuda_decode_small_ops
+
+        q_out = cuda_decode_small_ops.fused_q_rope_kv_cache_update(
+            q,
+            k,
+            v,
+            q_weight,
+            k_weight,
+            eps,
+            cos,
+            sin,
+            layer.keys,
+            layer.values,
+            cache_position,
+        )
+        return q_out, layer.keys, layer.values
+
+    if (
+        not allow_triton
+        or layer.keys.stride(-1) != 1
+        or layer.values.stride(-1) != 1
+    ):
+        return None
+
+    q_3d = q.reshape(batch * seq_len, q_heads, d)
+    k_3d = k.reshape(batch * seq_len, kv_heads, d)
+    v_3d = v.reshape(batch * seq_len, kv_heads, d)
+    cos_2d = cos.reshape(batch * seq_len, d)
+    sin_2d = sin.reshape(batch * seq_len, d)
+    q_out = torch.empty_like(q_3d)
+
+    half_d = d // 2
+    _fused_q_rope_kv_cache_update_fwd_kernel[(kv_heads,)](
+        q_3d,
+        k_3d,
+        v_3d,
+        q_out,
+        layer.keys,
+        layer.values,
+        q_weight,
+        k_weight,
+        cos_2d,
+        sin_2d,
+        cache_position,
+        q_3d.stride(0),
+        q_3d.stride(1),
+        k_3d.stride(0),
+        k_3d.stride(1),
+        v_3d.stride(0),
+        v_3d.stride(1),
+        q_out.stride(0),
+        layer.keys.stride(0),
+        layer.keys.stride(1),
+        layer.keys.stride(2),
+        layer.values.stride(0),
+        layer.values.stride(1),
+        layer.values.stride(2),
+        cos_2d.stride(0),
+        eps,
+        GROUPS=groups,
+        D=d,
+        HALF_D=half_d,
+        BLOCK_D=triton.next_power_of_2(d),
+        BLOCK_HALF=triton.next_power_of_2(half_d),
+    )
+    return q_out.view_as(q), layer.keys, layer.values
 
 
 def _fused_add_rms_norm(
@@ -1269,12 +1450,17 @@ def _static_cache_single_token_update(
     layer = past_key_values.layers[layer_idx]
     if not isinstance(layer, StaticLayer):
         return None
-    cumulative_length = getattr(layer, "cumulative_length", None)
-    if not isinstance(cumulative_length, torch.Tensor) or cumulative_length.device.type != "cuda":
-        return None
 
     if not layer.is_initialized:
         layer.lazy_initialization(key_states, value_states)
+
+    if (
+        layer.keys is None
+        or layer.values is None
+        or layer.keys.device.type != "cuda"
+        or layer.values.device.type != "cuda"
+    ):
+        return None
 
     head_dim = key_states.shape[-1]
     block_d = triton.next_power_of_2(head_dim)
@@ -1287,7 +1473,6 @@ def _static_cache_single_token_update(
         layer.keys,
         layer.values,
         cache_position,
-        cumulative_length,
         key_states.stride(1),
         key_states.stride(2),
         key_states.stride(3),
@@ -1504,7 +1689,6 @@ def _static_cache_single_token_update_fwd_kernel(
     keys_cache_ptr,
     values_cache_ptr,
     cache_position_ptr,
-    cumulative_length_ptr,
     key_stride_h,
     key_stride_s,
     key_stride_d,
@@ -1532,9 +1716,6 @@ def _static_cache_single_token_update_fwd_kernel(
 
     tl.store(keys_cache_ptrs, tl.load(key_ptrs, mask=mask_d), mask=mask_d)
     tl.store(values_cache_ptrs, tl.load(value_ptrs, mask=mask_d), mask=mask_d)
-
-    if kv_head == 0:
-        tl.store(cumulative_length_ptr, pos + 1)
 
 
 def _small_decode_attention_grouped(
@@ -2019,6 +2200,91 @@ def _fused_qk_rms_norm_rope_fwd_kernel(
     tl.store(kout_base + rk, (kn0 * cos - kn1 * sin).to(K_OUT.dtype.element_ty), mask=mask_half)
     tl.store(kout_base + HALF_D + rk, (kn1 * cos + kn0 * sin).to(K_OUT.dtype.element_ty), mask=mask_half)
 
+    for group_idx in range(GROUPS):
+        q_h = q_head_base + group_idx
+        q_base = Q + m * stride_q_m + q_h * stride_q_h
+        q = tl.load(q_base + cols, mask=mask, other=0.0).to(tl.float32)
+        q_var = tl.sum(q * q, axis=0) / D
+        q_rstd = tl.rsqrt(q_var + eps)
+        q0 = tl.load(q_base + rk, mask=mask_half, other=0.0).to(tl.float32)
+        q1 = tl.load(q_base + HALF_D + rk, mask=mask_half, other=0.0).to(tl.float32)
+        qw0 = tl.load(Q_W + rk, mask=mask_half, other=0.0).to(tl.float32)
+        qw1 = tl.load(Q_W + HALF_D + rk, mask=mask_half, other=0.0).to(tl.float32)
+        qn0 = (q0 * q_rstd * qw0).to(Q_OUT.dtype.element_ty).to(tl.float32)
+        qn1 = (q1 * q_rstd * qw1).to(Q_OUT.dtype.element_ty).to(tl.float32)
+        qout_base = Q_OUT + m * stride_qout_m + q_h * stride_q_h
+        tl.store(qout_base + rk, (qn0 * cos - qn1 * sin).to(Q_OUT.dtype.element_ty), mask=mask_half)
+        tl.store(qout_base + HALF_D + rk, (qn1 * cos + qn0 * sin).to(Q_OUT.dtype.element_ty), mask=mask_half)
+
+
+@triton.jit
+def _fused_q_rope_kv_cache_update_fwd_kernel(
+    Q,
+    K,
+    V,
+    Q_OUT,
+    K_CACHE,
+    V_CACHE,
+    Q_W,
+    K_W,
+    COS,
+    SIN,
+    CACHE_POS,
+    stride_q_m,
+    stride_q_h,
+    stride_k_m,
+    stride_k_h,
+    stride_v_m,
+    stride_v_h,
+    stride_qout_m,
+    stride_kcache_b,
+    stride_kcache_h,
+    stride_kcache_s,
+    stride_vcache_b,
+    stride_vcache_h,
+    stride_vcache_s,
+    stride_cos_m,
+    eps,
+    GROUPS: tl.constexpr,
+    D: tl.constexpr,
+    HALF_D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_HALF: tl.constexpr,
+):
+    """Decode single-token fusion: q norm+rope, k norm+rope->cache, v->cache."""
+    kv_h = tl.program_id(0)
+    m = 0
+    pos = tl.load(CACHE_POS).to(tl.int64)
+
+    cols = tl.arange(0, BLOCK_D)
+    mask = cols < D
+    rk = tl.arange(0, BLOCK_HALF)
+    mask_half = rk < HALF_D
+
+    cs_base = m * stride_cos_m
+    cos = tl.load(COS + cs_base + rk, mask=mask_half, other=0.0).to(tl.float32)
+    sin = tl.load(SIN + cs_base + rk, mask=mask_half, other=0.0).to(tl.float32)
+
+    k_base = K + m * stride_k_m + kv_h * stride_k_h
+    k = tl.load(k_base + cols, mask=mask, other=0.0).to(tl.float32)
+    k_var = tl.sum(k * k, axis=0) / D
+    k_rstd = tl.rsqrt(k_var + eps)
+    k0 = tl.load(k_base + rk, mask=mask_half, other=0.0).to(tl.float32)
+    k1 = tl.load(k_base + HALF_D + rk, mask=mask_half, other=0.0).to(tl.float32)
+    kw0 = tl.load(K_W + rk, mask=mask_half, other=0.0).to(tl.float32)
+    kw1 = tl.load(K_W + HALF_D + rk, mask=mask_half, other=0.0).to(tl.float32)
+    kn0 = (k0 * k_rstd * kw0).to(K_CACHE.dtype.element_ty).to(tl.float32)
+    kn1 = (k1 * k_rstd * kw1).to(K_CACHE.dtype.element_ty).to(tl.float32)
+
+    kcache_base = K_CACHE + kv_h * stride_kcache_h + pos * stride_kcache_s
+    tl.store(kcache_base + rk, (kn0 * cos - kn1 * sin).to(K_CACHE.dtype.element_ty), mask=mask_half)
+    tl.store(kcache_base + HALF_D + rk, (kn1 * cos + kn0 * sin).to(K_CACHE.dtype.element_ty), mask=mask_half)
+
+    v_base = V + m * stride_v_m + kv_h * stride_v_h
+    vcache_base = V_CACHE + kv_h * stride_vcache_h + pos * stride_vcache_s
+    tl.store(vcache_base + cols, tl.load(v_base + cols, mask=mask), mask=mask)
+
+    q_head_base = kv_h * GROUPS
     for group_idx in range(GROUPS):
         q_h = q_head_base + group_idx
         q_base = Q + m * stride_q_m + q_h * stride_q_h
