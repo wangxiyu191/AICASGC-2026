@@ -8,6 +8,7 @@ device-link the gridsync TU separately and pass the resulting objects via
 extra_objects.
 """
 
+import glob
 import os
 import subprocess
 import sys
@@ -101,6 +102,31 @@ def _precompile_gridsync():
 
 
 _precompile_gridsync()
+
+
+def _invalidate_build_cache_if_needed():
+    """Remove cached .so from build/ when gridsync objects are newer, forcing relink.
+
+    setuptools tracks source->object mtime for files listed in ``sources``,
+    but ``extra_objects`` (the pre-compiled gridsync .o / _dlink.o) are not
+    monitored.  If only gridsync.cu changed, the old .so in build/lib.*/ is
+    considered up-to-date and simply *copied* to the inplace directory without
+    relinking.  Deleting the stale cached .so solves this.
+    """
+    objs = [f for f in (_GRIDSYNC_OBJ, _GRIDSYNC_DLINK) if os.path.exists(f)]
+    if not objs:
+        return
+    gridsync_mtime = max(os.path.getmtime(f) for f in objs)
+
+    pattern = os.path.join(_SCRIPT_DIR, "build", "lib.*",
+                           "cuda_decode_gemv_ext*.so")
+    for cached_so in glob.glob(pattern):
+        if os.path.getmtime(cached_so) < gridsync_mtime:
+            print(f"[gridsync] removing stale build cache: {cached_so}")
+            os.remove(cached_so)
+
+
+_invalidate_build_cache_if_needed()
 
 # ---------------------------------------------------------------------------
 # Main extension (no -rdc=true for decode_gemv_kernel.cu)
