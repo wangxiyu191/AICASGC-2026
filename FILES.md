@@ -7,7 +7,7 @@ AICAS 2026 竞赛项目 — Qwen3-VL-2B-Instruct 推理优化。
 | 文件 | 说明 |
 |------|------|
 | [evaluation_wrapper.py](./evaluation_wrapper.py) | **参赛者核心修改文件**，包含 VLMModel 类和所有优化入口 |
-| [optimized_layer.py](./optimized_layer.py) | 优化的 decoder layer（Fused QKV/gate_up、Triton 小 shape 融合、decode attention、GEMV 等） |
+| [optimized_layer.py](./optimized_layer.py) | 优化的 decoder layer（Fused QKV/gate_up、Triton 小 shape 融合、decode attention、GEMV）及 prefill Triton kernel（fused QK-norm+RoPE、packed SiLU*mul、fused vision RoPE） |
 | [benchmark.py](./benchmark.py) | 官方基准测试工具（不可修改），测量 TTFT/吞吐量/准确率 |
 
 ## CUDA Extensions
@@ -39,6 +39,7 @@ AICAS 2026 竞赛项目 — Qwen3-VL-2B-Instruct 推理优化。
 | [bench_decode_layer_chain.py](./bench_decode_layer_chain.py) | 单层 decode chain CUDAGraph microbenchmark（含 viztrace 集成） |
 | [bench_prefill.py](./bench_prefill.py) | 真实路径 prefill forward benchmark（host/GPU 双计时，支持 bucketed cache 与 viztrace） |
 | [bench_rmsnorm.py](./bench_rmsnorm.py) | RMSNorm microbenchmark |
+| [run_nsys_prefill.py](./run_nsys_prefill.py) | nsys prefill profiler（CUPTI+NVTX，低开销替代 VizTracer） |
 | [run_viztrace.py](./run_viztrace.py) | VizTracer profiling 脚本，分别采集 TTFT 和 throughput trace |
 | [analyze_traces.py](./analyze_traces.py) | Trace 分析脚本，解析 viztracer JSON 输出并生成瓶颈报告（含 decode step 抽样时间线） |
 | [profile_attention_ncu.py](./profile_attention_ncu.py) | NCU attention profiling 辅助脚本 |
@@ -60,9 +61,9 @@ AICAS 2026 竞赛项目 — Qwen3-VL-2B-Instruct 推理优化。
 
 | 文件/目录 | 说明 |
 |-----------|------|
-| [result.csv](./result.csv) | **里程碑记录**：基线、官方评测、合入主线的优化、当前默认配置 benchmark（33 条） |
-| [result_experiments.csv](./result_experiments.csv) | **实验记录**：未合入或已回退的探索、消融、A/B 对照、验证（40 条） |
-| [result_tooling.csv](./result_tooling.csv) | **工具/分析记录**：NCU profiling、trace 工具链、microbench、研究调研（28 条） |
+| [result.csv](./result.csv) | **里程碑记录**：基线、官方评测、合入主线的优化、当前默认配置 benchmark |
+| [result_experiments.csv](./result_experiments.csv) | **实验记录**：未合入或已回退的探索、消融、A/B 对照、验证 |
+| [result_tooling.csv](./result_tooling.csv) | **工具/分析记录**：NCU profiling、trace 工具链、microbench、研究调研 |
 | [results/](./results/) | benchmark JSON 测试结果存放目录 |
 | [traces/](./traces/) | viztrace/trace 文件存放目录 |
 
@@ -76,8 +77,8 @@ AICAS 2026 竞赛项目 — Qwen3-VL-2B-Instruct 推理优化。
 
 | 文件 | 说明 |
 |------|------|
-| [docs/README.md](./docs/README.md) | 优化文档索引（计划、日志、踩坑记录、Trace 分析、引擎对比） |
-| [docs/sequential_stride_mapping_findings_20260404.md](./docs/sequential_stride_mapping_findings_20260404.md) | A800 上 `SM x Address` 顺序 stride 规律总结，归纳 `1MiB` 局部 checkerboard、`128MiB` chunk 结构与当前判断 |
+| [docs/README.md](./docs/README.md) | 优化文档索引（活跃文档与归档文档） |
+| [CLAUDE.md](./CLAUDE.md) | Claude Code AI 助手项目指引 |
 | [FILES.md](./FILES.md) | 本文件 — 项目文件索引 |
 | [AGENTS.md](./AGENTS.md) | AI 助手工作指引与约定 |
 | [README_CN.md](./README_CN.md) | 竞赛介绍与评测说明 |

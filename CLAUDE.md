@@ -108,7 +108,7 @@ benchmark.py (official, immutable)
 ```
 
 ### Two execution phases
-1. **Prefill (eager)** — runs through `_optimize_prefill_path` monkey-patches that cache vision grid metadata (`fast_pos_embed_interpolate`, `rot_pos_emb`, cu_seqlens, per-frame split_sizes), rewrite `patch_embed` as `F.linear`, skip HF's generic multimodal merge / causal-mask builder, and cache RoPE position deltas. Prefill attention runs SDPA on the valid-prompt slice then writes back into StaticCache.
+1. **Prefill (eager)** — runs through `_optimize_prefill_path` monkey-patches that cache vision grid metadata (`fast_pos_embed_interpolate`, `rot_pos_emb`, cu_seqlens, per-frame split_sizes), rewrite `patch_embed` as `F.linear`, skip HF's generic multimodal merge / causal-mask builder, and cache RoPE position deltas. Vision encoder uses a fused Triton RoPE kernel (`fused_vision_rope`) replacing 14 PyTorch ops per ViT block. Text decoder prefill uses `_language_model_forward_prefill_fastpath` with Triton fused QK-norm+RoPE (non-contiguous-input aware, separate output strides to skip DirectCopy), fused add+RMSNorm, and packed SiLU*mul. Prefill attention runs SDPA on the valid-prompt slice then writes back into StaticCache.
 
 2. **Decode (CUDAGraph replay)** — `DecodeCudaGraphRunner` pre-captures **32 graph buckets** (`cache_len` 64..2048 in 64-step increments, tunable via `CUDAGRAPH_PREBUILD_MAX_CACHE_LEN` / `CUDAGRAPH_BUCKET_SIZE`) during `VLMModel.__init__`. Each request picks the smallest bucket ≥ its cache length, resets the static cache/mask, then runs `graph.replay() → argmax → next_token_buf` in a tight loop. EOS detection runs asynchronously via pinned host copies + CUDA events so the decode loop never stalls on `cudaEventSynchronize`.
 
@@ -119,7 +119,7 @@ input_rmsnorm → qkv (1 fused GEMM/GEMV) → fused q_norm+k_norm+RoPE
  → single-token KV cache update (1 Triton kernel) → decode attention
  → o_proj → post_attn add+rmsnorm → fused gate_up → silu_mul → down_proj → residual_add
 ```
-Key fusions and when they fire are listed in `docs/code_reading_guide.md §4`. The single biggest wins layered in over time (see `result.csv`): fused QKV/gate_up, Triton small-shape RMSNorm/QK-norm+RoPE/decode-attention, split-KV attention with persistent workspace + online merge, Triton single-token StaticCache writer, CUDA nosplit GEMV (replacing cuBLAS M=1 WMMA GEMM), and — most recently — persistent cooperative CUDA kernels that fuse `post_attn add+rmsnorm → gate_up → silu_mul → down_proj → residual_add` into a single launch, with an experimental variant that also absorbs `o_proj` upstream.
+Key fusions and when they fire are listed in `docs/code_reading_guide.md §4`. The single biggest wins layered in over time (see `result.csv`): fused QKV/gate_up, Triton small-shape RMSNorm/QK-norm+RoPE/decode-attention, split-KV attention with persistent workspace + online merge, Triton single-token StaticCache writer, CUDA nosplit GEMV (replacing cuBLAS M=1 WMMA GEMM), and persistent cooperative CUDA kernels that fuse `post_attn add+rmsnorm → gate_up → silu_mul → down_proj → residual_add` into a single launch, with an experimental variant that also absorbs `o_proj` upstream. The prefill path also has Triton kernels: fused QK-norm+RoPE with separate output strides (eliminates DirectCopy), packed SiLU*mul (eliminates chunk copies), fused add+RMSNorm, and fused vision RoPE (replaces 14 PyTorch ops per ViT block).
 
 ### Decode attention dispatch (`_small_decode_attention`)
 Tried in order; each can be individually toggled via env var:
@@ -171,9 +171,9 @@ The decode-path flags are enabled by default via `os.environ.setdefault` at the 
 
 - [`docs/README.md`](docs/README.md) — index of active and stale design / analysis docs
 - [`docs/code_reading_guide.md`](docs/code_reading_guide.md) — full evaluation_wrapper + optimized_layer walkthrough with line numbers
-- [`docs/decode_bottleneck_analysis.md`](docs/decode_bottleneck_analysis.md) — current decode GPU-kernel breakdown
 - [`docs/decode_fusion_plan.md`](docs/decode_fusion_plan.md) — in-flight fusion priorities
 - [`docs/decode_attention_optimization.md`](docs/decode_attention_optimization.md) — attention / split-KV route, NCU findings, failed experiments
 - [`docs/decode_gemv_analysis.md`](docs/decode_gemv_analysis.md) — GEMV analysis and CUDA/fusion verdicts
+- [`docs/nsys_profiling_guide.md`](docs/nsys_profiling_guide.md) — nsys trace capture & SQLite analysis workflow
 - [`FILES.md`](FILES.md) — complete index of every benchmark/profile/tooling script
 - [`AGENTS.md`](AGENTS.md) — project-wide working conventions (source of truth over anything here that drifts)

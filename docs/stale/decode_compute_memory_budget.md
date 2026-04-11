@@ -172,7 +172,7 @@ ideal_time = max(FLOPs / 312 TFLOP/s, bytes / 2039 GB/s)
 - 线性层按权重读取主导估算
 - attention 按 `L=768`、只取 K/V 读取这个主项估算
 - 小算子（RMSNorm / RoPE / SiLU）按 activation bytes 粗估，它们的“倍率”很容易很夸张，但绝对值通常很小
-- 实测列来自最新 trace [traces/compare/triton_decode_attention_dot](../traces/compare/triton_decode_attention_dot) 的 steady-state decode 分解
+- 实测列来自最新 trace [traces/compare/triton_decode_attention_dot](../../traces/compare/triton_decode_attention_dot) 的 steady-state decode 分解
 
 | 算子 | 理想带宽时间 | 理想算力时间 | A800 理想下限 | 最新实测 | 实测/理想 |
 |------|--------------|--------------|---------------|----------|-----------|
@@ -352,7 +352,7 @@ HBM 读 -> 小计算 -> HBM 写 -> 再读 -> 再算 -> 再写
 
 最新 trace：
 
-- [`traces/compare/triton_decode_step39_static_kv_write`](../traces/compare/triton_decode_step39_static_kv_write)
+- [`traces/compare/triton_decode_step39_static_kv_write`](../../traces/compare/triton_decode_step39_static_kv_write)
 
 相对上一版 step38，steady-state decode GPU/步已经从 `4.33ms` 进一步降到 `4.05ms`。
 

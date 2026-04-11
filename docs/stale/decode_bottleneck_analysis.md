@@ -72,34 +72,34 @@ CUDAGraph capture (如 bucket 未预建)
 
 - `Reduction`
   - 主要是剩余 **3 个 RMSNorm**：
-    - input RMSNorm: [`optimized_layer.py:102`](../optimized_layer.py#L102)
-    - q RMSNorm: [`optimized_layer.py:110`](../optimized_layer.py#L110)
-    - k RMSNorm: [`optimized_layer.py:111`](../optimized_layer.py#L111)
-  - post-attn RMSNorm 原本也会贡献一组 reduction，但现在已经由 [`_fused_add_rms_norm()`](../optimized_layer.py#L179) 合掉了，所以 trace 里 `Reduction` 已明显下降。
+    - input RMSNorm: [`optimized_layer.py:102`](../../optimized_layer.py#L102)
+    - q RMSNorm: [`optimized_layer.py:110`](../../optimized_layer.py#L110)
+    - k RMSNorm: [`optimized_layer.py:111`](../../optimized_layer.py#L111)
+  - post-attn RMSNorm 原本也会贡献一组 reduction，但现在已经由 [`_fused_add_rms_norm()`](../../optimized_layer.py#L179) 合掉了，所以 trace 里 `Reduction` 已明显下降。
 
 - `Mul`
   - 第一大头是 **decode RoPE** 的逐元素乘加：
-    - [`optimized_layer.py:327`](../optimized_layer.py#L327) 到 [`optimized_layer.py:338`](../optimized_layer.py#L338)
+    - [`optimized_layer.py:327`](../../optimized_layer.py#L327) 到 [`optimized_layer.py:338`](../../optimized_layer.py#L338)
     - 这里会展开成 `x1*cos - x2*sin` 和 `x2*cos + x1*sin`
   - 第二部分是 RMSNorm 的 scale：
     - decode 小 shape 下 `_rms_norm()` 走 `F.rms_norm`，内部会有逐元素乘
-    - 位置在 [`optimized_layer.py:161`](../optimized_layer.py#L161) 到 [`optimized_layer.py:176`](../optimized_layer.py#L176)
+    - 位置在 [`optimized_layer.py:161`](../../optimized_layer.py#L161) 到 [`optimized_layer.py:176`](../../optimized_layer.py#L176)
   - 第三部分是 MLP 里的 `SiLU(gate) * up`：
-    - [`optimized_layer.py:142`](../optimized_layer.py#L142) 到 [`optimized_layer.py:148`](../optimized_layer.py#L148)
+    - [`optimized_layer.py:142`](../../optimized_layer.py#L142) 到 [`optimized_layer.py:148`](../../optimized_layer.py#L148)
     - 但从单独 trace 看，这一块已经不是主要瓶颈，收益明显小于 add+rmsnorm
 
 - `Copy`
   - 第一大头是 **KV cache 写入**：
-    - layer 内调用点在 [`optimized_layer.py:117`](../optimized_layer.py#L117) 到 [`optimized_layer.py:122`](../optimized_layer.py#L122)
+    - layer 内调用点在 [`optimized_layer.py:117`](../../optimized_layer.py#L117) 到 [`optimized_layer.py:122`](../../optimized_layer.py#L122)
     - 实际实现是 `StaticLayer.update()` 里的 `index_copy_`：
-      - [`venv/lib/python3.12/site-packages/transformers/cache_utils.py:333`](../venv/lib/python3.12/site-packages/transformers/cache_utils.py#L333)
-      - [`venv/lib/python3.12/site-packages/transformers/cache_utils.py:334`](../venv/lib/python3.12/site-packages/transformers/cache_utils.py#L334)
+      - [`venv/lib/python3.12/site-packages/transformers/cache_utils.py:333`](../../venv/lib/python3.12/site-packages/transformers/cache_utils.py#L333)
+      - [`venv/lib/python3.12/site-packages/transformers/cache_utils.py:334`](../../venv/lib/python3.12/site-packages/transformers/cache_utils.py#L334)
   - 第二部分是 attention 输出整理：
-    - [`optimized_layer.py:129`](../optimized_layer.py#L129) 的 `.reshape(...).contiguous()`
+    - [`optimized_layer.py:129`](../../optimized_layer.py#L129) 的 `.reshape(...).contiguous()`
   - 第三部分是 decode 小张量在 view/split/cat/materialize 边界上的中间结果落地：
-    - `qkv.split(...)` 见 [`optimized_layer.py:106`](../optimized_layer.py#L106)
-    - RoPE 的 `torch.cat(...)` 见 [`optimized_layer.py:337`](../optimized_layer.py#L337)
-    - 最后一层残差 `residual + hidden_states` 见 [`optimized_layer.py:152`](../optimized_layer.py#L152)
+    - `qkv.split(...)` 见 [`optimized_layer.py:106`](../../optimized_layer.py#L106)
+    - RoPE 的 `torch.cat(...)` 见 [`optimized_layer.py:337`](../../optimized_layer.py#L337)
+    - 最后一层残差 `residual + hidden_states` 见 [`optimized_layer.py:152`](../../optimized_layer.py#L152)
 
 ### 3.2 对应该怎么优化
 
@@ -150,8 +150,8 @@ CUDAGraph capture (如 bucket 未预建)
 
 对应 trace：
 
-- baseline: [traces/compare/triton_decode_attention_baseline](../traces/compare/triton_decode_attention_baseline)
-- experiment: [traces/compare/triton_decode_attention](../traces/compare/triton_decode_attention)
+- baseline: [traces/compare/triton_decode_attention_baseline](../../traces/compare/triton_decode_attention_baseline)
+- experiment: [traces/compare/triton_decode_attention](../../traces/compare/triton_decode_attention)
 
 结论：
 
@@ -195,13 +195,13 @@ Qwen3-VL-2B 的文本 attention 是 `16 q heads / 8 kv heads`，也就是每个 
 
 对应结果文件：
 
-- microbench: [results/attention_microbench_grouped_smoke.json](../results/attention_microbench_grouped_smoke.json)
-- benchmark: [results/result_step33_decode_attn_grouped_gqa_10.json](../results/result_step33_decode_attn_grouped_gqa_10.json)
-- benchmark rerun: [results/result_step33_decode_attn_grouped_gqa_10_rerun.json](../results/result_step33_decode_attn_grouped_gqa_10_rerun.json)
+- microbench: [results/attention_microbench_grouped_smoke.json](../../results/attention_microbench_grouped_smoke.json)
+- benchmark: [results/result_step33_decode_attn_grouped_gqa_10.json](../../results/result_step33_decode_attn_grouped_gqa_10.json)
+- benchmark rerun: [results/result_step33_decode_attn_grouped_gqa_10_rerun.json](../../results/result_step33_decode_attn_grouped_gqa_10_rerun.json)
 
 另外也抓了一版 trace：
 
-- trace: [traces/compare/triton_decode_attention_grouped](../traces/compare/triton_decode_attention_grouped)
+- trace: [traces/compare/triton_decode_attention_grouped](../../traces/compare/triton_decode_attention_grouped)
 
 这里要特别注明一个现象：
 
@@ -471,9 +471,9 @@ TTFT 目前的主要证据是 prefill GPU kernel `50.6ms/样本`，其中 `GEMM 
 
 2026-03-28 又抓了一版新 trace：
 
-- 目录：[`traces/nvtx_decode_breakdown_rf`](../traces/nvtx_decode_breakdown_rf)
+- 目录：[`traces/nvtx_decode_breakdown_rf`](../../traces/nvtx_decode_breakdown_rf)
 - 说明：尝试给 decode forward 加 NVTX/`record_function` 分段，但在 `viztracer + CUDAGraph replay` 这条链路下，图内用户 range 没有直接保留到 trace 里
-- 因此改为在 [`analyze_traces.py`](../analyze_traces.py) 中新增 **`generate_2 - generate_1` 的 steady-state decode 估算**
+- 因此改为在 [`analyze_traces.py`](../../analyze_traces.py) 中新增 **`generate_2 - generate_1` 的 steady-state decode 估算**
 
 这样可以把 `generate_2` 里的 prompt prefill 和首 token 影响尽量扣掉，更接近“稳定 decode 单步”。
 
@@ -552,7 +552,7 @@ TTFT 目前的主要证据是 prefill GPU kernel `50.6ms/样本`，其中 `GEMM 
 
 ### 实现方式
 
-在 [`optimized_layer.py`](../optimized_layer.py) 中新增了 `_fused_rms_norm_rope()`：
+在 [`optimized_layer.py`](../../optimized_layer.py) 中新增了 `_fused_rms_norm_rope()`：
 
 - 把 `RMSNorm + RoPE` 合到一个 Triton kernel
 - 只在 **decode 小 shape** 且 `prefer_small_decode_triton=True` 时启用
@@ -586,7 +586,7 @@ TTFT 目前的主要证据是 prefill GPU kernel `50.6ms/样本`，其中 `GEMM 
 
 - `66.44ms / 135.47 tok/s`
 
-与 [`results/result_step26_baseline_100.json`](../results/result_step26_baseline_100.json) 对比：
+与 [`results/result_step26_baseline_100.json`](../../results/result_step26_baseline_100.json) 对比：
 
 - 吞吐 `104.15 -> 135.47 tok/s`，约 **`+30.1%`**
 - TTFT `64.50 -> 66.44ms`，约 `+3.0%`
@@ -596,7 +596,7 @@ TTFT 目前的主要证据是 prefill GPU kernel `50.6ms/样本`，其中 `GEMM 
 
 实验 trace 在：
 
-- [`traces/compare/triton_qk_norm_rope`](../traces/compare/triton_qk_norm_rope)
+- [`traces/compare/triton_qk_norm_rope`](../../traces/compare/triton_qk_norm_rope)
 
 用 `generate_2 - generate_1` steady-state 分析后，decode GPU/步从上一版 fresh baseline 的约 `8.22ms` 降到 `6.34ms`。
 
@@ -634,7 +634,7 @@ TTFT 目前的主要证据是 prefill GPU kernel `50.6ms/样本`，其中 `GEMM 
 
 ### 实现
 
-在 [`optimized_layer.py`](../optimized_layer.py) 里补了：
+在 [`optimized_layer.py`](../../optimized_layer.py) 里补了：
 
 - `ENABLE_TRITON_SMALL_RMSNORM`
 - 只对 **decode 小 shape** 的 `_rms_norm(..., prefer_small_triton=True)` 生效
@@ -663,7 +663,7 @@ TTFT 目前的主要证据是 prefill GPU kernel `50.6ms/样本`，其中 `GEMM 
 
 trace 在：
 
-- [`traces/compare/triton_small_rmsnorm`](../traces/compare/triton_small_rmsnorm)
+- [`traces/compare/triton_small_rmsnorm`](../../traces/compare/triton_small_rmsnorm)
 
 相对上一阶段的 `triton_qk_norm_rope`：
 
@@ -704,25 +704,25 @@ steady-state 结构估算里：
 
 把代码对回去后，这 5 个 kernel 基本就是 HF `StaticCache.update()` 的通用实现：
 
-- [`cache_utils.py:327`](../venv/lib/python3.12/site-packages/transformers/cache_utils.py#L327)
+- [`cache_utils.py:327`](../../venv/lib/python3.12/site-packages/transformers/cache_utils.py#L327)
   `torch.arange(kv_length) + self.cumulative_length`
-- [`cache_utils.py:329`](../venv/lib/python3.12/site-packages/transformers/cache_utils.py#L329)
+- [`cache_utils.py:329`](../../venv/lib/python3.12/site-packages/transformers/cache_utils.py#L329)
   `self.cumulative_length.add_(kv_length)`
-- [`cache_utils.py:333`](../venv/lib/python3.12/site-packages/transformers/cache_utils.py#L333)
+- [`cache_utils.py:333`](../../venv/lib/python3.12/site-packages/transformers/cache_utils.py#L333)
   `self.keys.index_copy_(...)`
-- [`cache_utils.py:334`](../venv/lib/python3.12/site-packages/transformers/cache_utils.py#L334)
+- [`cache_utils.py:334`](../../venv/lib/python3.12/site-packages/transformers/cache_utils.py#L334)
   `self.values.index_copy_(...)`
 
 对于我们当前 decode 主路径，`batch=1`、`q_len=1`、`kv_len=1`，这条通用实现明显过重。
 
 ### 实现
 
-在 [`optimized_layer.py`](../optimized_layer.py) 里补了一个专用快路径：
+在 [`optimized_layer.py`](../../optimized_layer.py) 里补了一个专用快路径：
 
 - 入口：
-  [`_static_cache_single_token_update()`](../optimized_layer.py)
+  [`_static_cache_single_token_update()`](../../optimized_layer.py)
 - kernel：
-  [`_static_cache_single_token_update_fwd_kernel()`](../optimized_layer.py)
+  [`_static_cache_single_token_update_fwd_kernel()`](../../optimized_layer.py)
 
 触发条件：
 
@@ -755,13 +755,13 @@ steady-state 结构估算里：
 
 结果文件：
 
-- [`results/result_step39_static_kv_write_10.json`](../results/result_step39_static_kv_write_10.json)
+- [`results/result_step39_static_kv_write_10.json`](../../results/result_step39_static_kv_write_10.json)
 
 ### Trace 结论
 
 trace 在：
 
-- [`traces/compare/triton_decode_step39_static_kv_write`](../traces/compare/triton_decode_step39_static_kv_write)
+- [`traces/compare/triton_decode_step39_static_kv_write`](../../traces/compare/triton_decode_step39_static_kv_write)
 
 相对 step38：
 
