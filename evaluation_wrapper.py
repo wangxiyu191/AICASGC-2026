@@ -1891,6 +1891,23 @@ class VLMModel:
                             **kwargs,
                         )
 
+                    # Compute position_ids BEFORE vision encoder to avoid implicit
+                    # cudaStreamSynchronize.  HF's get_rope_index() calls
+                    # input_token_type.tolist() which forces a GPU→CPU sync.
+                    # Moving this ahead of get_image_features() lets the sync
+                    # happen before ~700 vision kernels are queued, eliminating
+                    # a ~3.5 ms stall between vision and text decoder phases.
+                    if position_ids is None:
+                        position_ids = this_model.compute_3d_position_ids(
+                            input_ids=input_ids,
+                            image_grid_thw=image_grid_thw,
+                            video_grid_thw=video_grid_thw,
+                            inputs_embeds=None,  # prefill branch doesn't use it
+                            attention_mask=attention_mask,
+                            past_key_values=past_key_values,
+                            mm_token_type_ids=mm_token_type_ids,
+                        )
+
                     inputs_embeds = this_model.get_input_embeddings()(input_ids)
                     image_outputs = this_model.get_image_features(pixel_values, image_grid_thw, return_dict=True)
                     pooler_output = image_outputs.pooler_output
@@ -1935,17 +1952,6 @@ class VLMModel:
 
                     inputs_embeds = inputs_embeds.clone()
                     inputs_embeds[:, segment["image_start"] : segment["image_end"], :].copy_(image_embeds.unsqueeze(0))
-
-                    if position_ids is None:
-                        position_ids = this_model.compute_3d_position_ids(
-                            input_ids=input_ids,
-                            image_grid_thw=image_grid_thw,
-                            video_grid_thw=video_grid_thw,
-                            inputs_embeds=inputs_embeds,
-                            attention_mask=attention_mask,
-                            past_key_values=past_key_values,
-                            mm_token_type_ids=mm_token_type_ids,
-                        )
 
                     previous_range = getattr(language_model, "_prefill_visual_token_range", None)
                     previous_text_fastpath_state = getattr(language_model, "_prefill_text_fastpath_state", None)
