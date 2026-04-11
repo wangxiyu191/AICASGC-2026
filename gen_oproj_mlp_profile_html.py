@@ -22,6 +22,8 @@ NUM_ITERS = 20
 WARMUP = 10
 
 # Slot indices (must match OPROJ_MLP_PROFILE_SLOT_NAMES / OProjMlpProfileSlot enum)
+# Slots 0-12: clock64() cycle counts (per-SM cycle counter)
+# Slots 13-14: globaltimer nanoseconds (for calibration)
 S_KERNEL_START       = 0
 S_X_LOAD_DONE        = 1
 S_OPROJ_DONE         = 2
@@ -35,7 +37,9 @@ S_GRIDSYNC2_DONE     = 9
 S_DOWN_HIDDEN_LOADED = 10
 S_DOWN_COMPUTE_DONE  = 11
 S_KERNEL_DONE        = 12
-NUM_SLOTS            = 13
+S_GT_START           = 13
+S_GT_END             = 14
+NUM_SLOTS            = 15
 
 
 def run_profile(device):
@@ -69,28 +73,50 @@ def run_profile(device):
 
 
 def extract_block_data(profile_tensor, num_sms):
-    """Extract per-block phase data from a single run's profile tensor [num_sms, 13]."""
-    ts = profile_tensor.to(torch.float64)  # nanoseconds
+    """Extract per-block phase data from a single run's profile tensor [num_sms, 15].
+
+    Slots 0-12 are clock64 cycle counts; slots 13-14 are globaltimer (ns) for calibration.
+    We compute per-block effective GHz = (kernel_done - kernel_start) cycles / (gt_end - gt_start) ns,
+    then convert each cycle delta to microseconds: delta_cycles / effective_ghz / 1000.
+    """
+    ts = profile_tensor.to(torch.float64)
     n = ts.shape[0]
+
+    # Compute per-block effective frequency (GHz = cycles/ns)
+    gt_span_ns = ts[:, S_GT_END] - ts[:, S_GT_START]     # globaltimer ns span
+    clk_span   = ts[:, S_KERNEL_DONE] - ts[:, S_KERNEL_START]  # clock64 cycle span
+
+    # Use median across all blocks as robust effective_ghz (all SMs run same frequency)
+    valid = gt_span_ns > 0
+    if valid.any():
+        per_block_ghz = clk_span[valid] / gt_span_ns[valid]
+        effective_ghz = float(per_block_ghz.median())
+    else:
+        effective_ghz = 1.41  # fallback to nominal A800 frequency
+
     blocks = []
     for b in range(n):
         t = ts[b]
-        x_load = float(t[S_X_LOAD_DONE] - t[S_KERNEL_START]) / 1000.0
-        o_proj = float(t[S_OPROJ_DONE] - t[S_X_LOAD_DONE]) / 1000.0
-        gridsync1_wait = float(t[S_GRIDSYNC1_START] - t[S_OPROJ_DONE]) / 1000.0
-        gridsync1 = float(t[S_GRIDSYNC1_DONE] - t[S_GRIDSYNC1_START]) / 1000.0
-        resnorm = float(t[S_RESNORM_DONE] - t[S_GRIDSYNC1_DONE]) / 1000.0
+        # Convert cycle delta to microseconds: cycles / ghz / 1000
+        def c2us(cycles):
+            return float(cycles) / effective_ghz / 1000.0
+
+        x_load = c2us(t[S_X_LOAD_DONE] - t[S_KERNEL_START])
+        o_proj = c2us(t[S_OPROJ_DONE] - t[S_X_LOAD_DONE])
+        gridsync1_wait = c2us(t[S_GRIDSYNC1_START] - t[S_OPROJ_DONE])
+        gridsync1 = c2us(t[S_GRIDSYNC1_DONE] - t[S_GRIDSYNC1_START])
+        resnorm = c2us(t[S_RESNORM_DONE] - t[S_GRIDSYNC1_DONE])
 
         has_iter1 = t[S_GATEUP_ITER1_DONE].item() > 0
-        iter0 = float(t[S_GATEUP_ITER0_DONE] - t[S_RESNORM_DONE]) / 1000.0
-        iter1 = float(t[S_GATEUP_ITER1_DONE] - t[S_GATEUP_ITER0_DONE]) / 1000.0 if has_iter1 else 0.0
+        iter0 = c2us(t[S_GATEUP_ITER0_DONE] - t[S_RESNORM_DONE])
+        iter1 = c2us(t[S_GATEUP_ITER1_DONE] - t[S_GATEUP_ITER0_DONE]) if has_iter1 else 0.0
 
-        gridsync2_wait = float(t[S_GRIDSYNC2_START] - (t[S_GATEUP_ITER1_DONE] if has_iter1 else t[S_GATEUP_ITER0_DONE])) / 1000.0
-        gridsync2 = float(t[S_GRIDSYNC2_DONE] - t[S_GRIDSYNC2_START]) / 1000.0
-        down_ld = float(t[S_DOWN_HIDDEN_LOADED] - t[S_GRIDSYNC2_DONE]) / 1000.0
+        gridsync2_wait = c2us(t[S_GRIDSYNC2_START] - (t[S_GATEUP_ITER1_DONE] if has_iter1 else t[S_GATEUP_ITER0_DONE]))
+        gridsync2 = c2us(t[S_GRIDSYNC2_DONE] - t[S_GRIDSYNC2_START])
+        down_ld = c2us(t[S_DOWN_HIDDEN_LOADED] - t[S_GRIDSYNC2_DONE])
         down_active = b < 64
-        down_cp = float(t[S_DOWN_COMPUTE_DONE] - t[S_DOWN_HIDDEN_LOADED]) / 1000.0
-        total = float(t[S_KERNEL_DONE] - t[S_KERNEL_START]) / 1000.0
+        down_cp = c2us(t[S_DOWN_COMPUTE_DONE] - t[S_DOWN_HIDDEN_LOADED])
+        total = c2us(t[S_KERNEL_DONE] - t[S_KERNEL_START])
         blocks.append({
             "block": b,
             "x_load": round(x_load, 3),
@@ -108,11 +134,14 @@ def extract_block_data(profile_tensor, num_sms):
             "down_cp": round(down_cp, 3),
             "total": round(total, 3),
         })
-    return blocks
+    return blocks, effective_ghz
 
 
 def compute_summary(all_profiles, num_sms):
-    """Compute aggregated summary across runs."""
+    """Compute aggregated summary across runs.
+
+    Profile data uses clock64 (cycles). We calibrate per-run using globaltimer slots.
+    """
     warps_per_block = 32
     stride = num_sms * warps_per_block  # 3456
 
@@ -139,32 +168,45 @@ def compute_summary(all_profiles, num_sms):
     for prof in all_profiles:
         ts = prof.to(torch.float64)
 
-        wall_oproj = float((ts[:, S_OPROJ_DONE] - ts[:, S_X_LOAD_DONE]).max()) / 1000.0
+        # Per-run calibration: compute effective GHz from globaltimer span
+        gt_span = ts[:, S_GT_END] - ts[:, S_GT_START]
+        clk_span = ts[:, S_KERNEL_DONE] - ts[:, S_KERNEL_START]
+        valid = gt_span > 0
+        if valid.any():
+            ghz = float((clk_span[valid] / gt_span[valid]).median())
+        else:
+            ghz = 1.41
+
+        # Helper: max cycle delta across blocks → microseconds
+        def max_c2us(cycle_deltas):
+            return float(cycle_deltas.max()) / ghz / 1000.0
+
+        wall_oproj = max_c2us(ts[:, S_OPROJ_DONE] - ts[:, S_X_LOAD_DONE])
         phase_stats["o_proj"]["wall_us"].append(wall_oproj)
 
-        wall_sync1 = float((ts[:, S_GRIDSYNC1_DONE] - ts[:, S_GRIDSYNC1_START]).max()) / 1000.0
+        wall_sync1 = max_c2us(ts[:, S_GRIDSYNC1_DONE] - ts[:, S_GRIDSYNC1_START])
         phase_stats["grid_sync_1"]["wall_us"].append(wall_sync1)
 
-        wall_resnorm = float((ts[:, S_RESNORM_DONE] - ts[:, S_GRIDSYNC1_DONE]).max()) / 1000.0
+        wall_resnorm = max_c2us(ts[:, S_RESNORM_DONE] - ts[:, S_GRIDSYNC1_DONE])
         phase_stats["res+norm"]["wall_us"].append(wall_resnorm)
 
-        wall_iter0 = float((ts[:, S_GATEUP_ITER0_DONE] - ts[:, S_RESNORM_DONE]).max()) / 1000.0
+        wall_iter0 = max_c2us(ts[:, S_GATEUP_ITER0_DONE] - ts[:, S_RESNORM_DONE])
         phase_stats["gate_up iter0"]["wall_us"].append(wall_iter0)
 
         mask = ts[:, S_GATEUP_ITER1_DONE] > 0
         if mask.any():
-            wall_iter1 = float((ts[mask, S_GATEUP_ITER1_DONE] - ts[mask, S_GATEUP_ITER0_DONE]).max()) / 1000.0
+            wall_iter1 = max_c2us(ts[mask, S_GATEUP_ITER1_DONE] - ts[mask, S_GATEUP_ITER0_DONE])
         else:
             wall_iter1 = 0.0
         phase_stats["gate_up iter1"]["wall_us"].append(wall_iter1)
 
-        wall_sync2 = float((ts[:, S_GRIDSYNC2_DONE] - ts[:, S_GRIDSYNC2_START]).max()) / 1000.0
+        wall_sync2 = max_c2us(ts[:, S_GRIDSYNC2_DONE] - ts[:, S_GRIDSYNC2_START])
         phase_stats["grid_sync_2"]["wall_us"].append(wall_sync2)
 
-        wall_down = float((ts[:64, S_DOWN_COMPUTE_DONE] - ts[:64, S_DOWN_HIDDEN_LOADED]).max()) / 1000.0
+        wall_down = max_c2us(ts[:64, S_DOWN_COMPUTE_DONE] - ts[:64, S_DOWN_HIDDEN_LOADED])
         phase_stats["down_proj"]["wall_us"].append(wall_down)
 
-        wall_total = float((ts[:, S_KERNEL_DONE] - ts[:, S_KERNEL_START]).max()) / 1000.0
+        wall_total = max_c2us(ts[:, S_KERNEL_DONE] - ts[:, S_KERNEL_START])
         phase_stats["total"]["wall_us"].append(wall_total)
 
     summary = []
@@ -185,7 +227,7 @@ def compute_summary(all_profiles, num_sms):
     return summary
 
 
-def generate_html(block_data_runs, summary, num_sms):
+def generate_html(block_data_runs, summary, num_sms, effective_ghz=1.41):
     """Generate self-contained HTML visualization."""
     run_totals = []
     for i, blocks in enumerate(block_data_runs):
@@ -198,7 +240,7 @@ def generate_html(block_data_runs, summary, num_sms):
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<title>O-Proj + Post-Attn MLP Persistent Kernel Per-SM Profile</title>
+<title>O-Proj + Post-Attn MLP Persistent Kernel Per-SM Profile (clock64 calibrated)</title>
 <style>
 * {{ margin: 0; padding: 0; box-sizing: border-box; }}
 body {{
@@ -409,11 +451,12 @@ h2 {{
 </head>
 <body>
 
-<h1>O-Proj + Post-Attn MLP Persistent Kernel Per-SM Profile</h1>
+<h1>O-Proj + Post-Attn MLP Persistent Kernel Per-SM Profile (clock64)</h1>
 <div class="subtitle">
     NVIDIA A800 80GB PCIe &middot; {num_sms} SMs &middot;
     Peak HBM BW: {PEAK_BW_GBS:.0f} GB/s &middot;
-    {NUM_ITERS} runs (showing median)
+    {NUM_ITERS} runs (showing median) &middot;
+    Timer: clock64 @ {effective_ghz:.4f} GHz (globaltimer calibrated)
 </div>
 
 <h2>1. Bandwidth Summary</h2>
@@ -699,15 +742,20 @@ def main():
 
     print("Extracting per-block data...")
     block_data_runs = []
+    effective_ghz_list = []
     for prof in all_profiles:
-        blocks = extract_block_data(prof, num_sms)
+        blocks, effective_ghz = extract_block_data(prof, num_sms)
         block_data_runs.append(blocks)
+        effective_ghz_list.append(effective_ghz)
+
+    median_ghz = sorted(effective_ghz_list)[len(effective_ghz_list) // 2]
+    print(f"Calibrated SM frequency: {median_ghz:.4f} GHz (median across {len(effective_ghz_list)} runs)")
 
     print("Computing summary...")
     summary = compute_summary(all_profiles, num_sms)
 
     print("Generating HTML...")
-    html = generate_html(block_data_runs, summary, num_sms)
+    html = generate_html(block_data_runs, summary, num_sms, median_ghz)
 
     out_path = Path("results/oproj_mlp_profile_viz.html")
     out_path.parent.mkdir(parents=True, exist_ok=True)

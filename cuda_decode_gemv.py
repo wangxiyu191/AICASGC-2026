@@ -1558,19 +1558,21 @@ PERSISTENT_PROFILE_SLOT_NAMES = (
 )
 
 OPROJ_MLP_PROFILE_SLOT_NAMES = (
-    "kernel_start",         # 0
-    "x_load_done",          # 1
-    "oproj_done",           # 2
-    "gridsync1_start",      # 3
-    "gridsync1_done",       # 4
-    "resnorm_done",         # 5
-    "gateup_iter0_done",    # 6
-    "gateup_iter1_done",    # 7  (0 if block does only 1 iteration)
-    "gridsync2_start",      # 8
-    "gridsync2_done",       # 9
-    "down_hidden_loaded",   # 10
-    "down_compute_done",    # 11
-    "kernel_done",          # 12
+    "kernel_start",         # 0  (clock64)
+    "x_load_done",          # 1  (clock64)
+    "oproj_done",           # 2  (clock64)
+    "gridsync1_start",      # 3  (clock64)
+    "gridsync1_done",       # 4  (clock64)
+    "resnorm_done",         # 5  (clock64)
+    "gateup_iter0_done",    # 6  (clock64)
+    "gateup_iter1_done",    # 7  (clock64, 0 if block does only 1 iteration)
+    "gridsync2_start",      # 8  (clock64)
+    "gridsync2_done",       # 9  (clock64)
+    "down_hidden_loaded",   # 10 (clock64)
+    "down_compute_done",    # 11 (clock64)
+    "kernel_done",          # 12 (clock64)
+    "gt_start",             # 13 (globaltimer, calibration)
+    "gt_end",               # 14 (globaltimer, calibration)
 )
 
 

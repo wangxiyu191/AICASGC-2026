@@ -52,7 +52,9 @@ enum PersistentProfileSlot : int {
 };
 
 // O-proj + post-attn MLP persistent kernel profile slots
-constexpr int kOProjMlpProfileSlots = 13;
+// Slots 0-12: recorded with clock64() (SM cycle counter, ~0.7ns resolution)
+// Slots 13-14: recorded with globaltimer (1024ns quantization) for calibration
+constexpr int kOProjMlpProfileSlots = 15;
 enum OProjMlpProfileSlot : int {
     OP_KERNEL_START       = 0,
     OP_X_LOAD_DONE        = 1,
@@ -67,12 +69,18 @@ enum OProjMlpProfileSlot : int {
     OP_DOWN_HIDDEN_LOADED = 10,
     OP_DOWN_COMPUTE_DONE  = 11,
     OP_KERNEL_DONE        = 12,
+    OP_GT_START           = 13,  // globaltimer at kernel start (calibration)
+    OP_GT_END             = 14,  // globaltimer at kernel end (calibration)
 };
 
 __device__ __forceinline__ uint64_t read_globaltimer() {
     uint64_t ts;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(ts));
     return ts;
+}
+
+__device__ __forceinline__ uint64_t read_clock64() {
+    return static_cast<uint64_t>(clock64());
 }
 
 __device__ __forceinline__ void accumulate_hfma2_uint4(
@@ -974,7 +982,9 @@ __global__ void fused_o_proj_post_attn_mlp_persistent_profile_k2048_k6144_fwd_ke
     if constexpr (kProfile) {
         if (threadIdx.x == 0 && profile != nullptr) {
             profile[static_cast<int64_t>(blockIdx.x) * kOProjMlpProfileSlots +
-                    OP_KERNEL_START] = read_globaltimer();
+                    OP_GT_START] = read_globaltimer();
+            profile[static_cast<int64_t>(blockIdx.x) * kOProjMlpProfileSlots +
+                    OP_KERNEL_START] = read_clock64();
         }
     }
 
@@ -986,7 +996,7 @@ __global__ void fused_o_proj_post_attn_mlp_persistent_profile_k2048_k6144_fwd_ke
     if constexpr (kProfile) {
         if (threadIdx.x == 0 && profile != nullptr) {
             profile[static_cast<int64_t>(blockIdx.x) * kOProjMlpProfileSlots +
-                    OP_X_LOAD_DONE] = read_globaltimer();
+                    OP_X_LOAD_DONE] = read_clock64();
         }
     }
 
@@ -1025,14 +1035,14 @@ __global__ void fused_o_proj_post_attn_mlp_persistent_profile_k2048_k6144_fwd_ke
     if constexpr (kProfile) {
         if (threadIdx.x == 0 && profile != nullptr) {
             profile[static_cast<int64_t>(blockIdx.x) * kOProjMlpProfileSlots +
-                    OP_OPROJ_DONE] = read_globaltimer();
+                    OP_OPROJ_DONE] = read_clock64();
         }
     }
 
     if constexpr (kProfile) {
         if (threadIdx.x == 0 && profile != nullptr) {
             profile[static_cast<int64_t>(blockIdx.x) * kOProjMlpProfileSlots +
-                    OP_GRIDSYNC1_START] = read_globaltimer();
+                    OP_GRIDSYNC1_START] = read_clock64();
         }
     }
 
@@ -1041,7 +1051,7 @@ __global__ void fused_o_proj_post_attn_mlp_persistent_profile_k2048_k6144_fwd_ke
     if constexpr (kProfile) {
         if (threadIdx.x == 0 && profile != nullptr) {
             profile[static_cast<int64_t>(blockIdx.x) * kOProjMlpProfileSlots +
-                    OP_GRIDSYNC1_DONE] = read_globaltimer();
+                    OP_GRIDSYNC1_DONE] = read_clock64();
         }
     }
 
@@ -1081,7 +1091,7 @@ __global__ void fused_o_proj_post_attn_mlp_persistent_profile_k2048_k6144_fwd_ke
     if constexpr (kProfile) {
         if (threadIdx.x == 0 && profile != nullptr) {
             profile[static_cast<int64_t>(blockIdx.x) * kOProjMlpProfileSlots +
-                    OP_RESNORM_DONE] = read_globaltimer();
+                    OP_RESNORM_DONE] = read_clock64();
         }
     }
 
@@ -1127,7 +1137,7 @@ __global__ void fused_o_proj_post_attn_mlp_persistent_profile_k2048_k6144_fwd_ke
         if constexpr (kProfile) {
             if (threadIdx.x == 0 && profile != nullptr) {
                 profile[static_cast<int64_t>(blockIdx.x) * kOProjMlpProfileSlots +
-                        OP_GATEUP_ITER0_DONE + gate_up_iter] = read_globaltimer();
+                        OP_GATEUP_ITER0_DONE + gate_up_iter] = read_clock64();
             }
         }
         ++gate_up_iter;
@@ -1136,7 +1146,7 @@ __global__ void fused_o_proj_post_attn_mlp_persistent_profile_k2048_k6144_fwd_ke
     if constexpr (kProfile) {
         if (threadIdx.x == 0 && profile != nullptr) {
             profile[static_cast<int64_t>(blockIdx.x) * kOProjMlpProfileSlots +
-                    OP_GRIDSYNC2_START] = read_globaltimer();
+                    OP_GRIDSYNC2_START] = read_clock64();
         }
     }
 
@@ -1145,7 +1155,7 @@ __global__ void fused_o_proj_post_attn_mlp_persistent_profile_k2048_k6144_fwd_ke
     if constexpr (kProfile) {
         if (threadIdx.x == 0 && profile != nullptr) {
             profile[static_cast<int64_t>(blockIdx.x) * kOProjMlpProfileSlots +
-                    OP_GRIDSYNC2_DONE] = read_globaltimer();
+                    OP_GRIDSYNC2_DONE] = read_clock64();
         }
     }
 
@@ -1177,7 +1187,7 @@ __global__ void fused_o_proj_post_attn_mlp_persistent_profile_k2048_k6144_fwd_ke
     if constexpr (kProfile) {
         if (threadIdx.x == 0 && profile != nullptr) {
             profile[static_cast<int64_t>(blockIdx.x) * kOProjMlpProfileSlots +
-                    OP_DOWN_HIDDEN_LOADED] = read_globaltimer();
+                    OP_DOWN_HIDDEN_LOADED] = read_clock64();
         }
     }
 
@@ -1250,9 +1260,11 @@ __global__ void fused_o_proj_post_attn_mlp_persistent_profile_k2048_k6144_fwd_ke
     if constexpr (kProfile) {
         if (threadIdx.x == 0 && profile != nullptr) {
             profile[static_cast<int64_t>(blockIdx.x) * kOProjMlpProfileSlots +
-                    OP_DOWN_COMPUTE_DONE] = read_globaltimer();
+                    OP_DOWN_COMPUTE_DONE] = read_clock64();
             profile[static_cast<int64_t>(blockIdx.x) * kOProjMlpProfileSlots +
-                    OP_KERNEL_DONE] = read_globaltimer();
+                    OP_KERNEL_DONE] = read_clock64();
+            profile[static_cast<int64_t>(blockIdx.x) * kOProjMlpProfileSlots +
+                    OP_GT_END] = read_globaltimer();
         }
     }
 }
