@@ -29,7 +29,7 @@ os.environ.setdefault("ENABLE_CUDA_FUSED_POST_ATTN_MLP_PERSISTENT", "1")
 os.environ.setdefault("ENABLE_CUDA_FUSED_GATEUP_SILU_DOWNPROJ", "1")
 os.environ.setdefault("CUDA_FUSED_GATEUP_SILU_DOWNPROJ_VARIANT", "persistent")
 
-from optimized_layer import replace_decoder_layers, set_small_decode_triton_enabled
+from optimized_layer import replace_decoder_layers, set_small_decode_triton_enabled, fused_vision_rope
 
 
 _ENABLE_PREFILL_VISION_GRID_CACHE = os.environ.get("ENABLE_PREFILL_VISION_GRID_CACHE", "1") == "1"
@@ -1592,7 +1592,11 @@ class VLMModel:
                         this_attn.qkv(hidden_states).reshape(seq_length, 3, this_attn.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
                     )
                     cos, sin = position_embeddings
-                    query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
+                    fused_rope_result = fused_vision_rope(query_states, key_states, cos, sin)
+                    if fused_rope_result is not None:
+                        query_states, key_states = fused_rope_result
+                    else:
+                        query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
 
                     query_states = query_states.transpose(0, 1).unsqueeze(0)
                     key_states = key_states.transpose(0, 1).unsqueeze(0)

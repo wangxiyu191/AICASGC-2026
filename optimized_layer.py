@@ -637,12 +637,12 @@ def _fused_qk_rms_norm_rope(
         return None
 
     m = batch * seq_len
-    q_3d = q.contiguous().reshape(m, q_heads, d)
-    k_3d = k.contiguous().reshape(m, kv_heads, d)
+    q_3d = q.reshape(m, q_heads, d)
+    k_3d = k.reshape(m, kv_heads, d)
     cos_2d = cos.reshape(m, d)
     sin_2d = sin.reshape(m, d)
-    q_out = torch.empty_like(q_3d)
-    k_out = torch.empty_like(k_3d)
+    q_out = torch.empty(m, q_heads, d, dtype=q.dtype, device=q.device)
+    k_out = torch.empty(m, kv_heads, d, dtype=k.dtype, device=k.device)
     _fused_qk_rms_norm_rope_fwd_kernel[(m * kv_heads,)](
         q_3d,
         k_3d,
@@ -657,6 +657,8 @@ def _fused_qk_rms_norm_rope(
         q_3d.stride(1),
         k_3d.stride(0),
         k_3d.stride(1),
+        q_out.stride(0),
+        k_out.stride(0),
         cos_2d.stride(0),
         eps,
         GROUPS=groups,
@@ -1979,6 +1981,8 @@ def _fused_qk_rms_norm_rope_fwd_kernel(
     stride_q_h,
     stride_k_m,
     stride_k_h,
+    stride_qout_m,
+    stride_kout_m,
     stride_cos_m,
     eps,
     GROUPS: tl.constexpr,
@@ -2011,8 +2015,9 @@ def _fused_qk_rms_norm_rope_fwd_kernel(
     kw1 = tl.load(K_W + HALF_D + rk, mask=mask_half, other=0.0).to(tl.float32)
     kn0 = (k0 * k_rstd * kw0).to(K_OUT.dtype.element_ty).to(tl.float32)
     kn1 = (k1 * k_rstd * kw1).to(K_OUT.dtype.element_ty).to(tl.float32)
-    tl.store(K_OUT + m * stride_k_m + kv_h * stride_k_h + rk, (kn0 * cos - kn1 * sin).to(K_OUT.dtype.element_ty), mask=mask_half)
-    tl.store(K_OUT + m * stride_k_m + kv_h * stride_k_h + HALF_D + rk, (kn1 * cos + kn0 * sin).to(K_OUT.dtype.element_ty), mask=mask_half)
+    kout_base = K_OUT + m * stride_kout_m + kv_h * stride_k_h
+    tl.store(kout_base + rk, (kn0 * cos - kn1 * sin).to(K_OUT.dtype.element_ty), mask=mask_half)
+    tl.store(kout_base + HALF_D + rk, (kn1 * cos + kn0 * sin).to(K_OUT.dtype.element_ty), mask=mask_half)
 
     for group_idx in range(GROUPS):
         q_h = q_head_base + group_idx
@@ -2026,8 +2031,105 @@ def _fused_qk_rms_norm_rope_fwd_kernel(
         qw1 = tl.load(Q_W + HALF_D + rk, mask=mask_half, other=0.0).to(tl.float32)
         qn0 = (q0 * q_rstd * qw0).to(Q_OUT.dtype.element_ty).to(tl.float32)
         qn1 = (q1 * q_rstd * qw1).to(Q_OUT.dtype.element_ty).to(tl.float32)
-        tl.store(Q_OUT + m * stride_q_m + q_h * stride_q_h + rk, (qn0 * cos - qn1 * sin).to(Q_OUT.dtype.element_ty), mask=mask_half)
-        tl.store(Q_OUT + m * stride_q_m + q_h * stride_q_h + HALF_D + rk, (qn1 * cos + qn0 * sin).to(Q_OUT.dtype.element_ty), mask=mask_half)
+        qout_base = Q_OUT + m * stride_qout_m + q_h * stride_q_h
+        tl.store(qout_base + rk, (qn0 * cos - qn1 * sin).to(Q_OUT.dtype.element_ty), mask=mask_half)
+        tl.store(qout_base + HALF_D + rk, (qn1 * cos + qn0 * sin).to(Q_OUT.dtype.element_ty), mask=mask_half)
+
+
+@triton.jit
+def _fused_vision_rope_fwd_kernel(
+    Q, K, Q_OUT, K_OUT, COS, SIN,
+    num_heads,
+    stride_q_m, stride_q_h,
+    stride_k_m, stride_k_h,
+    stride_qout_m, stride_qout_h,
+    stride_kout_m, stride_kout_h,
+    stride_cos_m,
+    HALF_D: tl.constexpr,
+    BLOCK_HALF: tl.constexpr,
+):
+    """Fused vision encoder RoPE for one (token, head) pair, applied to both Q and K."""
+    pid = tl.program_id(0)
+    m = pid // num_heads
+    h = pid % num_heads
+
+    rk = tl.arange(0, BLOCK_HALF)
+    mask = rk < HALF_D
+
+    cs_base = m * stride_cos_m
+    cos = tl.load(COS + cs_base + rk, mask=mask, other=0.0).to(tl.float32)
+    sin = tl.load(SIN + cs_base + rk, mask=mask, other=0.0).to(tl.float32)
+
+    # Q RoPE
+    q_base = Q + m * stride_q_m + h * stride_q_h
+    q0 = tl.load(q_base + rk, mask=mask, other=0.0).to(tl.float32)
+    q1 = tl.load(q_base + HALF_D + rk, mask=mask, other=0.0).to(tl.float32)
+    qout_base = Q_OUT + m * stride_qout_m + h * stride_qout_h
+    tl.store(qout_base + rk, (q0 * cos - q1 * sin).to(Q_OUT.dtype.element_ty), mask=mask)
+    tl.store(qout_base + HALF_D + rk, (q1 * cos + q0 * sin).to(Q_OUT.dtype.element_ty), mask=mask)
+
+    # K RoPE
+    k_base = K + m * stride_k_m + h * stride_k_h
+    k0 = tl.load(k_base + rk, mask=mask, other=0.0).to(tl.float32)
+    k1 = tl.load(k_base + HALF_D + rk, mask=mask, other=0.0).to(tl.float32)
+    kout_base = K_OUT + m * stride_kout_m + h * stride_kout_h
+    tl.store(kout_base + rk, (k0 * cos - k1 * sin).to(K_OUT.dtype.element_ty), mask=mask)
+    tl.store(kout_base + HALF_D + rk, (k1 * cos + k0 * sin).to(K_OUT.dtype.element_ty), mask=mask)
+
+
+def fused_vision_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+):
+    """Fused vision encoder RoPE: replaces 14 PyTorch kernels with 1 Triton kernel.
+
+    Args:
+        q: (N, H, D) input query states (fp16)
+        k: (N, H, D) input key states (fp16)
+        cos: (N, D) or (N, 1, D) cosine embeddings (fp32)
+        sin: (N, D) or (N, 1, D) sine embeddings (fp32)
+
+    Returns:
+        (q_embed, k_embed) both (N, H, D) in original dtype, or None if conditions not met.
+    """
+    if (
+        q.device.type != "cuda"
+        or q.ndim != 3
+        or k.ndim != 3
+        or q.stride(-1) != 1
+        or k.stride(-1) != 1
+    ):
+        return None
+
+    N, H, D = q.shape
+    if D % 2 != 0 or D == 0:
+        return None
+    half_d = D // 2
+
+    if cos.ndim == 3:
+        cos = cos.squeeze(-2)
+    if sin.ndim == 3:
+        sin = sin.squeeze(-2)
+    if cos.stride(-1) != 1 or sin.stride(-1) != 1:
+        return None
+
+    q_out = torch.empty(N, H, D, dtype=q.dtype, device=q.device)
+    k_out = torch.empty(N, H, D, dtype=k.dtype, device=k.device)
+
+    _fused_vision_rope_fwd_kernel[(N * H,)](
+        q, k, q_out, k_out, cos, sin,
+        H,
+        q.stride(0), q.stride(1),
+        k.stride(0), k.stride(1),
+        q_out.stride(0), q_out.stride(1),
+        k_out.stride(0), k_out.stride(1),
+        cos.stride(0),
+        HALF_D=half_d,
+        BLOCK_HALF=triton.next_power_of_2(half_d),
+    )
+    return q_out, k_out
 
 
 @triton.jit
