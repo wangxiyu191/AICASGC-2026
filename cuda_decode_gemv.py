@@ -1573,6 +1573,7 @@ OPROJ_MLP_PROFILE_SLOT_NAMES = (
     "kernel_done",          # 12 (clock64)
     "gt_start",             # 13 (globaltimer, calibration)
     "gt_end",               # 14 (globaltimer, calibration)
+    "sm_id",                # 15 (SM ID from %smid)
 )
 
 
@@ -1587,6 +1588,7 @@ def fused_o_proj_post_attn_mlp_persistent_profile_half(
     down_proj_bias: torch.Tensor | None,
     eps: float,
     workspace: dict | None = None,
+    gate_up_active_sms: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
     if (
         residual.device.type != "cuda"
@@ -1657,6 +1659,7 @@ def fused_o_proj_post_attn_mlp_persistent_profile_half(
         eps,
         o_proj_bias is not None,
         down_proj_bias is not None,
+        gate_up_active_sms,
     )
     meta = {
         "kernel_name": "fused_o_proj_post_attn_mlp_persistent_profile",

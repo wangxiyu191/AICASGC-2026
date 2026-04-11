@@ -16,6 +16,7 @@ os.environ.setdefault("CUDAGRAPH_PREBUILD_MAX_CACHE_LEN", "0")
 
 import torch
 import cuda_decode_gemv
+import hbm_latency_partition
 
 PEAK_BW_GBS = 2039.0
 NUM_ITERS = 20
@@ -39,10 +40,11 @@ S_DOWN_COMPUTE_DONE  = 11
 S_KERNEL_DONE        = 12
 S_GT_START           = 13
 S_GT_END             = 14
-NUM_SLOTS            = 15
+S_SM_ID              = 15
+NUM_SLOTS            = 16
 
 
-def run_profile(device):
+def run_profile(device, gate_up_active_sms=0):
     num_sms = torch.cuda.get_device_properties(device).multi_processor_count
     # Model dimensions for Qwen2.5-3B-Instruct
     residual = torch.randn((1, 1, 2048), dtype=torch.float16, device=device)
@@ -64,7 +66,8 @@ def run_profile(device):
     all_profiles = []
     for _ in range(NUM_ITERS):
         _, _, profile, meta = cuda_decode_gemv.fused_o_proj_post_attn_mlp_persistent_profile_half(
-            residual, attn_input, o_proj_w, None, norm_w, gate_up_w, down_proj_w, None, eps
+            residual, attn_input, o_proj_w, None, norm_w, gate_up_w, down_proj_w, None, eps,
+            gate_up_active_sms=gate_up_active_sms,
         )
         torch.cuda.synchronize()
         all_profiles.append(profile.to(torch.int64).cpu())
@@ -72,10 +75,11 @@ def run_profile(device):
     return all_profiles, num_sms
 
 
-def extract_block_data(profile_tensor, num_sms):
-    """Extract per-block phase data from a single run's profile tensor [num_sms, 15].
+def extract_block_data(profile_tensor, num_sms, sm_class_map=None):
+    """Extract per-block phase data from a single run's profile tensor [num_sms, 16].
 
     Slots 0-12 are clock64 cycle counts; slots 13-14 are globaltimer (ns) for calibration.
+    Slot 15 is SM ID from %smid PTX register.
     We compute per-block effective GHz = (kernel_done - kernel_start) cycles / (gt_end - gt_start) ns,
     then convert each cycle delta to microseconds: delta_cycles / effective_ghz / 1000.
     """
@@ -117,8 +121,12 @@ def extract_block_data(profile_tensor, num_sms):
         down_active = b < 64
         down_cp = c2us(t[S_DOWN_COMPUTE_DONE] - t[S_DOWN_HIDDEN_LOADED])
         total = c2us(t[S_KERNEL_DONE] - t[S_KERNEL_START])
+        sm_id = int(t[S_SM_ID].item())
+        sm_class = sm_class_map.get(sm_id, -1) if sm_class_map else -1
         blocks.append({
             "block": b,
+            "sm_id": sm_id,
+            "sm_class": sm_class,
             "x_load": round(x_load, 3),
             "o_proj": round(o_proj, 3),
             "gridsync1_wait": round(gridsync1_wait, 3),
@@ -137,19 +145,24 @@ def extract_block_data(profile_tensor, num_sms):
     return blocks, effective_ghz
 
 
-def compute_summary(all_profiles, num_sms):
+def compute_summary(all_profiles, num_sms, gate_up_active_sms=0):
     """Compute aggregated summary across runs.
 
     Profile data uses clock64 (cycles). We calibrate per-run using globaltimer slots.
     """
     warps_per_block = 32
-    stride = num_sms * warps_per_block  # 3456
+    gu_sms = gate_up_active_sms if gate_up_active_sms > 0 else num_sms
+    stride = gu_sms * warps_per_block
+    # How many SMs have iter1 work? ceil(6144 / warps_per_block) blocks needed total,
+    # minus those covered by iter0 (= gu_sms blocks).
+    iter1_rows = max(0, 6144 - stride)
+    iter1_sms = min(gu_sms, (iter1_rows + warps_per_block - 1) // warps_per_block) if iter1_rows > 0 else 0
 
     data_bytes = {
         "o_proj": 2048 * 2048 * 2,
         "res+norm": 0,  # compute-bound, no HBM weight read
         "gate_up iter0": min(stride, 6144) * 2 * 2048 * 2,
-        "gate_up iter1": max(0, 6144 - stride) * 2 * 2048 * 2,
+        "gate_up iter1": iter1_rows * 2 * 2048 * 2,
         "down_proj": 2048 * 6144 * 2,
         "total": 2048 * 2048 * 2 + 12288 * 2048 * 2 + 2048 * 6144 * 2,
     }
@@ -158,8 +171,8 @@ def compute_summary(all_profiles, num_sms):
         "o_proj": {"sms": num_sms, "wall_us": [], "data_mb": data_bytes["o_proj"] / 1e6},
         "res+norm": {"sms": num_sms, "wall_us": [], "data_mb": 0},
         "grid_sync_1": {"sms": num_sms, "wall_us": [], "data_mb": 0},
-        "gate_up iter0": {"sms": num_sms, "wall_us": [], "data_mb": data_bytes["gate_up iter0"] / 1e6},
-        "gate_up iter1": {"sms": 84, "wall_us": [], "data_mb": data_bytes["gate_up iter1"] / 1e6},
+        "gate_up iter0": {"sms": gu_sms, "wall_us": [], "data_mb": data_bytes["gate_up iter0"] / 1e6},
+        "gate_up iter1": {"sms": iter1_sms, "wall_us": [], "data_mb": data_bytes["gate_up iter1"] / 1e6},
         "grid_sync_2": {"sms": num_sms, "wall_us": [], "data_mb": 0},
         "down_proj": {"sms": 64, "wall_us": [], "data_mb": data_bytes["down_proj"] / 1e6},
         "total": {"sms": num_sms, "wall_us": [], "data_mb": data_bytes["total"] / 1e6},
@@ -190,7 +203,12 @@ def compute_summary(all_profiles, num_sms):
         wall_resnorm = max_c2us(ts[:, S_RESNORM_DONE] - ts[:, S_GRIDSYNC1_DONE])
         phase_stats["res+norm"]["wall_us"].append(wall_resnorm)
 
-        wall_iter0 = max_c2us(ts[:, S_GATEUP_ITER0_DONE] - ts[:, S_RESNORM_DONE])
+        # gate_up: only look at blocks that actually participate
+        gu_mask = ts[:, S_GATEUP_ITER0_DONE] > 0
+        if gu_mask.any():
+            wall_iter0 = max_c2us(ts[gu_mask, S_GATEUP_ITER0_DONE] - ts[gu_mask, S_RESNORM_DONE])
+        else:
+            wall_iter0 = 0.0
         phase_stats["gate_up iter0"]["wall_us"].append(wall_iter0)
 
         mask = ts[:, S_GATEUP_ITER1_DONE] > 0
@@ -544,17 +562,28 @@ function renderLegend() {{
     el.innerHTML = h;
 }}
 
+// Sort helper: by (sm_class, sm_id)
+function sortBySMClass(blocks) {{
+    return [...blocks].sort((a, b) => a.sm_class - b.sm_class || a.sm_id - b.sm_id);
+}}
+
 // Timeline
 function renderTimeline(runIdx) {{
-    const blocks = allRuns[runIdx];
+    const blocks = sortBySMClass(allRuns[runIdx]);
     const container = document.getElementById('timelineContainer');
     const maxTotal = Math.max(...blocks.map(b => b.total));
     const scale = maxTotal > 0 ? 1.0 / maxTotal : 1.0;
 
     let h = '';
+    let prevClass = -1;
     for (const b of blocks) {{
+        if (prevClass >= 0 && b.sm_class !== prevClass) {{
+            h += `<div style="height:3px;background:#58a6ff;margin:2px 0;opacity:0.6"></div>`;
+        }}
+        prevClass = b.sm_class;
+        const cls = b.sm_class >= 0 ? `C${{b.sm_class}}` : '';
         h += `<div class="timeline-row">`;
-        h += `<div class="timeline-label">${{b.block}}</div>`;
+        h += `<div class="timeline-label">${{cls}} SM${{b.sm_id}}</div>`;
         h += `<div class="timeline-bar-area">`;
 
         const segs = [];
@@ -585,7 +614,7 @@ function renderTimeline(runIdx) {{
         }}
 
         for (const s of segs) {{
-            h += `<div class="timeline-seg" style="left:${{s.left.toFixed(2)}}%;width:${{Math.max(s.width, 0.15).toFixed(2)}}%;background:${{PHASE_COLORS[s.phase]}}" data-block="${{b.block}}" data-phase="${{PHASE_LABELS[s.phase]}}" data-dur="${{s.dur.toFixed(2)}}"></div>`;
+            h += `<div class="timeline-seg" style="left:${{s.left.toFixed(2)}}%;width:${{Math.max(s.width, 0.15).toFixed(2)}}%;background:${{PHASE_COLORS[s.phase]}}" data-block="SM${{b.sm_id}}" data-phase="${{PHASE_LABELS[s.phase]}}" data-dur="${{s.dur.toFixed(2)}}"></div>`;
         }}
 
         h += `</div></div>`;
@@ -614,7 +643,7 @@ function renderTimeline(runIdx) {{
 
 // Heatmap
 function renderHeatmap(runIdx) {{
-    const blocks = allRuns[runIdx];
+    const blocks = sortBySMClass(allRuns[runIdx]);
     const phases = ['x_load', 'o_proj', 'gridsync1', 'resnorm', 'iter0', 'iter1', 'gridsync2', 'down_ld', 'down_cp', 'total'];
     const labels = ['x_load', 'o_proj', 'sync1', 'resnorm', 'iter0', 'iter1', 'sync2', 'down_ld', 'down_cp', 'total'];
 
@@ -623,13 +652,19 @@ function renderHeatmap(runIdx) {{
         maxPerPhase[p] = Math.max(...blocks.map(b => b[p] || 0), 0.001);
     }}
 
-    let h = '<table class="heatmap-table"><tr><th>Block</th>';
+    let h = '<table class="heatmap-table"><tr><th>SM</th>';
     labels.forEach(l => {{ h += `<th>${{l}}</th>`; }});
     h += '<th>Status</th></tr>';
 
+    let prevClass = -1;
     for (const b of blocks) {{
+        if (prevClass >= 0 && b.sm_class !== prevClass) {{
+            h += `<tr><td colspan="${{phases.length + 2}}" style="height:3px;background:#58a6ff;padding:0"></td></tr>`;
+        }}
+        prevClass = b.sm_class;
+        const cls = b.sm_class >= 0 ? `C${{b.sm_class}}` : '';
         h += '<tr>';
-        h += `<td>${{b.block}}</td>`;
+        h += `<td>${{cls}} SM${{b.sm_id}}</td>`;
         for (const p of phases) {{
             let val = b[p] || 0;
             const maxV = maxPerPhase[p];
@@ -672,9 +707,15 @@ function renderHeatmap(runIdx) {{
     document.getElementById('tab-heatmap').innerHTML = h;
 
     // Raw table
-    let t = '<table class="heatmap-table"><tr><th>Block</th><th>x_load</th><th>o_proj</th><th>sync1</th><th>resnorm</th><th>iter0</th><th>iter1</th><th>sync2</th><th>down_ld</th><th>down_cp</th><th>total</th><th>has_iter1</th><th>down_active</th></tr>';
+    let t = '<table class="heatmap-table"><tr><th>SM</th><th>x_load</th><th>o_proj</th><th>sync1</th><th>resnorm</th><th>iter0</th><th>iter1</th><th>sync2</th><th>down_ld</th><th>down_cp</th><th>total</th><th>has_iter1</th><th>down_active</th></tr>';
+    let prevClass2 = -1;
     for (const b of blocks) {{
-        t += `<tr><td>${{b.block}}</td>`;
+        if (prevClass2 >= 0 && b.sm_class !== prevClass2) {{
+            t += `<tr><td colspan="13" style="height:3px;background:#58a6ff;padding:0"></td></tr>`;
+        }}
+        prevClass2 = b.sm_class;
+        const cls = b.sm_class >= 0 ? `C${{b.sm_class}}` : '';
+        t += `<tr><td>${{cls}} SM${{b.sm_id}}</td>`;
         t += `<td>${{b.x_load.toFixed(2)}}</td>`;
         t += `<td>${{b.o_proj.toFixed(2)}}</td>`;
         t += `<td>${{b.gridsync1.toFixed(2)}}</td>`;
@@ -734,17 +775,32 @@ renderHeatmap(medianRunIdx);
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Profile fused o_proj+MLP kernel")
+    parser.add_argument("--gate-up-sms", type=int, default=0,
+                        help="Limit gate_up phase to N SMs (0 = all, baseline)")
+    parser.add_argument("-o", "--output", type=str, default=None,
+                        help="Output HTML path (default: auto-named in results/)")
+    args = parser.parse_args()
+
     device = torch.device("cuda:0")
     print(f"Device: {torch.cuda.get_device_name(device)}")
-    print("Running o_proj+post_attn+MLP profiler...")
 
-    all_profiles, num_sms = run_profile(device)
+    print("Probing SM classes...")
+    sm_result = hbm_latency_partition.probe_sm_classes(device=device)
+    sm_class_map = sm_result.sm_class_map
+    print(f"  Class 0: {len(sm_result.sm_class_0)} SMs, Class 1: {len(sm_result.sm_class_1)} SMs")
+
+    gu_label = f"gate_up_sms={args.gate_up_sms}" if args.gate_up_sms > 0 else "baseline"
+    print(f"Running o_proj+post_attn+MLP profiler ({gu_label})...")
+
+    all_profiles, num_sms = run_profile(device, gate_up_active_sms=args.gate_up_sms)
 
     print("Extracting per-block data...")
     block_data_runs = []
     effective_ghz_list = []
     for prof in all_profiles:
-        blocks, effective_ghz = extract_block_data(prof, num_sms)
+        blocks, effective_ghz = extract_block_data(prof, num_sms, sm_class_map)
         block_data_runs.append(blocks)
         effective_ghz_list.append(effective_ghz)
 
@@ -752,12 +808,17 @@ def main():
     print(f"Calibrated SM frequency: {median_ghz:.4f} GHz (median across {len(effective_ghz_list)} runs)")
 
     print("Computing summary...")
-    summary = compute_summary(all_profiles, num_sms)
+    summary = compute_summary(all_profiles, num_sms, gate_up_active_sms=args.gate_up_sms)
 
     print("Generating HTML...")
     html = generate_html(block_data_runs, summary, num_sms, median_ghz)
 
-    out_path = Path("results/oproj_mlp_profile_viz.html")
+    if args.output:
+        out_path = Path(args.output)
+    elif args.gate_up_sms > 0:
+        out_path = Path(f"results/oproj_mlp_profile_gateup_{args.gate_up_sms}sm.html")
+    else:
+        out_path = Path("results/oproj_mlp_profile_viz.html")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(html, encoding="utf-8")
     print(f"Saved: {out_path}")

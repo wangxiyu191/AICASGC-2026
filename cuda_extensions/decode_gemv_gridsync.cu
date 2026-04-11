@@ -54,7 +54,7 @@ enum PersistentProfileSlot : int {
 // O-proj + post-attn MLP persistent kernel profile slots
 // Slots 0-12: recorded with clock64() (SM cycle counter, ~0.7ns resolution)
 // Slots 13-14: recorded with globaltimer (1024ns quantization) for calibration
-constexpr int kOProjMlpProfileSlots = 15;
+constexpr int kOProjMlpProfileSlots = 16;
 enum OProjMlpProfileSlot : int {
     OP_KERNEL_START       = 0,
     OP_X_LOAD_DONE        = 1,
@@ -71,6 +71,7 @@ enum OProjMlpProfileSlot : int {
     OP_KERNEL_DONE        = 12,
     OP_GT_START           = 13,  // globaltimer at kernel start (calibration)
     OP_GT_END             = 14,  // globaltimer at kernel end (calibration)
+    OP_SM_ID              = 15,  // SM ID from %smid PTX register
 };
 
 __device__ __forceinline__ uint64_t read_globaltimer() {
@@ -957,7 +958,8 @@ __global__ void fused_o_proj_post_attn_mlp_persistent_profile_k2048_k6144_fwd_ke
     bool has_down_proj_bias,
     int64_t o_proj_stride_wn,
     int64_t gate_up_stride_wn,
-    int64_t down_proj_stride_wn) {
+    int64_t down_proj_stride_wn,
+    int gate_up_active_sms) {
     __shared__ __align__(16) __half residual_sh[kNosplitSpecializedK2048];
     __shared__ __align__(16) __half x_small_sh[kNosplitSpecializedK2048];
     __shared__ float warp_sums[kPersistentWarps];
@@ -985,6 +987,10 @@ __global__ void fused_o_proj_post_attn_mlp_persistent_profile_k2048_k6144_fwd_ke
                     OP_GT_START] = read_globaltimer();
             profile[static_cast<int64_t>(blockIdx.x) * kOProjMlpProfileSlots +
                     OP_KERNEL_START] = read_clock64();
+            unsigned int smid;
+            asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
+            profile[static_cast<int64_t>(blockIdx.x) * kOProjMlpProfileSlots +
+                    OP_SM_ID] = static_cast<uint64_t>(smid);
         }
     }
 
@@ -1096,51 +1102,56 @@ __global__ void fused_o_proj_post_attn_mlp_persistent_profile_k2048_k6144_fwd_ke
     }
 
     // Phase 2: gate_up GEMV + SiLU fusion
+    // gate_up_active_sms <= 0 means use all SMs (baseline).
     int gate_up_iter = 0;
-    for (int hidden_base = blockIdx.x * kPersistentWarps;
-         hidden_base < 6144;
-         hidden_base += gridDim.x * kPersistentWarps) {
-        const int hidden_idx = hidden_base + warp;
-        if (hidden_idx < 6144) {
-            const uint4* gate_row_vec = reinterpret_cast<const uint4*>(
-                gate_w_half + hidden_idx * gate_up_stride_wn);
-            const uint4* up_row_vec = reinterpret_cast<const uint4*>(
-                gate_w_half + (hidden_idx + 6144) * gate_up_stride_wn);
-            __half2 gate_acc0 = __float2half2_rn(0.0f);
-            __half2 gate_acc1 = __float2half2_rn(0.0f);
-            __half2 up_acc0 = __float2half2_rn(0.0f);
-            __half2 up_acc1 = __float2half2_rn(0.0f);
+    const int gu_sms = (gate_up_active_sms > 0 && gate_up_active_sms < static_cast<int>(gridDim.x))
+                        ? gate_up_active_sms : static_cast<int>(gridDim.x);
+    if (static_cast<int>(blockIdx.x) < gu_sms) {
+        for (int hidden_base = blockIdx.x * kPersistentWarps;
+             hidden_base < 6144;
+             hidden_base += gu_sms * kPersistentWarps) {
+            const int hidden_idx = hidden_base + warp;
+            if (hidden_idx < 6144) {
+                const uint4* gate_row_vec = reinterpret_cast<const uint4*>(
+                    gate_w_half + hidden_idx * gate_up_stride_wn);
+                const uint4* up_row_vec = reinterpret_cast<const uint4*>(
+                    gate_w_half + (hidden_idx + 6144) * gate_up_stride_wn);
+                __half2 gate_acc0 = __float2half2_rn(0.0f);
+                __half2 gate_acc1 = __float2half2_rn(0.0f);
+                __half2 up_acc0 = __float2half2_rn(0.0f);
+                __half2 up_acc1 = __float2half2_rn(0.0f);
 
-            #pragma unroll
-            for (int vec_idx = lane; vec_idx < vecs_k2048; vec_idx += 64) {
-                const uint4 x_vec0 = x_small_vec[vec_idx];
-                const uint4 x_vec1 = x_small_vec[vec_idx + 32];
-                accumulate_hfma2_uint4(x_vec0, gate_row_vec[vec_idx], gate_acc0);
-                accumulate_hfma2_uint4(x_vec1, gate_row_vec[vec_idx + 32], gate_acc1);
-                accumulate_hfma2_uint4(x_vec0, up_row_vec[vec_idx], up_acc0);
-                accumulate_hfma2_uint4(x_vec1, up_row_vec[vec_idx + 32], up_acc1);
-            }
+                #pragma unroll
+                for (int vec_idx = lane; vec_idx < vecs_k2048; vec_idx += 64) {
+                    const uint4 x_vec0 = x_small_vec[vec_idx];
+                    const uint4 x_vec1 = x_small_vec[vec_idx + 32];
+                    accumulate_hfma2_uint4(x_vec0, gate_row_vec[vec_idx], gate_acc0);
+                    accumulate_hfma2_uint4(x_vec1, gate_row_vec[vec_idx + 32], gate_acc1);
+                    accumulate_hfma2_uint4(x_vec0, up_row_vec[vec_idx], up_acc0);
+                    accumulate_hfma2_uint4(x_vec1, up_row_vec[vec_idx + 32], up_acc1);
+                }
 
-            const float2 gate_f0 = __half22float2(gate_acc0);
-            const float2 gate_f1 = __half22float2(gate_acc1);
-            const float2 up_f0 = __half22float2(up_acc0);
-            const float2 up_f1 = __half22float2(up_acc1);
-            float gate_sum = gate_f0.x + gate_f0.y + gate_f1.x + gate_f1.y;
-            float up_sum = up_f0.x + up_f0.y + up_f1.x + up_f1.y;
-            gate_sum = warp_sum(gate_sum);
-            up_sum = warp_sum(up_sum);
-            if (lane == 0) {
-                hidden_half[hidden_idx] =
-                    __float2half(gate_sum / (1.0f + __expf(-gate_sum)) * up_sum);
+                const float2 gate_f0 = __half22float2(gate_acc0);
+                const float2 gate_f1 = __half22float2(gate_acc1);
+                const float2 up_f0 = __half22float2(up_acc0);
+                const float2 up_f1 = __half22float2(up_acc1);
+                float gate_sum = gate_f0.x + gate_f0.y + gate_f1.x + gate_f1.y;
+                float up_sum = up_f0.x + up_f0.y + up_f1.x + up_f1.y;
+                gate_sum = warp_sum(gate_sum);
+                up_sum = warp_sum(up_sum);
+                if (lane == 0) {
+                    hidden_half[hidden_idx] =
+                        __float2half(gate_sum / (1.0f + __expf(-gate_sum)) * up_sum);
+                }
             }
-        }
-        if constexpr (kProfile) {
-            if (threadIdx.x == 0 && profile != nullptr) {
-                profile[static_cast<int64_t>(blockIdx.x) * kOProjMlpProfileSlots +
-                        OP_GATEUP_ITER0_DONE + gate_up_iter] = read_clock64();
+            if constexpr (kProfile) {
+                if (threadIdx.x == 0 && profile != nullptr) {
+                    profile[static_cast<int64_t>(blockIdx.x) * kOProjMlpProfileSlots +
+                            OP_GATEUP_ITER0_DONE + gate_up_iter] = read_clock64();
+                }
             }
+            ++gate_up_iter;
         }
-        ++gate_up_iter;
     }
 
     if constexpr (kProfile) {
@@ -2237,7 +2248,8 @@ torch::Tensor fused_o_proj_post_attn_mlp_persistent_profile_half_cuda(
     const torch::Tensor& profile,
     double eps,
     bool has_o_proj_bias,
-    bool has_down_proj_bias) {
+    bool has_down_proj_bias,
+    int64_t gate_up_active_sms) {
     TORCH_CHECK(
         residual.is_cuda() && attn_input.is_cuda() && o_proj_weight.is_cuda()
             && norm_weight.is_cuda() && gate_up_weight.is_cuda()
@@ -2301,11 +2313,13 @@ torch::Tensor fused_o_proj_post_attn_mlp_persistent_profile_half_cuda(
     int64_t o_s0 = o_proj_weight.stride(0);
     int64_t gu_s0 = gate_up_weight.stride(0);
     int64_t dp_s0 = down_proj_weight.stride(0);
+    int gu_active_sms = static_cast<int>(gate_up_active_sms);
 
     void* args[] = {
         &residual_ptr, &attn_ptr, &o_w_ptr, &o_b_ptr, &norm_ptr,
         &gu_ptr, &dp_ptr, &dp_b_ptr, &h_ptr, &o_ptr, &p_ptr,
         &eps_f, &has_o_proj_bias, &has_down_proj_bias, &o_s0, &gu_s0, &dp_s0,
+        &gu_active_sms,
     };
 
     C10_CUDA_CHECK(cudaLaunchCooperativeKernel(

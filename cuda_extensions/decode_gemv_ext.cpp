@@ -329,7 +329,8 @@ torch::Tensor fused_o_proj_post_attn_mlp_persistent_profile_half_cuda(
     const torch::Tensor& profile,
     double eps,
     bool has_o_proj_bias,
-    bool has_down_proj_bias);
+    bool has_down_proj_bias,
+    int64_t gate_up_active_sms);
 
 torch::Tensor fused_gateup_silu_downproj_persistent_half_cuda(
     const torch::Tensor& x,
@@ -892,7 +893,8 @@ torch::Tensor fused_o_proj_post_attn_mlp_persistent_profile_half(
     const torch::Tensor& profile,
     double eps,
     bool has_o_proj_bias,
-    bool has_down_proj_bias) {
+    bool has_down_proj_bias,
+    int64_t gate_up_active_sms) {
     return fused_o_proj_post_attn_mlp_persistent_profile_half_cuda(
         residual,
         attn_input,
@@ -907,7 +909,8 @@ torch::Tensor fused_o_proj_post_attn_mlp_persistent_profile_half(
         profile,
         eps,
         has_o_proj_bias,
-        has_down_proj_bias);
+        has_down_proj_bias,
+        gate_up_active_sms);
 }
 
 torch::Tensor fused_gateup_silu_downproj_persistent_profile_half(
