@@ -302,12 +302,17 @@ class OptimizedDecoderLayer(nn.Module):
                     prefer_small_triton=prefer_small_decode_triton,
                 )
                 if fused_down_proj is None:
-                    gate, up = gate_up.chunk(2, dim=-1)
-                    hidden_states = _fused_silu_mul(
-                        gate,
-                        up,
+                    hidden_states = _fused_silu_mul_packed(
+                        gate_up,
                         prefer_small_triton=prefer_small_decode_triton,
                     )
+                    if hidden_states is None:
+                        gate, up = gate_up.chunk(2, dim=-1)
+                        hidden_states = _fused_silu_mul(
+                            gate,
+                            up,
+                            prefer_small_triton=prefer_small_decode_triton,
+                        )
                 else:
                     hidden_states = fused_down_proj
             else:
@@ -935,6 +940,50 @@ def _fused_silu_mul(
         BLOCK=BLOCK,
     )
     return out_flat.view_as(gate)
+
+
+def _fused_silu_mul_packed(
+    gate_up: torch.Tensor,
+    prefer_small_triton: bool = False,
+) -> torch.Tensor | None:
+    """SiLU(gate) * up from packed [gate||up] tensor, avoiding chunk copies.
+
+    Returns None when conditions aren't met (caller falls back to chunk path).
+    """
+    allow_triton = (
+        (
+            prefer_small_triton
+            and _ENABLE_TRITON_SMALL_SILU_MUL
+        )
+        or (
+            (not prefer_small_triton)
+            and _ENABLE_TRITON_PREFILL_FUSED_SILU_MUL
+        )
+    )
+    if (
+        (not allow_triton)
+        or gate_up.device.type != "cuda"
+        or gate_up.stride(-1) != 1
+        or gate_up.shape[-1] % 2 != 0
+    ):
+        return None
+
+    orig_shape = gate_up.shape
+    N = orig_shape[-1] // 2  # intermediate_size
+    M = gate_up.numel() // orig_shape[-1]
+    gate_up_2d = gate_up.reshape(M, orig_shape[-1])
+    out = torch.empty((M, N), dtype=gate_up.dtype, device=gate_up.device)
+    BLOCK = 1024
+    _fused_silu_mul_packed_fwd_kernel[(M,)](
+        gate_up_2d,
+        out,
+        M,
+        N,
+        gate_up_2d.stride(0),
+        out.stride(0),
+        BLOCK=BLOCK,
+    )
+    return out.view(*orig_shape[:-1], N)
 
 
 def _fused_silu_downproj(
@@ -1979,6 +2028,31 @@ def _fused_qk_rms_norm_rope_fwd_kernel(
         qn1 = (q1 * q_rstd * qw1).to(Q_OUT.dtype.element_ty).to(tl.float32)
         tl.store(Q_OUT + m * stride_q_m + q_h * stride_q_h + rk, (qn0 * cos - qn1 * sin).to(Q_OUT.dtype.element_ty), mask=mask_half)
         tl.store(Q_OUT + m * stride_q_m + q_h * stride_q_h + HALF_D + rk, (qn1 * cos + qn0 * sin).to(Q_OUT.dtype.element_ty), mask=mask_half)
+
+
+@triton.jit
+def _fused_silu_mul_packed_fwd_kernel(
+    GATE_UP,        # [M, 2*N] packed gate||up tensor (contiguous)
+    OUT,            # [M, N] output tensor
+    M,
+    N,              # half width (intermediate_size)
+    stride_gu_m,    # GATE_UP.stride(0)
+    stride_out_m,   # OUT.stride(0)
+    BLOCK: tl.constexpr,
+):
+    """Compute SiLU(gate) * up from packed [gate||up] without chunk copies."""
+    pid = tl.program_id(0)
+    # Each program handles one row
+    row = pid
+    if row >= M:
+        return
+    for start in range(0, N, BLOCK):
+        offsets = start + tl.arange(0, BLOCK)
+        mask = offsets < N
+        gate = tl.load(GATE_UP + row * stride_gu_m + offsets, mask=mask, other=0.0).to(tl.float32)
+        up = tl.load(GATE_UP + row * stride_gu_m + N + offsets, mask=mask, other=0.0).to(tl.float32)
+        silu = gate / (1.0 + tl.exp(-gate))
+        tl.store(OUT + row * stride_out_m + offsets, (silu * up).to(OUT.dtype.element_ty), mask=mask)
 
 
 @triton.jit
