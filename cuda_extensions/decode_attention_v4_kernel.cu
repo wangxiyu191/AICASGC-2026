@@ -272,7 +272,8 @@ torch::Tensor decode_attn_v4_splitkv_cuda(
     const torch::Tensor& partial_acc,
     const torch::Tensor& partial_stats,
     const torch::Tensor& out,
-    int64_t num_kv_groups) {
+    int64_t num_kv_groups,
+    int64_t split_k) {
 
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "inputs must be CUDA");
     TORCH_CHECK(q.scalar_type() == torch::kHalf, "only float16");
@@ -280,8 +281,10 @@ torch::Tensor decode_attn_v4_splitkv_cuda(
     TORCH_CHECK(q.size(3) == kHeadDim, "head_dim must be 128");
 
     const int64_t num_kv_heads = k.size(1);
-    const int64_t split_k     = partial_acc.size(1);
     const int64_t max_seq_len = k.size(2);
+    TORCH_CHECK(split_k > 1, "split_k must be > 1");
+    TORCH_CHECK(split_k <= partial_acc.size(1), "split_k exceeds partial_acc capacity");
+    TORCH_CHECK(split_k <= partial_stats.size(1), "split_k exceeds partial_stats capacity");
 
     c10::cuda::CUDAGuard device_guard(q.device());
     auto stream = at::cuda::getCurrentCUDAStream();

@@ -87,7 +87,7 @@ class OptimizedDecoderLayer(nn.Module):
         )
         self._prefer_small_decode_triton = False
         self._splitkv_workspace = None
-        if _ENABLE_TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV:
+        if _decode_attention_needs_splitkv_workspace():
             self._ensure_splitkv_workspace()
 
     def forward(
@@ -433,6 +433,7 @@ _ENABLE_CUDA_FUSED_QK_NORM_ROPE = os.environ.get("ENABLE_CUDA_FUSED_QK_NORM_ROPE
 _ENABLE_TRITON_SMALL_DECODE_ATTENTION = os.environ.get("ENABLE_TRITON_SMALL_DECODE_ATTENTION", "1") == "1"
 _ENABLE_TRITON_SMALL_DECODE_ATTENTION_DOT = os.environ.get("ENABLE_TRITON_SMALL_DECODE_ATTENTION_DOT", "1") == "1"
 _ENABLE_TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV = os.environ.get("ENABLE_TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV", "1") == "1"
+_ENABLE_CUDA_SMALL_DECODE_ATTENTION_V4 = os.environ.get("ENABLE_CUDA_SMALL_DECODE_ATTENTION_V4", "1") == "1"
 _ENABLE_CUDA_PERSISTENT_ATTENTION = os.environ.get("ENABLE_CUDA_PERSISTENT_ATTENTION", "0") == "1"
 _TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_SPLIT_K = int(os.environ.get("TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_SPLIT_K", "0"))
 _TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_BLOCK_N = int(os.environ.get("TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_BLOCK_N", "0"))
@@ -460,6 +461,10 @@ def _nvtx_range(name: str, enabled: bool):
                 torch.cuda.nvtx.range_pop()
         return
     yield
+
+
+def _decode_attention_needs_splitkv_workspace() -> bool:
+    return _ENABLE_TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV or _ENABLE_CUDA_SMALL_DECODE_ATTENTION_V4
 
 
 def _should_enable_decode_nvtx(hidden_states: torch.Tensor, past_key_values) -> bool:
@@ -1539,6 +1544,32 @@ def _small_decode_attention(
         )
         return out
 
+    if (
+        _ENABLE_CUDA_SMALL_DECODE_ATTENTION_V4
+        and prefer_small_triton
+        and cache_position is not None
+        and cache_position.device.type == "cuda"
+        and cache_position.ndim == 1
+        and cache_position.numel() == 1
+        and q.dtype == torch.float16
+        and k.dtype == torch.float16
+        and v.dtype == torch.float16
+        and q.shape[-1] == 128
+        and num_key_value_groups == 2
+    ):
+        import cuda_decode_attention
+        out = cuda_decode_attention.decode_attn_v4_splitkv(
+            q,
+            k,
+            v,
+            scaling,
+            num_key_value_groups,
+            cache_position,
+            workspace=splitkv_workspace,
+        )
+        if out is not None:
+            return out
+
     out = _small_decode_attention_grouped_prefix_cachepos_splitkv(
         q,
         k,
@@ -1938,7 +1969,7 @@ def _small_decode_attention_grouped_prefix_cachepos_splitkv(
 
     if (
         workspace is not None
-        and workspace.get("split_k") == split_k
+        and workspace.get("split_k", 0) >= split_k
         and workspace["partial_acc"].device == q.device
         and workspace["out"].dtype == q.dtype
     ):
@@ -2028,8 +2059,12 @@ def _small_decode_attention_grouped_prefix_cachepos_splitkv_launch_config(seq_le
 
 
 def _default_splitkv_workspace_split_k() -> int:
+    if _ENABLE_CUDA_SMALL_DECODE_ATTENTION_V4:
+        return 32
     if _TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_SPLIT_K > 0:
         return _TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_SPLIT_K
+    if _ENABLE_TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV:
+        return 8
     return 4
 
 
@@ -2944,7 +2979,7 @@ def set_small_decode_triton_enabled(model, enabled: bool) -> bool:
         if isinstance(layer, OptimizedDecoderLayer):
             previous = layer._prefer_small_decode_triton
             layer._prefer_small_decode_triton = enabled
-            if enabled and _ENABLE_TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV:
+            if enabled and _decode_attention_needs_splitkv_workspace():
                 layer._ensure_splitkv_workspace()
     return previous
 

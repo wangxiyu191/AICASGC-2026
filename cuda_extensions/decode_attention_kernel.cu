@@ -311,7 +311,8 @@ torch::Tensor grouped_prefix_cachepos_splitkv_cuda(
     double scale,
     const torch::Tensor& partial_acc,
     const torch::Tensor& partial_stats,
-    const torch::Tensor& out) {
+    const torch::Tensor& out,
+    int64_t split_k) {
     TORCH_CHECK(q.is_cuda(), "q must be CUDA");
     TORCH_CHECK(k.is_cuda(), "k must be CUDA");
     TORCH_CHECK(v.is_cuda(), "v must be CUDA");
@@ -327,7 +328,9 @@ torch::Tensor grouped_prefix_cachepos_splitkv_cuda(
     TORCH_CHECK(partial_stats.scalar_type() == torch::kFloat32, "partial_stats must be float32");
     TORCH_CHECK(out.scalar_type() == q.scalar_type(), "out dtype mismatch");
 
-    const int64_t split_k = partial_acc.size(1);
+    TORCH_CHECK(split_k > 1, "split_k must be > 1");
+    TORCH_CHECK(split_k <= partial_acc.size(1), "split_k exceeds partial_acc capacity");
+    TORCH_CHECK(split_k <= partial_stats.size(1), "split_k exceeds partial_stats capacity");
     const int64_t head_dim = q.size(3);
     const int64_t max_seq_len = k.size(2);
     const int64_t num_kv_heads = k.size(1);
@@ -405,7 +408,8 @@ torch::Tensor grouped_prefix_cachepos_splitkv_qhead_cuda(
     double scale,
     const torch::Tensor& partial_acc,
     const torch::Tensor& partial_stats,
-    const torch::Tensor& out) {
+    const torch::Tensor& out,
+    int64_t split_k) {
     TORCH_CHECK(q.is_cuda(), "q must be CUDA");
     TORCH_CHECK(k.is_cuda(), "k must be CUDA");
     TORCH_CHECK(v.is_cuda(), "v must be CUDA");
@@ -421,7 +425,9 @@ torch::Tensor grouped_prefix_cachepos_splitkv_qhead_cuda(
     TORCH_CHECK(partial_stats.scalar_type() == torch::kFloat32, "partial_stats must be float32");
     TORCH_CHECK(out.scalar_type() == q.scalar_type(), "out dtype mismatch");
 
-    const int64_t split_k = partial_acc.size(1);
+    TORCH_CHECK(split_k > 1, "split_k must be > 1");
+    TORCH_CHECK(split_k <= partial_acc.size(1), "split_k exceeds partial_acc capacity");
+    TORCH_CHECK(split_k <= partial_stats.size(1), "split_k exceeds partial_stats capacity");
     const int64_t head_dim = q.size(3);
     const int64_t max_seq_len = k.size(2);
     const int64_t num_heads = q.size(1);

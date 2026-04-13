@@ -17,6 +17,12 @@ import torch
 _ROOT = Path(__file__).resolve().parent
 _SRC_DIR = _ROOT / "cuda_extensions"
 _MODULE_NAME = "cuda_decode_attention_ext"
+_BUILD_SOURCES = (
+    _SRC_DIR / "setup.py",
+    _SRC_DIR / "decode_attention_ext.cpp",
+    _SRC_DIR / "decode_attention_kernel.cu",
+    _SRC_DIR / "decode_attention_v4_kernel.cu",
+)
 
 
 def _find_prebuilt_ext() -> Path | None:
@@ -27,11 +33,18 @@ def _find_prebuilt_ext() -> Path | None:
     return None
 
 
+def _needs_rebuild(prebuilt_ext: Path | None) -> bool:
+    if prebuilt_ext is None:
+        return True
+    ext_mtime = prebuilt_ext.stat().st_mtime
+    return any(src.exists() and src.stat().st_mtime > ext_mtime for src in _BUILD_SOURCES)
+
+
 @lru_cache(maxsize=1)
 def _load_ext():
     os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.0")
     prebuilt_ext = _find_prebuilt_ext()
-    if prebuilt_ext is None:
+    if _needs_rebuild(prebuilt_ext):
         env = dict(os.environ)
         env.setdefault("TORCH_CUDA_ARCH_LIST", "8.0")
         env["PATH"] = f"/usr/local/cuda/bin:{env.get('PATH', '')}"
@@ -106,9 +119,11 @@ def grouped_prefix_cachepos_splitkv(
     )
     if (
         workspace is not None
-        and workspace.get("split_k") == split_k
-        and tuple(workspace["partial_acc"].shape) == layout["partial_acc_shape"]
-        and tuple(workspace["partial_stats"].shape) == layout["partial_stats_shape"]
+        and workspace.get("split_k", 0) >= split_k
+        and workspace["partial_acc"].shape[0] == layout["partial_acc_shape"][0]
+        and workspace["partial_acc"].shape[2:] == layout["partial_acc_shape"][2:]
+        and workspace["partial_stats"].shape[0] == layout["partial_stats_shape"][0]
+        and workspace["partial_stats"].shape[2:] == layout["partial_stats_shape"][2:]
         and tuple(workspace["out"].shape) == layout["out_shape"]
         and workspace["out"].dtype == q.dtype
         and workspace["partial_acc"].device == q.device
@@ -131,6 +146,7 @@ def grouped_prefix_cachepos_splitkv(
         partial_acc,
         partial_stats,
         out,
+        int(split_k),
     )
     return out.unsqueeze(2).transpose(1, 2)
 
@@ -165,9 +181,11 @@ def grouped_prefix_cachepos_splitkv_qhead(
     )
     if (
         workspace is not None
-        and workspace.get("split_k") == split_k
-        and tuple(workspace["partial_acc"].shape) == layout["partial_acc_shape"]
-        and tuple(workspace["partial_stats"].shape) == layout["partial_stats_shape"]
+        and workspace.get("split_k", 0) >= split_k
+        and workspace["partial_acc"].shape[0] == layout["partial_acc_shape"][0]
+        and workspace["partial_acc"].shape[2:] == layout["partial_acc_shape"][2:]
+        and workspace["partial_stats"].shape[0] == layout["partial_stats_shape"][0]
+        and workspace["partial_stats"].shape[2:] == layout["partial_stats_shape"][2:]
         and tuple(workspace["out"].shape) == layout["out_shape"]
         and workspace["out"].dtype == q.dtype
         and workspace["partial_acc"].device == q.device
@@ -190,6 +208,7 @@ def grouped_prefix_cachepos_splitkv_qhead(
         partial_acc,
         partial_stats,
         out,
+        int(split_k),
     )
     return out.unsqueeze(2).transpose(1, 2)
 
@@ -240,9 +259,11 @@ def decode_attn_v4_splitkv(
     )
     if (
         workspace is not None
-        and workspace.get("split_k") == split_k
-        and tuple(workspace["partial_acc"].shape) == layout["partial_acc_shape"]
-        and tuple(workspace["partial_stats"].shape) == layout["partial_stats_shape"]
+        and workspace.get("split_k", 0) >= split_k
+        and workspace["partial_acc"].shape[0] == layout["partial_acc_shape"][0]
+        and workspace["partial_acc"].shape[2:] == layout["partial_acc_shape"][2:]
+        and workspace["partial_stats"].shape[0] == layout["partial_stats_shape"][0]
+        and workspace["partial_stats"].shape[2:] == layout["partial_stats_shape"][2:]
         and tuple(workspace["out"].shape) == layout["out_shape"]
         and workspace["out"].dtype == q.dtype
         and workspace["partial_acc"].device == q.device
@@ -261,5 +282,6 @@ def decode_attn_v4_splitkv(
         float(scaling),
         partial_acc, partial_stats, out,
         int(num_key_value_groups),
+        int(split_k),
     )
     return out.unsqueeze(2).transpose(1, 2)
