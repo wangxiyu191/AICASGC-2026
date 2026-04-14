@@ -120,6 +120,34 @@ __device__ __forceinline__ void cp_async_wait_group() {
     asm volatile("cp.async.wait_group %0;" :: "n"(N));
 }
 
+struct AtomicGridSync {
+    unsigned int* counter;
+    unsigned int* generation;
+    unsigned int nblocks;
+    unsigned int* local_gen;
+
+    __device__ __forceinline__ void sync() const {
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            const unsigned int my_gen = *local_gen;
+            asm volatile("fence.acq_rel.gpu;" ::: "memory");
+            const unsigned int arrived = atomicAdd(counter, 1u);
+            if (arrived == nblocks - 1) {
+                *counter = 0;
+                asm volatile("fence.acq_rel.gpu;" ::: "memory");
+                atomicAdd(generation, 1u);
+            } else {
+                volatile unsigned int* vgen =
+                    reinterpret_cast<volatile unsigned int*>(generation);
+                while (*vgen <= my_gen) {
+                }
+            }
+            *local_gen = my_gen + 1;
+        }
+        __syncthreads();
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Non-profile kernel
 // ---------------------------------------------------------------------------
@@ -1162,6 +1190,620 @@ __global__ void fused_o_proj_post_attn_mlp_persistent_profile_k2048_k6144_fwd_ke
     }
 
     cg::this_grid().sync();
+
+    if constexpr (kProfile) {
+        if (threadIdx.x == 0 && profile != nullptr) {
+            profile[static_cast<int64_t>(blockIdx.x) * kOProjMlpProfileSlots +
+                    OP_GRIDSYNC2_DONE] = read_clock64();
+        }
+    }
+
+    // Phase 3: down_proj GEMV
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    constexpr bool kUseCpAsync = true;
+#else
+    constexpr bool kUseCpAsync = false;
+#endif
+
+    const int row = blockIdx.x * kPersistentWarps + warp;
+
+    for (int vec_idx = threadIdx.x; vec_idx < kAsyncVecsPerTileK6144;
+         vec_idx += kPersistentThreads) {
+        if constexpr (kUseCpAsync) {
+            cp_async_cg_16(&x_tile_sh[0][vec_idx],
+                           reinterpret_cast<const uint4*>(hidden_half) + vec_idx);
+        } else {
+            x_tile_sh[0][vec_idx] =
+                reinterpret_cast<const uint4*>(hidden_half)[vec_idx];
+        }
+    }
+    if constexpr (kUseCpAsync) {
+        cp_async_commit_group();
+        cp_async_wait_group<0>();
+    }
+    __syncthreads();
+
+    if constexpr (kProfile) {
+        if (threadIdx.x == 0 && profile != nullptr) {
+            profile[static_cast<int64_t>(blockIdx.x) * kOProjMlpProfileSlots +
+                    OP_DOWN_HIDDEN_LOADED] = read_clock64();
+        }
+    }
+
+    float sum = 0.0f;
+    #pragma unroll
+    for (int tile_idx = 0; tile_idx < 6; ++tile_idx) {
+        const int stage = tile_idx & 1;
+        const int tile_start = tile_idx * kNosplitAsyncTileK6144;
+
+        if (tile_idx + 1 < 6) {
+            const int next_tile_start = tile_start + kNosplitAsyncTileK6144;
+            const uint4* x_next_vec =
+                reinterpret_cast<const uint4*>(hidden_half + next_tile_start);
+            for (int vec_idx = threadIdx.x; vec_idx < kAsyncVecsPerTileK6144;
+                 vec_idx += kPersistentThreads) {
+                if constexpr (kUseCpAsync) {
+                    cp_async_cg_16(&x_tile_sh[stage ^ 1][vec_idx],
+                                   x_next_vec + vec_idx);
+                } else {
+                    x_tile_sh[stage ^ 1][vec_idx] = x_next_vec[vec_idx];
+                }
+            }
+            if constexpr (kUseCpAsync) {
+                cp_async_commit_group();
+            }
+        }
+
+        if (row < 2048) {
+            const uint4* x_sh_stage_vec = x_tile_sh[stage];
+            const uint4* w_row_vec = reinterpret_cast<const uint4*>(
+                down_w_half + row * down_proj_stride_wn + tile_start);
+            __half2 h2_acc0 = __float2half2_rn(0.0f);
+            __half2 h2_acc1 = __float2half2_rn(0.0f);
+
+            #pragma unroll
+            for (int vec_idx = lane; vec_idx < kAsyncVecsPerTileK6144;
+                 vec_idx += 64) {
+                const uint4 x_vec0 = x_sh_stage_vec[vec_idx];
+                const uint4 w_vec0 = w_row_vec[vec_idx];
+                const uint4 x_vec1 = x_sh_stage_vec[vec_idx + 32];
+                const uint4 w_vec1 = w_row_vec[vec_idx + 32];
+                accumulate_hfma2_uint4(x_vec0, w_vec0, h2_acc0);
+                accumulate_hfma2_uint4(x_vec1, w_vec1, h2_acc1);
+            }
+
+            const float2 f2_0 = __half22float2(h2_acc0);
+            const float2 f2_1 = __half22float2(h2_acc1);
+            sum += f2_0.x + f2_0.y + f2_1.x + f2_1.y;
+        }
+
+        if constexpr (kUseCpAsync) {
+            if (tile_idx + 1 < 6) {
+                cp_async_wait_group<0>();
+            }
+        }
+        __syncthreads();
+    }
+
+    if (row < 2048) {
+        sum = warp_sum(sum);
+        if (lane == 0) {
+            float result = sum + __half2float(residual_sh[row]);
+            if (has_down_proj_bias) {
+                result += __half2float(down_bias_half[row]);
+            }
+            out_half[row] = __float2half(result);
+        }
+    }
+
+    if constexpr (kProfile) {
+        if (threadIdx.x == 0 && profile != nullptr) {
+            profile[static_cast<int64_t>(blockIdx.x) * kOProjMlpProfileSlots +
+                    OP_DOWN_COMPUTE_DONE] = read_clock64();
+            profile[static_cast<int64_t>(blockIdx.x) * kOProjMlpProfileSlots +
+                    OP_KERNEL_DONE] = read_clock64();
+            profile[static_cast<int64_t>(blockIdx.x) * kOProjMlpProfileSlots +
+                    OP_GT_END] = read_globaltimer();
+        }
+    }
+}
+
+__launch_bounds__(1024, 1)
+__global__ void fused_o_proj_post_attn_mlp_softsync_k2048_k6144_fwd_kernel(
+    const at::Half* __restrict__ residual,
+    const at::Half* __restrict__ attn_input,
+    const at::Half* __restrict__ o_proj_weight,
+    const at::Half* __restrict__ o_proj_bias,
+    const at::Half* __restrict__ norm_weight,
+    const at::Half* __restrict__ gate_up_weight,
+    const at::Half* __restrict__ down_proj_weight,
+    const at::Half* __restrict__ down_proj_bias,
+    unsigned int* __restrict__ barrier_count,
+    unsigned int* __restrict__ barrier_generation,
+    at::Half* __restrict__ hidden_out,
+    at::Half* __restrict__ out,
+    float eps,
+    bool has_o_proj_bias,
+    bool has_down_proj_bias,
+    int64_t o_proj_stride_wn,
+    int64_t gate_up_stride_wn,
+    int64_t down_proj_stride_wn,
+    int gate_up_active_sms) {
+    __shared__ __align__(16) __half residual_sh[kNosplitSpecializedK2048];
+    __shared__ __align__(16) __half x_small_sh[kNosplitSpecializedK2048];
+    __shared__ float warp_sums[kPersistentWarps];
+    __shared__ float inv_rms_sh;
+    __shared__ __align__(16) uint4 x_tile_sh[2][kAsyncVecsPerTileK6144];
+    __shared__ unsigned int local_gen_sh;
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const __half* residual_half = reinterpret_cast<const __half*>(residual);
+    const __half* attn_half = reinterpret_cast<const __half*>(attn_input);
+    const __half* o_w_half = reinterpret_cast<const __half*>(o_proj_weight);
+    const __half* o_bias_half = reinterpret_cast<const __half*>(o_proj_bias);
+    const __half* norm_half = reinterpret_cast<const __half*>(norm_weight);
+    const __half* gate_w_half = reinterpret_cast<const __half*>(gate_up_weight);
+    const __half* down_w_half = reinterpret_cast<const __half*>(down_proj_weight);
+    const __half* down_bias_half = reinterpret_cast<const __half*>(down_proj_bias);
+    __half* hidden_half = reinterpret_cast<__half*>(hidden_out);
+    __half* out_half = reinterpret_cast<__half*>(out);
+    uint4* x_small_vec = reinterpret_cast<uint4*>(x_small_sh);
+    constexpr int vecs_k2048 = kNosplitSpecializedK2048 / kHalfPerVec128;  // 256
+
+    if (threadIdx.x == 0) {
+        local_gen_sh = barrier_generation[0];
+    }
+    __syncthreads();
+
+    AtomicGridSync grid_sync{
+        barrier_count,
+        barrier_generation,
+        static_cast<unsigned int>(gridDim.x),
+        &local_gen_sh,
+    };
+
+    for (int idx = threadIdx.x; idx < vecs_k2048; idx += kPersistentThreads) {
+        x_small_vec[idx] = reinterpret_cast<const uint4*>(attn_half)[idx];
+    }
+    __syncthreads();
+
+    // Phase 0: o_proj GEMV. Materialize to hidden_out[0:2048] as scratch so
+    // every CTA can consume the same post-attention residual after sync.
+    for (int out_base = blockIdx.x * kPersistentWarps;
+         out_base < kNosplitSpecializedK2048;
+         out_base += gridDim.x * kPersistentWarps) {
+        const int out_idx = out_base + warp;
+        if (out_idx < kNosplitSpecializedK2048) {
+            const uint4* o_row_vec = reinterpret_cast<const uint4*>(
+                o_w_half + out_idx * o_proj_stride_wn);
+            __half2 acc0 = __float2half2_rn(0.0f);
+            __half2 acc1 = __float2half2_rn(0.0f);
+
+            #pragma unroll
+            for (int vec_idx = lane; vec_idx < vecs_k2048; vec_idx += 64) {
+                const uint4 x_vec0 = x_small_vec[vec_idx];
+                const uint4 x_vec1 = x_small_vec[vec_idx + 32];
+                accumulate_hfma2_uint4(x_vec0, o_row_vec[vec_idx], acc0);
+                accumulate_hfma2_uint4(x_vec1, o_row_vec[vec_idx + 32], acc1);
+            }
+
+            const float2 f0 = __half22float2(acc0);
+            const float2 f1 = __half22float2(acc1);
+            float sum = f0.x + f0.y + f1.x + f1.y;
+            sum = warp_sum(sum);
+            if (lane == 0) {
+                if (has_o_proj_bias) {
+                    sum += __half2float(o_bias_half[out_idx]);
+                }
+                hidden_half[out_idx] = __float2half(sum);
+            }
+        }
+    }
+
+    grid_sync.sync();
+
+    // Phase 1: post-attn residual add + RMSNorm.
+    float thread_sum_sq = 0.0f;
+    for (int idx = threadIdx.x; idx < kNosplitSpecializedK2048; idx += kPersistentThreads) {
+        const float summed_f =
+            __half2float(residual_half[idx]) + __half2float(hidden_half[idx]);
+        residual_sh[idx] = __float2half(summed_f);
+        thread_sum_sq += summed_f * summed_f;
+    }
+
+    thread_sum_sq = warp_sum(thread_sum_sq);
+    if (lane == 0) {
+        warp_sums[warp] = thread_sum_sq;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        float block_sum_sq = lane < kPersistentWarps ? warp_sums[lane] : 0.0f;
+        block_sum_sq = warp_sum(block_sum_sq);
+        if (lane == 0) {
+            inv_rms_sh = rsqrtf(
+                block_sum_sq / static_cast<float>(kNosplitSpecializedK2048) + eps);
+        }
+    }
+    __syncthreads();
+
+    const float inv_rms = inv_rms_sh;
+    for (int idx = threadIdx.x; idx < kNosplitSpecializedK2048; idx += kPersistentThreads) {
+        const float summed_f = __half2float(residual_sh[idx]);
+        const float scale_f = __half2float(norm_half[idx]);
+        x_small_sh[idx] = __float2half(summed_f * inv_rms * scale_f);
+    }
+    __syncthreads();
+
+    // Phase 2: gate_up GEMV + SiLU fusion.
+    const int gu_sms = (gate_up_active_sms > 0 && gate_up_active_sms < static_cast<int>(gridDim.x))
+        ? gate_up_active_sms : static_cast<int>(gridDim.x);
+    if (static_cast<int>(blockIdx.x) < gu_sms) {
+        for (int hidden_base = blockIdx.x * kPersistentWarps;
+             hidden_base < 6144;
+             hidden_base += gu_sms * kPersistentWarps) {
+            const int hidden_idx = hidden_base + warp;
+            if (hidden_idx < 6144) {
+                const uint4* gate_row_vec = reinterpret_cast<const uint4*>(
+                    gate_w_half + hidden_idx * gate_up_stride_wn);
+                const uint4* up_row_vec = reinterpret_cast<const uint4*>(
+                    gate_w_half + (hidden_idx + 6144) * gate_up_stride_wn);
+                __half2 gate_acc0 = __float2half2_rn(0.0f);
+                __half2 gate_acc1 = __float2half2_rn(0.0f);
+                __half2 up_acc0 = __float2half2_rn(0.0f);
+                __half2 up_acc1 = __float2half2_rn(0.0f);
+
+                #pragma unroll
+                for (int vec_idx = lane; vec_idx < vecs_k2048; vec_idx += 64) {
+                    const uint4 x_vec0 = x_small_vec[vec_idx];
+                    const uint4 x_vec1 = x_small_vec[vec_idx + 32];
+                    accumulate_hfma2_uint4(x_vec0, gate_row_vec[vec_idx], gate_acc0);
+                    accumulate_hfma2_uint4(x_vec1, gate_row_vec[vec_idx + 32], gate_acc1);
+                    accumulate_hfma2_uint4(x_vec0, up_row_vec[vec_idx], up_acc0);
+                    accumulate_hfma2_uint4(x_vec1, up_row_vec[vec_idx + 32], up_acc1);
+                }
+
+                const float2 gate_f0 = __half22float2(gate_acc0);
+                const float2 gate_f1 = __half22float2(gate_acc1);
+                const float2 up_f0 = __half22float2(up_acc0);
+                const float2 up_f1 = __half22float2(up_acc1);
+                float gate_sum = gate_f0.x + gate_f0.y + gate_f1.x + gate_f1.y;
+                float up_sum = up_f0.x + up_f0.y + up_f1.x + up_f1.y;
+                gate_sum = warp_sum(gate_sum);
+                up_sum = warp_sum(up_sum);
+                if (lane == 0) {
+                    hidden_half[hidden_idx] =
+                        __float2half(gate_sum / (1.0f + __expf(-gate_sum)) * up_sum);
+                }
+            }
+        }
+    }
+
+    grid_sync.sync();
+
+    // Phase 3: down_proj GEMV from hidden_out[6144] + post-attn residual epilogue.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    constexpr bool kUseCpAsync = true;
+#else
+    constexpr bool kUseCpAsync = false;
+#endif
+
+    const int row = blockIdx.x * kPersistentWarps + warp;
+
+    for (int vec_idx = threadIdx.x; vec_idx < kAsyncVecsPerTileK6144;
+         vec_idx += kPersistentThreads) {
+        if constexpr (kUseCpAsync) {
+            cp_async_cg_16(&x_tile_sh[0][vec_idx],
+                           reinterpret_cast<const uint4*>(hidden_half) + vec_idx);
+        } else {
+            x_tile_sh[0][vec_idx] =
+                reinterpret_cast<const uint4*>(hidden_half)[vec_idx];
+        }
+    }
+    if constexpr (kUseCpAsync) {
+        cp_async_commit_group();
+        cp_async_wait_group<0>();
+    }
+    __syncthreads();
+
+    float sum = 0.0f;
+    #pragma unroll
+    for (int tile_idx = 0; tile_idx < 6; ++tile_idx) {
+        const int stage = tile_idx & 1;
+        const int tile_start = tile_idx * kNosplitAsyncTileK6144;
+
+        if (tile_idx + 1 < 6) {
+            const int next_tile_start = tile_start + kNosplitAsyncTileK6144;
+            const uint4* x_next_vec =
+                reinterpret_cast<const uint4*>(hidden_half + next_tile_start);
+            for (int vec_idx = threadIdx.x; vec_idx < kAsyncVecsPerTileK6144;
+                 vec_idx += kPersistentThreads) {
+                if constexpr (kUseCpAsync) {
+                    cp_async_cg_16(&x_tile_sh[stage ^ 1][vec_idx], x_next_vec + vec_idx);
+                } else {
+                    x_tile_sh[stage ^ 1][vec_idx] = x_next_vec[vec_idx];
+                }
+            }
+            if constexpr (kUseCpAsync) {
+                cp_async_commit_group();
+            }
+        }
+
+        if (row < 2048) {
+            const uint4* x_sh_stage_vec = x_tile_sh[stage];
+            const uint4* w_row_vec = reinterpret_cast<const uint4*>(
+                down_w_half + row * down_proj_stride_wn + tile_start);
+            __half2 h2_acc0 = __float2half2_rn(0.0f);
+            __half2 h2_acc1 = __float2half2_rn(0.0f);
+
+            #pragma unroll
+            for (int vec_idx = lane; vec_idx < kAsyncVecsPerTileK6144; vec_idx += 64) {
+                const uint4 x_vec0 = x_sh_stage_vec[vec_idx];
+                const uint4 w_vec0 = w_row_vec[vec_idx];
+                const uint4 x_vec1 = x_sh_stage_vec[vec_idx + 32];
+                const uint4 w_vec1 = w_row_vec[vec_idx + 32];
+                accumulate_hfma2_uint4(x_vec0, w_vec0, h2_acc0);
+                accumulate_hfma2_uint4(x_vec1, w_vec1, h2_acc1);
+            }
+
+            const float2 f2_0 = __half22float2(h2_acc0);
+            const float2 f2_1 = __half22float2(h2_acc1);
+            sum += f2_0.x + f2_0.y + f2_1.x + f2_1.y;
+        }
+
+        if constexpr (kUseCpAsync) {
+            if (tile_idx + 1 < 6) {
+                cp_async_wait_group<0>();
+            }
+        }
+        __syncthreads();
+    }
+
+    if (row < 2048) {
+        sum = warp_sum(sum);
+        if (lane == 0) {
+            float result = sum + __half2float(residual_sh[row]);
+            if (has_down_proj_bias) {
+                result += __half2float(down_bias_half[row]);
+            }
+            out_half[row] = __float2half(result);
+        }
+    }
+}
+
+template <bool kProfile = false>
+__launch_bounds__(1024, 1)
+__global__ void fused_o_proj_post_attn_mlp_softsync_profile_k2048_k6144_fwd_kernel(
+    const at::Half* __restrict__ residual,
+    const at::Half* __restrict__ attn_input,
+    const at::Half* __restrict__ o_proj_weight,
+    const at::Half* __restrict__ o_proj_bias,
+    const at::Half* __restrict__ norm_weight,
+    const at::Half* __restrict__ gate_up_weight,
+    const at::Half* __restrict__ down_proj_weight,
+    const at::Half* __restrict__ down_proj_bias,
+    unsigned int* __restrict__ barrier_count,
+    unsigned int* __restrict__ barrier_generation,
+    at::Half* __restrict__ hidden_out,
+    at::Half* __restrict__ out,
+    uint64_t* __restrict__ profile,
+    float eps,
+    bool has_o_proj_bias,
+    bool has_down_proj_bias,
+    int64_t o_proj_stride_wn,
+    int64_t gate_up_stride_wn,
+    int64_t down_proj_stride_wn,
+    int gate_up_active_sms) {
+    __shared__ __align__(16) __half residual_sh[kNosplitSpecializedK2048];
+    __shared__ __align__(16) __half x_small_sh[kNosplitSpecializedK2048];
+    __shared__ float warp_sums[kPersistentWarps];
+    __shared__ float inv_rms_sh;
+    __shared__ __align__(16) uint4 x_tile_sh[2][kAsyncVecsPerTileK6144];
+    __shared__ unsigned int local_gen_sh;
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const __half* residual_half = reinterpret_cast<const __half*>(residual);
+    const __half* attn_half = reinterpret_cast<const __half*>(attn_input);
+    const __half* o_w_half = reinterpret_cast<const __half*>(o_proj_weight);
+    const __half* o_bias_half = reinterpret_cast<const __half*>(o_proj_bias);
+    const __half* norm_half = reinterpret_cast<const __half*>(norm_weight);
+    const __half* gate_w_half = reinterpret_cast<const __half*>(gate_up_weight);
+    const __half* down_w_half = reinterpret_cast<const __half*>(down_proj_weight);
+    const __half* down_bias_half = reinterpret_cast<const __half*>(down_proj_bias);
+    __half* hidden_half = reinterpret_cast<__half*>(hidden_out);
+    __half* out_half = reinterpret_cast<__half*>(out);
+    uint4* x_small_vec = reinterpret_cast<uint4*>(x_small_sh);
+    constexpr int vecs_k2048 = kNosplitSpecializedK2048 / kHalfPerVec128;  // 256
+
+    if (threadIdx.x == 0) {
+        local_gen_sh = barrier_generation[0];
+    }
+    __syncthreads();
+
+    AtomicGridSync grid_sync{
+        barrier_count,
+        barrier_generation,
+        static_cast<unsigned int>(gridDim.x),
+        &local_gen_sh,
+    };
+
+    if constexpr (kProfile) {
+        if (threadIdx.x == 0 && profile != nullptr) {
+            profile[static_cast<int64_t>(blockIdx.x) * kOProjMlpProfileSlots +
+                    OP_GT_START] = read_globaltimer();
+            profile[static_cast<int64_t>(blockIdx.x) * kOProjMlpProfileSlots +
+                    OP_KERNEL_START] = read_clock64();
+            unsigned int smid;
+            asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
+            profile[static_cast<int64_t>(blockIdx.x) * kOProjMlpProfileSlots +
+                    OP_SM_ID] = static_cast<uint64_t>(smid);
+        }
+    }
+
+    for (int idx = threadIdx.x; idx < vecs_k2048; idx += kPersistentThreads) {
+        x_small_vec[idx] = reinterpret_cast<const uint4*>(attn_half)[idx];
+    }
+    __syncthreads();
+
+    if constexpr (kProfile) {
+        if (threadIdx.x == 0 && profile != nullptr) {
+            profile[static_cast<int64_t>(blockIdx.x) * kOProjMlpProfileSlots +
+                    OP_X_LOAD_DONE] = read_clock64();
+        }
+    }
+
+    // Phase 0: o_proj GEMV
+    for (int out_base = blockIdx.x * kPersistentWarps;
+         out_base < kNosplitSpecializedK2048;
+         out_base += gridDim.x * kPersistentWarps) {
+        const int out_idx = out_base + warp;
+        if (out_idx < kNosplitSpecializedK2048) {
+            const uint4* o_row_vec = reinterpret_cast<const uint4*>(
+                o_w_half + out_idx * o_proj_stride_wn);
+            __half2 acc0 = __float2half2_rn(0.0f);
+            __half2 acc1 = __float2half2_rn(0.0f);
+
+            #pragma unroll
+            for (int vec_idx = lane; vec_idx < vecs_k2048; vec_idx += 64) {
+                const uint4 x_vec0 = x_small_vec[vec_idx];
+                const uint4 x_vec1 = x_small_vec[vec_idx + 32];
+                accumulate_hfma2_uint4(x_vec0, o_row_vec[vec_idx], acc0);
+                accumulate_hfma2_uint4(x_vec1, o_row_vec[vec_idx + 32], acc1);
+            }
+
+            const float2 f0 = __half22float2(acc0);
+            const float2 f1 = __half22float2(acc1);
+            float sum = f0.x + f0.y + f1.x + f1.y;
+            sum = warp_sum(sum);
+            if (lane == 0) {
+                if (has_o_proj_bias) {
+                    sum += __half2float(o_bias_half[out_idx]);
+                }
+                hidden_half[out_idx] = __float2half(sum);
+            }
+        }
+    }
+
+    if constexpr (kProfile) {
+        if (threadIdx.x == 0 && profile != nullptr) {
+            profile[static_cast<int64_t>(blockIdx.x) * kOProjMlpProfileSlots +
+                    OP_OPROJ_DONE] = read_clock64();
+            profile[static_cast<int64_t>(blockIdx.x) * kOProjMlpProfileSlots +
+                    OP_GRIDSYNC1_START] = read_clock64();
+        }
+    }
+
+    grid_sync.sync();
+
+    if constexpr (kProfile) {
+        if (threadIdx.x == 0 && profile != nullptr) {
+            profile[static_cast<int64_t>(blockIdx.x) * kOProjMlpProfileSlots +
+                    OP_GRIDSYNC1_DONE] = read_clock64();
+        }
+    }
+
+    // Phase 1: post-attn residual add + RMSNorm
+    float thread_sum_sq = 0.0f;
+    for (int idx = threadIdx.x; idx < kNosplitSpecializedK2048; idx += kPersistentThreads) {
+        const float summed_f =
+            __half2float(residual_half[idx]) + __half2float(hidden_half[idx]);
+        residual_sh[idx] = __float2half(summed_f);
+        thread_sum_sq += summed_f * summed_f;
+    }
+
+    thread_sum_sq = warp_sum(thread_sum_sq);
+    if (lane == 0) {
+        warp_sums[warp] = thread_sum_sq;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        float block_sum_sq = lane < kPersistentWarps ? warp_sums[lane] : 0.0f;
+        block_sum_sq = warp_sum(block_sum_sq);
+        if (lane == 0) {
+            inv_rms_sh = rsqrtf(
+                block_sum_sq / static_cast<float>(kNosplitSpecializedK2048) + eps);
+        }
+    }
+    __syncthreads();
+
+    const float inv_rms = inv_rms_sh;
+    for (int idx = threadIdx.x; idx < kNosplitSpecializedK2048; idx += kPersistentThreads) {
+        const float summed_f = __half2float(residual_sh[idx]);
+        const float scale_f = __half2float(norm_half[idx]);
+        x_small_sh[idx] = __float2half(summed_f * inv_rms * scale_f);
+    }
+    __syncthreads();
+
+    if constexpr (kProfile) {
+        if (threadIdx.x == 0 && profile != nullptr) {
+            profile[static_cast<int64_t>(blockIdx.x) * kOProjMlpProfileSlots +
+                    OP_RESNORM_DONE] = read_clock64();
+        }
+    }
+
+    // Phase 2: gate_up GEMV + SiLU fusion
+    int gate_up_iter = 0;
+    const int gu_sms = (gate_up_active_sms > 0 && gate_up_active_sms < static_cast<int>(gridDim.x))
+        ? gate_up_active_sms : static_cast<int>(gridDim.x);
+    if (static_cast<int>(blockIdx.x) < gu_sms) {
+        for (int hidden_base = blockIdx.x * kPersistentWarps;
+             hidden_base < 6144;
+             hidden_base += gu_sms * kPersistentWarps) {
+            const int hidden_idx = hidden_base + warp;
+            if (hidden_idx < 6144) {
+                const uint4* gate_row_vec = reinterpret_cast<const uint4*>(
+                    gate_w_half + hidden_idx * gate_up_stride_wn);
+                const uint4* up_row_vec = reinterpret_cast<const uint4*>(
+                    gate_w_half + (hidden_idx + 6144) * gate_up_stride_wn);
+                __half2 gate_acc0 = __float2half2_rn(0.0f);
+                __half2 gate_acc1 = __float2half2_rn(0.0f);
+                __half2 up_acc0 = __float2half2_rn(0.0f);
+                __half2 up_acc1 = __float2half2_rn(0.0f);
+
+                #pragma unroll
+                for (int vec_idx = lane; vec_idx < vecs_k2048; vec_idx += 64) {
+                    const uint4 x_vec0 = x_small_vec[vec_idx];
+                    const uint4 x_vec1 = x_small_vec[vec_idx + 32];
+                    accumulate_hfma2_uint4(x_vec0, gate_row_vec[vec_idx], gate_acc0);
+                    accumulate_hfma2_uint4(x_vec1, gate_row_vec[vec_idx + 32], gate_acc1);
+                    accumulate_hfma2_uint4(x_vec0, up_row_vec[vec_idx], up_acc0);
+                    accumulate_hfma2_uint4(x_vec1, up_row_vec[vec_idx + 32], up_acc1);
+                }
+
+                const float2 gate_f0 = __half22float2(gate_acc0);
+                const float2 gate_f1 = __half22float2(gate_acc1);
+                const float2 up_f0 = __half22float2(up_acc0);
+                const float2 up_f1 = __half22float2(up_acc1);
+                float gate_sum = gate_f0.x + gate_f0.y + gate_f1.x + gate_f1.y;
+                float up_sum = up_f0.x + up_f0.y + up_f1.x + up_f1.y;
+                gate_sum = warp_sum(gate_sum);
+                up_sum = warp_sum(up_sum);
+                if (lane == 0) {
+                    hidden_half[hidden_idx] =
+                        __float2half(gate_sum / (1.0f + __expf(-gate_sum)) * up_sum);
+                }
+            }
+            if constexpr (kProfile) {
+                if (threadIdx.x == 0 && profile != nullptr) {
+                    profile[static_cast<int64_t>(blockIdx.x) * kOProjMlpProfileSlots +
+                            OP_GATEUP_ITER0_DONE + gate_up_iter] = read_clock64();
+                }
+            }
+            ++gate_up_iter;
+        }
+    }
+
+    if constexpr (kProfile) {
+        if (threadIdx.x == 0 && profile != nullptr) {
+            profile[static_cast<int64_t>(blockIdx.x) * kOProjMlpProfileSlots +
+                    OP_GRIDSYNC2_START] = read_clock64();
+        }
+    }
+
+    grid_sync.sync();
 
     if constexpr (kProfile) {
         if (threadIdx.x == 0 && profile != nullptr) {
@@ -2326,6 +2968,256 @@ torch::Tensor fused_o_proj_post_attn_mlp_persistent_profile_half_cuda(
         reinterpret_cast<void*>(
             fused_o_proj_post_attn_mlp_persistent_profile_k2048_k6144_fwd_kernel<true>),
         num_sms, kPersistentThreads, args, 0, stream));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+torch::Tensor fused_o_proj_post_attn_mlp_softsync_half_cuda(
+    const torch::Tensor& residual,
+    const torch::Tensor& attn_input,
+    const torch::Tensor& o_proj_weight,
+    const torch::Tensor& o_proj_bias,
+    const torch::Tensor& norm_weight,
+    const torch::Tensor& gate_up_weight,
+    const torch::Tensor& down_proj_weight,
+    const torch::Tensor& down_proj_bias,
+    const torch::Tensor& barrier_count,
+    const torch::Tensor& barrier_generation,
+    const torch::Tensor& hidden_out,
+    const torch::Tensor& out,
+    double eps,
+    bool has_o_proj_bias,
+    bool has_down_proj_bias,
+    int64_t gate_up_active_sms) {
+    TORCH_CHECK(
+        residual.is_cuda() && attn_input.is_cuda() && o_proj_weight.is_cuda()
+            && norm_weight.is_cuda() && gate_up_weight.is_cuda()
+            && down_proj_weight.is_cuda(),
+        "inputs must be CUDA");
+    TORCH_CHECK(hidden_out.is_cuda() && out.is_cuda(), "outputs must be CUDA");
+    TORCH_CHECK(barrier_count.is_cuda() && barrier_generation.is_cuda(),
+        "barrier tensors must be CUDA");
+    TORCH_CHECK(residual.scalar_type() == torch::kFloat16, "softsync only supports fp16");
+    TORCH_CHECK(attn_input.scalar_type() == torch::kFloat16, "softsync only supports fp16");
+    TORCH_CHECK(o_proj_weight.scalar_type() == torch::kFloat16, "softsync fp16");
+    TORCH_CHECK(norm_weight.scalar_type() == torch::kFloat16, "softsync fp16");
+    TORCH_CHECK(gate_up_weight.scalar_type() == torch::kFloat16, "softsync fp16");
+    TORCH_CHECK(down_proj_weight.scalar_type() == torch::kFloat16, "softsync fp16");
+    TORCH_CHECK(barrier_count.scalar_type() == torch::kInt32, "barrier_count int32");
+    TORCH_CHECK(barrier_generation.scalar_type() == torch::kInt32, "barrier_generation int32");
+    TORCH_CHECK(residual.dim() == 1 && residual.numel() == kNosplitSpecializedK2048, "residual [2048]");
+    TORCH_CHECK(attn_input.dim() == 1 && attn_input.numel() == kNosplitSpecializedK2048, "attn_input [2048]");
+    TORCH_CHECK(o_proj_weight.dim() == 2 && o_proj_weight.size(0) == 2048 &&
+        o_proj_weight.size(1) == kNosplitSpecializedK2048 && o_proj_weight.stride(1) == 1,
+        "o_proj [2048,2048] contiguous");
+    TORCH_CHECK(norm_weight.dim() == 1 && norm_weight.numel() == kNosplitSpecializedK2048, "norm_weight [2048]");
+    TORCH_CHECK(gate_up_weight.dim() == 2 && gate_up_weight.size(0) == 12288 &&
+        gate_up_weight.size(1) == kNosplitSpecializedK2048 && gate_up_weight.stride(1) == 1,
+        "gate_up [12288,2048] contiguous");
+    TORCH_CHECK(down_proj_weight.dim() == 2 && down_proj_weight.size(0) == 2048 &&
+        down_proj_weight.size(1) == 6144 && down_proj_weight.stride(1) == 1,
+        "down_proj [2048,6144] contiguous");
+    TORCH_CHECK(barrier_count.dim() == 1 && barrier_count.numel() == 1, "barrier_count [1]");
+    TORCH_CHECK(barrier_generation.dim() == 1 && barrier_generation.numel() == 1,
+        "barrier_generation [1]");
+    TORCH_CHECK(hidden_out.dim() == 1 && hidden_out.numel() == 6144, "hidden [6144]");
+    TORCH_CHECK(out.dim() == 1 && out.numel() == 2048, "out [2048]");
+    TORCH_CHECK(!has_o_proj_bias || (o_proj_bias.is_cuda() && o_proj_bias.scalar_type() == torch::kFloat16 &&
+        o_proj_bias.dim() == 1 && o_proj_bias.numel() == 2048 && o_proj_bias.stride(0) == 1),
+        "o_proj_bias [2048] contiguous when provided");
+    TORCH_CHECK(!has_down_proj_bias || (down_proj_bias.is_cuda() && down_proj_bias.scalar_type() == torch::kFloat16 &&
+        down_proj_bias.dim() == 1 && down_proj_bias.numel() == 2048 && down_proj_bias.stride(0) == 1),
+        "down_proj_bias [2048] contiguous when provided");
+
+    int device_idx = static_cast<int>(residual.device().index());
+    int num_sms = 0;
+    C10_CUDA_CHECK(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device_idx));
+
+    int max_blocks_per_sm = 0;
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &max_blocks_per_sm,
+        fused_o_proj_post_attn_mlp_softsync_k2048_k6144_fwd_kernel,
+        kPersistentThreads,
+        0));
+    TORCH_CHECK(
+        max_blocks_per_sm * num_sms >= num_sms,
+        "fused_o_proj_post_attn_mlp_softsync launch would deadlock: resident blocks ",
+        max_blocks_per_sm * num_sms,
+        " < required grid blocks ",
+        num_sms);
+
+    c10::cuda::CUDAGuard device_guard(residual.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    auto* residual_ptr = residual.data_ptr<at::Half>();
+    auto* attn_ptr = attn_input.data_ptr<at::Half>();
+    auto* o_w_ptr = o_proj_weight.data_ptr<at::Half>();
+    auto* o_b_ptr = has_o_proj_bias ? o_proj_bias.data_ptr<at::Half>() : nullptr;
+    auto* norm_ptr = norm_weight.data_ptr<at::Half>();
+    auto* gu_ptr = gate_up_weight.data_ptr<at::Half>();
+    auto* dp_ptr = down_proj_weight.data_ptr<at::Half>();
+    auto* dp_b_ptr = has_down_proj_bias ? down_proj_bias.data_ptr<at::Half>() : nullptr;
+    auto* bc_ptr = reinterpret_cast<unsigned int*>(barrier_count.data_ptr<int32_t>());
+    auto* bg_ptr = reinterpret_cast<unsigned int*>(barrier_generation.data_ptr<int32_t>());
+    auto* h_ptr = hidden_out.data_ptr<at::Half>();
+    auto* o_ptr = out.data_ptr<at::Half>();
+    float eps_f = static_cast<float>(eps);
+    int64_t o_s0 = o_proj_weight.stride(0);
+    int64_t gu_s0 = gate_up_weight.stride(0);
+    int64_t dp_s0 = down_proj_weight.stride(0);
+    int gu_active_sms = static_cast<int>(gate_up_active_sms);
+
+    fused_o_proj_post_attn_mlp_softsync_k2048_k6144_fwd_kernel<<<num_sms, kPersistentThreads, 0, stream>>>(
+        residual_ptr,
+        attn_ptr,
+        o_w_ptr,
+        o_b_ptr,
+        norm_ptr,
+        gu_ptr,
+        dp_ptr,
+        dp_b_ptr,
+        bc_ptr,
+        bg_ptr,
+        h_ptr,
+        o_ptr,
+        eps_f,
+        has_o_proj_bias,
+        has_down_proj_bias,
+        o_s0,
+        gu_s0,
+        dp_s0,
+        gu_active_sms);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+torch::Tensor fused_o_proj_post_attn_mlp_softsync_profile_half_cuda(
+    const torch::Tensor& residual,
+    const torch::Tensor& attn_input,
+    const torch::Tensor& o_proj_weight,
+    const torch::Tensor& o_proj_bias,
+    const torch::Tensor& norm_weight,
+    const torch::Tensor& gate_up_weight,
+    const torch::Tensor& down_proj_weight,
+    const torch::Tensor& down_proj_bias,
+    const torch::Tensor& barrier_count,
+    const torch::Tensor& barrier_generation,
+    const torch::Tensor& hidden_out,
+    const torch::Tensor& out,
+    const torch::Tensor& profile,
+    double eps,
+    bool has_o_proj_bias,
+    bool has_down_proj_bias,
+    int64_t gate_up_active_sms) {
+    TORCH_CHECK(
+        residual.is_cuda() && attn_input.is_cuda() && o_proj_weight.is_cuda()
+            && norm_weight.is_cuda() && gate_up_weight.is_cuda()
+            && down_proj_weight.is_cuda(),
+        "inputs must be CUDA");
+    TORCH_CHECK(hidden_out.is_cuda() && out.is_cuda() && profile.is_cuda(),
+        "outputs must be CUDA");
+    TORCH_CHECK(barrier_count.is_cuda() && barrier_generation.is_cuda(),
+        "barrier tensors must be CUDA");
+    TORCH_CHECK(residual.scalar_type() == torch::kFloat16, "softsync_profile fp16");
+    TORCH_CHECK(attn_input.scalar_type() == torch::kFloat16, "softsync_profile fp16");
+    TORCH_CHECK(o_proj_weight.scalar_type() == torch::kFloat16, "softsync_profile fp16");
+    TORCH_CHECK(norm_weight.scalar_type() == torch::kFloat16, "softsync_profile fp16");
+    TORCH_CHECK(gate_up_weight.scalar_type() == torch::kFloat16, "softsync_profile fp16");
+    TORCH_CHECK(down_proj_weight.scalar_type() == torch::kFloat16, "softsync_profile fp16");
+    TORCH_CHECK(barrier_count.scalar_type() == torch::kInt32, "barrier_count int32");
+    TORCH_CHECK(barrier_generation.scalar_type() == torch::kInt32, "barrier_generation int32");
+    TORCH_CHECK(profile.scalar_type() == torch::kInt64 && profile.is_contiguous(),
+        "profile int64 contiguous");
+    TORCH_CHECK(residual.dim() == 1 && residual.numel() == kNosplitSpecializedK2048, "residual [2048]");
+    TORCH_CHECK(attn_input.dim() == 1 && attn_input.numel() == kNosplitSpecializedK2048, "attn_input [2048]");
+    TORCH_CHECK(o_proj_weight.dim() == 2 && o_proj_weight.size(0) == 2048 &&
+        o_proj_weight.size(1) == kNosplitSpecializedK2048 && o_proj_weight.stride(1) == 1,
+        "o_proj [2048,2048] contiguous");
+    TORCH_CHECK(norm_weight.dim() == 1 && norm_weight.numel() == kNosplitSpecializedK2048, "norm_weight [2048]");
+    TORCH_CHECK(gate_up_weight.dim() == 2 && gate_up_weight.size(0) == 12288 &&
+        gate_up_weight.size(1) == kNosplitSpecializedK2048 && gate_up_weight.stride(1) == 1,
+        "gate_up [12288,2048] contiguous");
+    TORCH_CHECK(down_proj_weight.dim() == 2 && down_proj_weight.size(0) == 2048 &&
+        down_proj_weight.size(1) == 6144 && down_proj_weight.stride(1) == 1,
+        "down_proj [2048,6144] contiguous");
+    TORCH_CHECK(barrier_count.dim() == 1 && barrier_count.numel() == 1, "barrier_count [1]");
+    TORCH_CHECK(barrier_generation.dim() == 1 && barrier_generation.numel() == 1,
+        "barrier_generation [1]");
+    TORCH_CHECK(hidden_out.dim() == 1 && hidden_out.numel() == 6144, "hidden [6144]");
+    TORCH_CHECK(out.dim() == 1 && out.numel() == 2048, "out [2048]");
+    TORCH_CHECK(!has_o_proj_bias || (o_proj_bias.is_cuda() && o_proj_bias.scalar_type() == torch::kFloat16 &&
+        o_proj_bias.dim() == 1 && o_proj_bias.numel() == 2048 && o_proj_bias.stride(0) == 1),
+        "o_proj_bias [2048] contiguous when provided");
+    TORCH_CHECK(!has_down_proj_bias || (down_proj_bias.is_cuda() && down_proj_bias.scalar_type() == torch::kFloat16 &&
+        down_proj_bias.dim() == 1 && down_proj_bias.numel() == 2048 && down_proj_bias.stride(0) == 1),
+        "down_proj_bias [2048] contiguous when provided");
+
+    int device_idx = static_cast<int>(residual.device().index());
+    int num_sms = 0;
+    C10_CUDA_CHECK(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device_idx));
+
+    TORCH_CHECK(profile.numel() == static_cast<int64_t>(num_sms) * kOProjMlpProfileSlots,
+        "profile shape mismatch: expected ", num_sms * kOProjMlpProfileSlots,
+        " got ", profile.numel());
+
+    int max_blocks_per_sm = 0;
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &max_blocks_per_sm,
+        fused_o_proj_post_attn_mlp_softsync_profile_k2048_k6144_fwd_kernel<true>,
+        kPersistentThreads,
+        0));
+    TORCH_CHECK(
+        max_blocks_per_sm * num_sms >= num_sms,
+        "fused_o_proj_post_attn_mlp_softsync_profile launch would deadlock: resident blocks ",
+        max_blocks_per_sm * num_sms,
+        " < required grid blocks ",
+        num_sms);
+
+    c10::cuda::CUDAGuard device_guard(residual.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    profile.zero_();
+
+    auto* residual_ptr = residual.data_ptr<at::Half>();
+    auto* attn_ptr = attn_input.data_ptr<at::Half>();
+    auto* o_w_ptr = o_proj_weight.data_ptr<at::Half>();
+    auto* o_b_ptr = has_o_proj_bias ? o_proj_bias.data_ptr<at::Half>() : nullptr;
+    auto* norm_ptr = norm_weight.data_ptr<at::Half>();
+    auto* gu_ptr = gate_up_weight.data_ptr<at::Half>();
+    auto* dp_ptr = down_proj_weight.data_ptr<at::Half>();
+    auto* dp_b_ptr = has_down_proj_bias ? down_proj_bias.data_ptr<at::Half>() : nullptr;
+    auto* bc_ptr = reinterpret_cast<unsigned int*>(barrier_count.data_ptr<int32_t>());
+    auto* bg_ptr = reinterpret_cast<unsigned int*>(barrier_generation.data_ptr<int32_t>());
+    auto* h_ptr = hidden_out.data_ptr<at::Half>();
+    auto* o_ptr = out.data_ptr<at::Half>();
+    auto* p_ptr = reinterpret_cast<uint64_t*>(profile.data_ptr<int64_t>());
+    float eps_f = static_cast<float>(eps);
+    int64_t o_s0 = o_proj_weight.stride(0);
+    int64_t gu_s0 = gate_up_weight.stride(0);
+    int64_t dp_s0 = down_proj_weight.stride(0);
+    int gu_active_sms = static_cast<int>(gate_up_active_sms);
+
+    fused_o_proj_post_attn_mlp_softsync_profile_k2048_k6144_fwd_kernel<true><<<num_sms, kPersistentThreads, 0, stream>>>(
+        residual_ptr,
+        attn_ptr,
+        o_w_ptr,
+        o_b_ptr,
+        norm_ptr,
+        gu_ptr,
+        dp_ptr,
+        dp_b_ptr,
+        bc_ptr,
+        bg_ptr,
+        h_ptr,
+        o_ptr,
+        p_ptr,
+        eps_f,
+        has_o_proj_bias,
+        has_down_proj_bias,
+        o_s0,
+        gu_s0,
+        dp_s0,
+        gu_active_sms);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }

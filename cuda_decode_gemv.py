@@ -1391,6 +1391,92 @@ def fused_o_proj_post_attn_mlp_persistent_half(
     return hidden_out.view(*residual.shape[:-1], 6144), out_vec.view(*residual.shape[:-1], n)
 
 
+def fused_o_proj_post_attn_mlp_softsync_half(
+    residual: torch.Tensor,
+    attn_input: torch.Tensor,
+    o_proj_weight: torch.Tensor,
+    o_proj_bias: torch.Tensor | None,
+    norm_weight: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_proj_weight: torch.Tensor,
+    down_proj_bias: torch.Tensor | None,
+    eps: float,
+    workspace: dict | None = None,
+    gate_up_active_sms: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if (
+        residual.device.type != "cuda"
+        or attn_input.device.type != "cuda"
+        or o_proj_weight.device.type != "cuda"
+        or norm_weight.device.type != "cuda"
+        or gate_up_weight.device.type != "cuda"
+        or down_proj_weight.device.type != "cuda"
+        or residual.dtype != torch.float16
+        or attn_input.dtype != torch.float16
+        or o_proj_weight.dtype != torch.float16
+        or norm_weight.dtype != torch.float16
+        or gate_up_weight.dtype != torch.float16
+        or down_proj_weight.dtype != torch.float16
+        or residual.ndim < 2
+        or residual.shape[-2] != 1
+        or residual.shape != attn_input.shape
+    ):
+        raise RuntimeError(
+            "fused_o_proj_post_attn_mlp_softsync_half expects fp16 CUDA single-token decode tensors"
+        )
+
+    residual_vec = residual.reshape(-1).contiguous()
+    attn_vec = attn_input.reshape(-1).contiguous()
+    norm_vec = norm_weight.reshape(-1).contiguous()
+    n, _k = down_proj_weight.shape
+    if (
+        workspace is not None
+        and workspace.get("type") == "fused_o_proj_post_attn_mlp_softsync"
+        and tuple(workspace["barrier_count"].shape) == (1,)
+        and tuple(workspace["barrier_generation"].shape) == (1,)
+        and tuple(workspace["hidden_out"].shape) == (6144,)
+        and tuple(workspace["out"].shape) == (n,)
+        and workspace["barrier_count"].device == residual.device
+        and workspace["barrier_generation"].device == residual.device
+        and workspace["hidden_out"].device == residual.device
+        and workspace["out"].device == residual.device
+        and workspace["barrier_count"].dtype == torch.int32
+        and workspace["barrier_generation"].dtype == torch.int32
+        and workspace["hidden_out"].dtype == residual.dtype
+        and workspace["out"].dtype == residual.dtype
+    ):
+        barrier_count = workspace["barrier_count"]
+        barrier_generation = workspace["barrier_generation"]
+        hidden_out = workspace["hidden_out"]
+        out_vec = workspace["out"]
+    else:
+        barrier_count = torch.zeros((1,), dtype=torch.int32, device=residual.device)
+        barrier_generation = torch.zeros((1,), dtype=torch.int32, device=residual.device)
+        hidden_out = torch.empty((6144,), dtype=residual.dtype, device=residual.device)
+        out_vec = torch.empty((n,), dtype=residual.dtype, device=residual.device)
+
+    ext = _load_ext()
+    ext.fused_o_proj_post_attn_mlp_softsync_half(
+        residual_vec,
+        attn_vec,
+        o_proj_weight,
+        o_proj_bias if o_proj_bias is not None else torch.empty(0, device=residual.device, dtype=residual.dtype),
+        norm_vec,
+        gate_up_weight,
+        down_proj_weight,
+        down_proj_bias if down_proj_bias is not None else torch.empty(0, device=residual.device, dtype=residual.dtype),
+        barrier_count,
+        barrier_generation,
+        hidden_out,
+        out_vec,
+        eps,
+        o_proj_bias is not None,
+        down_proj_bias is not None,
+        gate_up_active_sms,
+    )
+    return hidden_out.view(*residual.shape[:-1], 6144), out_vec.view(*residual.shape[:-1], n)
+
+
 def fused_gateup_silu_downproj_mega_half(
     x: torch.Tensor,
     gate_up_weight: torch.Tensor,
@@ -1663,6 +1749,112 @@ def fused_o_proj_post_attn_mlp_persistent_profile_half(
     )
     meta = {
         "kernel_name": "fused_o_proj_post_attn_mlp_persistent_profile",
+        "grid_blocks": grid_blocks,
+        "slot_names": list(OPROJ_MLP_PROFILE_SLOT_NAMES),
+    }
+    return hidden_out.view(*residual.shape[:-1], 6144), out_vec.view(*residual.shape[:-1], n), profile, meta
+
+
+def fused_o_proj_post_attn_mlp_softsync_profile_half(
+    residual: torch.Tensor,
+    attn_input: torch.Tensor,
+    o_proj_weight: torch.Tensor,
+    o_proj_bias: torch.Tensor | None,
+    norm_weight: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_proj_weight: torch.Tensor,
+    down_proj_bias: torch.Tensor | None,
+    eps: float,
+    workspace: dict | None = None,
+    gate_up_active_sms: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+    if (
+        residual.device.type != "cuda"
+        or attn_input.device.type != "cuda"
+        or o_proj_weight.device.type != "cuda"
+        or norm_weight.device.type != "cuda"
+        or gate_up_weight.device.type != "cuda"
+        or down_proj_weight.device.type != "cuda"
+        or residual.dtype != torch.float16
+        or attn_input.dtype != torch.float16
+        or o_proj_weight.dtype != torch.float16
+        or norm_weight.dtype != torch.float16
+        or gate_up_weight.dtype != torch.float16
+        or down_proj_weight.dtype != torch.float16
+        or residual.ndim < 2
+        or residual.shape[-2] != 1
+        or residual.shape != attn_input.shape
+    ):
+        raise RuntimeError(
+            "fused_o_proj_post_attn_mlp_softsync_profile_half expects fp16 CUDA single-token decode tensors"
+        )
+
+    residual_vec = residual.reshape(-1).contiguous()
+    attn_vec = attn_input.reshape(-1).contiguous()
+    norm_vec = norm_weight.reshape(-1).contiguous()
+    n, _k = down_proj_weight.shape
+    props = torch.cuda.get_device_properties(residual.device)
+    grid_blocks = props.multi_processor_count
+    num_slots = len(OPROJ_MLP_PROFILE_SLOT_NAMES)
+
+    if (
+        workspace is not None
+        and workspace.get("type") == "oproj_mlp_softsync_profile"
+        and tuple(workspace["barrier_count"].shape) == (1,)
+        and tuple(workspace["barrier_generation"].shape) == (1,)
+        and tuple(workspace["hidden_out"].shape) == (6144,)
+        and tuple(workspace["out"].shape) == (n,)
+        and workspace["barrier_count"].device == residual.device
+        and workspace["barrier_generation"].device == residual.device
+        and workspace["hidden_out"].device == residual.device
+        and workspace["out"].device == residual.device
+        and workspace["barrier_count"].dtype == torch.int32
+        and workspace["barrier_generation"].dtype == torch.int32
+        and workspace["hidden_out"].dtype == residual.dtype
+        and workspace["out"].dtype == residual.dtype
+        and workspace.get("profile") is not None
+        and workspace["profile"].shape == (grid_blocks, num_slots)
+        and workspace["profile"].device == residual.device
+        and workspace["profile"].dtype == torch.int64
+    ):
+        barrier_count = workspace["barrier_count"]
+        barrier_generation = workspace["barrier_generation"]
+        hidden_out = workspace["hidden_out"]
+        out_vec = workspace["out"]
+        profile = workspace["profile"]
+    else:
+        barrier_count = torch.zeros((1,), dtype=torch.int32, device=residual.device)
+        barrier_generation = torch.zeros((1,), dtype=torch.int32, device=residual.device)
+        hidden_out = torch.empty((6144,), dtype=residual.dtype, device=residual.device)
+        out_vec = torch.empty((n,), dtype=residual.dtype, device=residual.device)
+        profile = torch.empty(
+            (grid_blocks, num_slots),
+            dtype=torch.int64,
+            device=residual.device,
+        )
+
+    ext = _load_ext()
+    ext.fused_o_proj_post_attn_mlp_softsync_profile_half(
+        residual_vec,
+        attn_vec,
+        o_proj_weight,
+        o_proj_bias if o_proj_bias is not None else torch.empty(0, device=residual.device, dtype=residual.dtype),
+        norm_vec,
+        gate_up_weight,
+        down_proj_weight,
+        down_proj_bias if down_proj_bias is not None else torch.empty(0, device=residual.device, dtype=residual.dtype),
+        barrier_count,
+        barrier_generation,
+        hidden_out,
+        out_vec,
+        profile,
+        eps,
+        o_proj_bias is not None,
+        down_proj_bias is not None,
+        gate_up_active_sms,
+    )
+    meta = {
+        "kernel_name": "fused_o_proj_post_attn_mlp_softsync_profile",
         "grid_blocks": grid_blocks,
         "slot_names": list(OPROJ_MLP_PROFILE_SLOT_NAMES),
     }

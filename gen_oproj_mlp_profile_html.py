@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Run o_proj+post_attn+MLP persistent kernel profiler and generate an interactive HTML visualization.
+"""Run o_proj+post_attn+MLP fused-kernel profiler and generate an interactive HTML visualization.
 
-Outputs: results/oproj_mlp_profile_viz.html
+Outputs: results/oproj_mlp_profile_<variant>_viz.html
 """
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ S_SM_ID              = 15
 NUM_SLOTS            = 16
 
 
-def run_profile(device, gate_up_active_sms=0):
+def run_profile(device, variant="persistent", gate_up_active_sms=0):
     num_sms = torch.cuda.get_device_properties(device).multi_processor_count
     # Model dimensions for Qwen2.5-3B-Instruct
     residual = torch.randn((1, 1, 2048), dtype=torch.float16, device=device)
@@ -57,22 +57,36 @@ def run_profile(device, gate_up_active_sms=0):
 
     # Warmup with the non-profile variant
     for _ in range(WARMUP):
-        cuda_decode_gemv.fused_o_proj_post_attn_mlp_persistent_half(
-            residual, attn_input, o_proj_w, None, norm_w, gate_up_w, down_proj_w, None, eps
-        )
+        if variant == "persistent":
+            cuda_decode_gemv.fused_o_proj_post_attn_mlp_persistent_half(
+                residual, attn_input, o_proj_w, None, norm_w, gate_up_w, down_proj_w, None, eps
+            )
+        elif variant == "softsync":
+            cuda_decode_gemv.fused_o_proj_post_attn_mlp_softsync_half(
+                residual, attn_input, o_proj_w, None, norm_w, gate_up_w, down_proj_w, None, eps,
+                gate_up_active_sms=gate_up_active_sms,
+            )
+        else:
+            raise ValueError(f"unsupported variant: {variant}")
     torch.cuda.synchronize()
 
     # Collect profiles
     all_profiles = []
     for _ in range(NUM_ITERS):
-        _, _, profile, meta = cuda_decode_gemv.fused_o_proj_post_attn_mlp_persistent_profile_half(
-            residual, attn_input, o_proj_w, None, norm_w, gate_up_w, down_proj_w, None, eps,
-            gate_up_active_sms=gate_up_active_sms,
-        )
+        if variant == "persistent":
+            _, _, profile, meta = cuda_decode_gemv.fused_o_proj_post_attn_mlp_persistent_profile_half(
+                residual, attn_input, o_proj_w, None, norm_w, gate_up_w, down_proj_w, None, eps,
+                gate_up_active_sms=gate_up_active_sms,
+            )
+        else:
+            _, _, profile, meta = cuda_decode_gemv.fused_o_proj_post_attn_mlp_softsync_profile_half(
+                residual, attn_input, o_proj_w, None, norm_w, gate_up_w, down_proj_w, None, eps,
+                gate_up_active_sms=gate_up_active_sms,
+            )
         torch.cuda.synchronize()
         all_profiles.append(profile.to(torch.int64).cpu())
 
-    return all_profiles, num_sms
+    return all_profiles, num_sms, meta
 
 
 def extract_block_data(profile_tensor, num_sms, sm_class_map=None):
@@ -145,11 +159,13 @@ def extract_block_data(profile_tensor, num_sms, sm_class_map=None):
     return blocks, effective_ghz
 
 
-def compute_summary(all_profiles, num_sms, gate_up_active_sms=0):
+def compute_summary(all_profiles, num_sms, gate_up_active_sms=0, variant="persistent"):
     """Compute aggregated summary across runs.
 
     Profile data uses clock64 (cycles). We calibrate per-run using globaltimer slots.
     """
+    sync_phase_1 = "grid_sync_1" if variant == "persistent" else "soft_sync_1"
+    sync_phase_2 = "grid_sync_2" if variant == "persistent" else "soft_sync_2"
     warps_per_block = 32
     gu_sms = gate_up_active_sms if gate_up_active_sms > 0 else num_sms
     stride = gu_sms * warps_per_block
@@ -170,10 +186,10 @@ def compute_summary(all_profiles, num_sms, gate_up_active_sms=0):
     phase_stats = {
         "o_proj": {"sms": num_sms, "wall_us": [], "data_mb": data_bytes["o_proj"] / 1e6},
         "res+norm": {"sms": num_sms, "wall_us": [], "data_mb": 0},
-        "grid_sync_1": {"sms": num_sms, "wall_us": [], "data_mb": 0},
+        sync_phase_1: {"sms": num_sms, "wall_us": [], "data_mb": 0},
         "gate_up iter0": {"sms": gu_sms, "wall_us": [], "data_mb": data_bytes["gate_up iter0"] / 1e6},
         "gate_up iter1": {"sms": iter1_sms, "wall_us": [], "data_mb": data_bytes["gate_up iter1"] / 1e6},
-        "grid_sync_2": {"sms": num_sms, "wall_us": [], "data_mb": 0},
+        sync_phase_2: {"sms": num_sms, "wall_us": [], "data_mb": 0},
         "down_proj": {"sms": 64, "wall_us": [], "data_mb": data_bytes["down_proj"] / 1e6},
         "total": {"sms": num_sms, "wall_us": [], "data_mb": data_bytes["total"] / 1e6},
     }
@@ -198,7 +214,7 @@ def compute_summary(all_profiles, num_sms, gate_up_active_sms=0):
         phase_stats["o_proj"]["wall_us"].append(wall_oproj)
 
         wall_sync1 = max_c2us(ts[:, S_GRIDSYNC1_DONE] - ts[:, S_GRIDSYNC1_START])
-        phase_stats["grid_sync_1"]["wall_us"].append(wall_sync1)
+        phase_stats[sync_phase_1]["wall_us"].append(wall_sync1)
 
         wall_resnorm = max_c2us(ts[:, S_RESNORM_DONE] - ts[:, S_GRIDSYNC1_DONE])
         phase_stats["res+norm"]["wall_us"].append(wall_resnorm)
@@ -219,7 +235,7 @@ def compute_summary(all_profiles, num_sms, gate_up_active_sms=0):
         phase_stats["gate_up iter1"]["wall_us"].append(wall_iter1)
 
         wall_sync2 = max_c2us(ts[:, S_GRIDSYNC2_DONE] - ts[:, S_GRIDSYNC2_START])
-        phase_stats["grid_sync_2"]["wall_us"].append(wall_sync2)
+        phase_stats[sync_phase_2]["wall_us"].append(wall_sync2)
 
         wall_down = max_c2us(ts[:64, S_DOWN_COMPUTE_DONE] - ts[:64, S_DOWN_HIDDEN_LOADED])
         phase_stats["down_proj"]["wall_us"].append(wall_down)
@@ -245,7 +261,7 @@ def compute_summary(all_profiles, num_sms, gate_up_active_sms=0):
     return summary
 
 
-def generate_html(block_data_runs, summary, num_sms, effective_ghz=1.41):
+def generate_html(block_data_runs, summary, num_sms, effective_ghz=1.41, variant="persistent"):
     """Generate self-contained HTML visualization."""
     run_totals = []
     for i, blocks in enumerate(block_data_runs):
@@ -253,12 +269,14 @@ def generate_html(block_data_runs, summary, num_sms, effective_ghz=1.41):
         run_totals.append((max_total, i))
     run_totals.sort()
     median_run_idx = run_totals[len(run_totals) // 2][1]
+    variant_title = "Persistent Cooperative GridSync" if variant == "persistent" else "Atomic SoftSync"
+    sync_label = "grid sync" if variant == "persistent" else "soft sync"
 
     html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<title>O-Proj + Post-Attn MLP Persistent Kernel Per-SM Profile (clock64 calibrated)</title>
+<title>O-Proj + Post-Attn MLP {variant_title} Per-SM Profile (clock64 calibrated)</title>
 <style>
 * {{ margin: 0; padding: 0; box-sizing: border-box; }}
 body {{
@@ -469,7 +487,7 @@ h2 {{
 </head>
 <body>
 
-<h1>O-Proj + Post-Attn MLP Persistent Kernel Per-SM Profile (clock64)</h1>
+<h1>O-Proj + Post-Attn MLP {variant_title} Per-SM Profile (clock64)</h1>
 <div class="subtitle">
     NVIDIA A800 80GB PCIe &middot; {num_sms} SMs &middot;
     Peak HBM BW: {PEAK_BW_GBS:.0f} GB/s &middot;
@@ -524,12 +542,12 @@ const PHASE_LABELS = {{
     x_load:         'x load',
     o_proj:         'o_proj GEMV',
     gridsync1_wait: 'wait sync 1',
-    gridsync1:      'grid sync 1',
+    gridsync1:      '{sync_label} 1',
     resnorm:        'res+RMSNorm',
     iter0:          'gate_up iter0',
     iter1:          'gate_up iter1',
     gridsync2_wait: 'wait sync 2',
-    gridsync2:      'grid sync 2',
+    gridsync2:      '{sync_label} 2',
     down_ld:        'down hidden load',
     down_cp:        'down_proj compute',
     down_idle:      'down_proj (idle)',
@@ -777,6 +795,8 @@ renderHeatmap(medianRunIdx);
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Profile fused o_proj+MLP kernel")
+    parser.add_argument("--variant", choices=("persistent", "softsync"), default="persistent",
+                        help="Kernel variant to profile")
     parser.add_argument("--gate-up-sms", type=int, default=0,
                         help="Limit gate_up phase to N SMs (0 = all, baseline)")
     parser.add_argument("-o", "--output", type=str, default=None,
@@ -792,9 +812,13 @@ def main():
     print(f"  Class 0: {len(sm_result.sm_class_0)} SMs, Class 1: {len(sm_result.sm_class_1)} SMs")
 
     gu_label = f"gate_up_sms={args.gate_up_sms}" if args.gate_up_sms > 0 else "baseline"
-    print(f"Running o_proj+post_attn+MLP profiler ({gu_label})...")
+    print(f"Running o_proj+post_attn+MLP profiler ({args.variant}, {gu_label})...")
 
-    all_profiles, num_sms = run_profile(device, gate_up_active_sms=args.gate_up_sms)
+    all_profiles, num_sms, meta = run_profile(
+        device,
+        variant=args.variant,
+        gate_up_active_sms=args.gate_up_sms,
+    )
 
     print("Extracting per-block data...")
     block_data_runs = []
@@ -808,20 +832,32 @@ def main():
     print(f"Calibrated SM frequency: {median_ghz:.4f} GHz (median across {len(effective_ghz_list)} runs)")
 
     print("Computing summary...")
-    summary = compute_summary(all_profiles, num_sms, gate_up_active_sms=args.gate_up_sms)
+    summary = compute_summary(
+        all_profiles,
+        num_sms,
+        gate_up_active_sms=args.gate_up_sms,
+        variant=args.variant,
+    )
 
     print("Generating HTML...")
-    html = generate_html(block_data_runs, summary, num_sms, median_ghz)
+    html = generate_html(
+        block_data_runs,
+        summary,
+        num_sms,
+        median_ghz,
+        variant=args.variant,
+    )
 
     if args.output:
         out_path = Path(args.output)
     elif args.gate_up_sms > 0:
-        out_path = Path(f"results/oproj_mlp_profile_gateup_{args.gate_up_sms}sm.html")
+        out_path = Path(f"results/oproj_mlp_profile_{args.variant}_gateup_{args.gate_up_sms}sm.html")
     else:
-        out_path = Path("results/oproj_mlp_profile_viz.html")
+        out_path = Path(f"results/oproj_mlp_profile_{args.variant}_viz.html")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(html, encoding="utf-8")
     print(f"Saved: {out_path}")
+    print(f"Kernel: {meta['kernel_name']}")
     print(f"File size: {out_path.stat().st_size / 1024:.1f} KB")
 
 

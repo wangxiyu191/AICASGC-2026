@@ -297,6 +297,12 @@ def _run_layer_chain_graph(target_layer, payload):
     benchmark_style_cuda_reset()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
+    o_proj_post_attn_mlp_variant = optimized_layer._active_o_proj_post_attn_mlp_variant()
+    o_proj_post_attn_mlp_workspace = (
+        None
+        if o_proj_post_attn_mlp_variant is None
+        else target_layer._ensure_o_proj_post_attn_mlp_workspace(o_proj_post_attn_mlp_variant)
+    )
     with torch.cuda.stream(stream):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -364,7 +370,7 @@ def _run_layer_chain_graph(target_layer, payload):
                 attn_output = attn_output.contiguous()
             outputs["o_proj_input_simulated"] = attn_output
 
-            fused_o_proj_post_attn_mlp_out = optimized_layer._fused_o_proj_post_attn_mlp_persistent(
+            fused_o_proj_post_attn_mlp_out = optimized_layer._fused_o_proj_post_attn_mlp(
                 layer_input,
                 attn_output,
                 target_layer.o_proj_weight,
@@ -375,6 +381,7 @@ def _run_layer_chain_graph(target_layer, payload):
                 target_layer.down_proj_bias,
                 target_layer.rms_norm_eps,
                 prefer_small_triton=prefer_small_triton,
+                workspace=o_proj_post_attn_mlp_workspace,
             )
             if fused_o_proj_post_attn_mlp_out is not None:
                 hidden_states = fused_o_proj_post_attn_mlp_out
@@ -597,6 +604,11 @@ def main():
         help="Enable experimental persistent CUDA fusion for o_proj -> post_attn_add_rmsnorm -> gate_up -> silu_mul -> down_proj -> residual_add during graph replay only.",
     )
     parser.add_argument(
+        "--enable-fused-o-proj-post-attn-mlp-softsync",
+        action="store_true",
+        help="Enable experimental softsync CUDA fusion for o_proj -> post_attn_add_rmsnorm -> gate_up -> silu_mul -> down_proj -> residual_add during graph replay only.",
+    )
+    parser.add_argument(
         "--enable-fused-silu-downproj",
         action="store_true",
         help="Enable experimental CUDA fusion for silu_mul -> down_proj during graph replay only.",
@@ -617,6 +629,15 @@ def main():
         default=None,
     )
     args = parser.parse_args()
+
+    if (
+        args.enable_fused_o_proj_post_attn_mlp_persistent
+        and args.enable_fused_o_proj_post_attn_mlp_softsync
+    ):
+        parser.error(
+            "--enable-fused-o-proj-post-attn-mlp-persistent and "
+            "--enable-fused-o-proj-post-attn-mlp-softsync are mutually exclusive"
+        )
 
     if args.output is None:
         args.output = (
@@ -639,6 +660,7 @@ def main():
         add_rmsnorm_gateup=False,
         post_attn_mlp_persistent=False,
         o_proj_post_attn_mlp_persistent=False,
+        o_proj_post_attn_mlp_softsync=False,
         silu_downproj=False,
         gateup_silu_downproj=False,
         gateup_silu_downproj_mega=False,
@@ -657,9 +679,10 @@ def main():
             add_rmsnorm_gateup=capture_flag_restore[0],
             post_attn_mlp_persistent=capture_flag_restore[1],
             o_proj_post_attn_mlp_persistent=capture_flag_restore[2],
-            silu_downproj=capture_flag_restore[3],
-            gateup_silu_downproj=capture_flag_restore[4],
-            gateup_silu_downproj_mega=capture_flag_restore[5],
+            o_proj_post_attn_mlp_softsync=capture_flag_restore[3],
+            silu_downproj=capture_flag_restore[4],
+            gateup_silu_downproj=capture_flag_restore[5],
+            gateup_silu_downproj_mega=capture_flag_restore[6],
         )
 
     target_layer = vlm._model.model.language_model.layers[args.layer_idx]
@@ -672,6 +695,7 @@ def main():
         add_rmsnorm_gateup=args.enable_fused_add_rmsnorm_gateup,
         post_attn_mlp_persistent=args.enable_fused_post_attn_mlp_persistent,
         o_proj_post_attn_mlp_persistent=args.enable_fused_o_proj_post_attn_mlp_persistent,
+        o_proj_post_attn_mlp_softsync=args.enable_fused_o_proj_post_attn_mlp_softsync,
         silu_downproj=args.enable_fused_silu_downproj,
         gateup_silu_downproj=args.enable_fused_gateup_silu_downproj,
         gateup_silu_downproj_mega=args.enable_fused_gateup_silu_downproj_mega,
@@ -686,9 +710,10 @@ def main():
             add_rmsnorm_gateup=capture_flag_restore[0],
             post_attn_mlp_persistent=capture_flag_restore[1],
             o_proj_post_attn_mlp_persistent=capture_flag_restore[2],
-            silu_downproj=capture_flag_restore[3],
-            gateup_silu_downproj=capture_flag_restore[4],
-            gateup_silu_downproj_mega=capture_flag_restore[5],
+            o_proj_post_attn_mlp_softsync=capture_flag_restore[3],
+            silu_downproj=capture_flag_restore[4],
+            gateup_silu_downproj=capture_flag_restore[5],
+            gateup_silu_downproj_mega=capture_flag_restore[6],
         )
         set_small_decode_triton_enabled(vlm._model, previous_small_decode_triton)
 
@@ -739,6 +764,7 @@ def main():
             "enable_fused_add_rmsnorm_gateup": bool(args.enable_fused_add_rmsnorm_gateup),
             "enable_fused_post_attn_mlp_persistent": bool(args.enable_fused_post_attn_mlp_persistent),
             "enable_fused_o_proj_post_attn_mlp_persistent": bool(args.enable_fused_o_proj_post_attn_mlp_persistent),
+            "enable_fused_o_proj_post_attn_mlp_softsync": bool(args.enable_fused_o_proj_post_attn_mlp_softsync),
             "enable_fused_silu_downproj": bool(args.enable_fused_silu_downproj),
             "enable_fused_gateup_silu_downproj": bool(args.enable_fused_gateup_silu_downproj),
             "enable_fused_gateup_silu_downproj_mega": bool(args.enable_fused_gateup_silu_downproj_mega),

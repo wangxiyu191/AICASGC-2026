@@ -315,6 +315,24 @@ torch::Tensor fused_o_proj_post_attn_mlp_persistent_half_cuda(
     bool has_o_proj_bias,
     bool has_down_proj_bias);
 
+torch::Tensor fused_o_proj_post_attn_mlp_softsync_half_cuda(
+    const torch::Tensor& residual,
+    const torch::Tensor& attn_input,
+    const torch::Tensor& o_proj_weight,
+    const torch::Tensor& o_proj_bias,
+    const torch::Tensor& norm_weight,
+    const torch::Tensor& gate_up_weight,
+    const torch::Tensor& down_proj_weight,
+    const torch::Tensor& down_proj_bias,
+    const torch::Tensor& barrier_count,
+    const torch::Tensor& barrier_generation,
+    const torch::Tensor& hidden_out,
+    const torch::Tensor& out,
+    double eps,
+    bool has_o_proj_bias,
+    bool has_down_proj_bias,
+    int64_t gate_up_active_sms);
+
 torch::Tensor fused_o_proj_post_attn_mlp_persistent_profile_half_cuda(
     const torch::Tensor& residual,
     const torch::Tensor& attn_input,
@@ -324,6 +342,25 @@ torch::Tensor fused_o_proj_post_attn_mlp_persistent_profile_half_cuda(
     const torch::Tensor& gate_up_weight,
     const torch::Tensor& down_proj_weight,
     const torch::Tensor& down_proj_bias,
+    const torch::Tensor& hidden_out,
+    const torch::Tensor& out,
+    const torch::Tensor& profile,
+    double eps,
+    bool has_o_proj_bias,
+    bool has_down_proj_bias,
+    int64_t gate_up_active_sms);
+
+torch::Tensor fused_o_proj_post_attn_mlp_softsync_profile_half_cuda(
+    const torch::Tensor& residual,
+    const torch::Tensor& attn_input,
+    const torch::Tensor& o_proj_weight,
+    const torch::Tensor& o_proj_bias,
+    const torch::Tensor& norm_weight,
+    const torch::Tensor& gate_up_weight,
+    const torch::Tensor& down_proj_weight,
+    const torch::Tensor& down_proj_bias,
+    const torch::Tensor& barrier_count,
+    const torch::Tensor& barrier_generation,
     const torch::Tensor& hidden_out,
     const torch::Tensor& out,
     const torch::Tensor& profile,
@@ -879,6 +916,42 @@ torch::Tensor fused_o_proj_post_attn_mlp_persistent_half(
         has_down_proj_bias);
 }
 
+torch::Tensor fused_o_proj_post_attn_mlp_softsync_half(
+    const torch::Tensor& residual,
+    const torch::Tensor& attn_input,
+    const torch::Tensor& o_proj_weight,
+    const torch::Tensor& o_proj_bias,
+    const torch::Tensor& norm_weight,
+    const torch::Tensor& gate_up_weight,
+    const torch::Tensor& down_proj_weight,
+    const torch::Tensor& down_proj_bias,
+    const torch::Tensor& barrier_count,
+    const torch::Tensor& barrier_generation,
+    const torch::Tensor& hidden_out,
+    const torch::Tensor& out,
+    double eps,
+    bool has_o_proj_bias,
+    bool has_down_proj_bias,
+    int64_t gate_up_active_sms) {
+    return fused_o_proj_post_attn_mlp_softsync_half_cuda(
+        residual,
+        attn_input,
+        o_proj_weight,
+        o_proj_bias,
+        norm_weight,
+        gate_up_weight,
+        down_proj_weight,
+        down_proj_bias,
+        barrier_count,
+        barrier_generation,
+        hidden_out,
+        out,
+        eps,
+        has_o_proj_bias,
+        has_down_proj_bias,
+        gate_up_active_sms);
+}
+
 torch::Tensor fused_o_proj_post_attn_mlp_persistent_profile_half(
     const torch::Tensor& residual,
     const torch::Tensor& attn_input,
@@ -904,6 +977,44 @@ torch::Tensor fused_o_proj_post_attn_mlp_persistent_profile_half(
         gate_up_weight,
         down_proj_weight,
         down_proj_bias,
+        hidden_out,
+        out,
+        profile,
+        eps,
+        has_o_proj_bias,
+        has_down_proj_bias,
+        gate_up_active_sms);
+}
+
+torch::Tensor fused_o_proj_post_attn_mlp_softsync_profile_half(
+    const torch::Tensor& residual,
+    const torch::Tensor& attn_input,
+    const torch::Tensor& o_proj_weight,
+    const torch::Tensor& o_proj_bias,
+    const torch::Tensor& norm_weight,
+    const torch::Tensor& gate_up_weight,
+    const torch::Tensor& down_proj_weight,
+    const torch::Tensor& down_proj_bias,
+    const torch::Tensor& barrier_count,
+    const torch::Tensor& barrier_generation,
+    const torch::Tensor& hidden_out,
+    const torch::Tensor& out,
+    const torch::Tensor& profile,
+    double eps,
+    bool has_o_proj_bias,
+    bool has_down_proj_bias,
+    int64_t gate_up_active_sms) {
+    return fused_o_proj_post_attn_mlp_softsync_profile_half_cuda(
+        residual,
+        attn_input,
+        o_proj_weight,
+        o_proj_bias,
+        norm_weight,
+        gate_up_weight,
+        down_proj_weight,
+        down_proj_bias,
+        barrier_count,
+        barrier_generation,
         hidden_out,
         out,
         profile,
@@ -965,7 +1076,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_gateup_silu_downproj_gridsync_profile_half", &fused_gateup_silu_downproj_gridsync_profile_half);
     m.def("fused_post_attn_mlp_persistent_half", &fused_post_attn_mlp_persistent_half);
     m.def("fused_o_proj_post_attn_mlp_persistent_half", &fused_o_proj_post_attn_mlp_persistent_half);
+    m.def("fused_o_proj_post_attn_mlp_softsync_half", &fused_o_proj_post_attn_mlp_softsync_half);
     m.def("fused_o_proj_post_attn_mlp_persistent_profile_half", &fused_o_proj_post_attn_mlp_persistent_profile_half);
+    m.def("fused_o_proj_post_attn_mlp_softsync_profile_half", &fused_o_proj_post_attn_mlp_softsync_profile_half);
     m.def("fused_gateup_silu_downproj_persistent_half", &fused_gateup_silu_downproj_persistent_half);
     m.def("fused_gateup_silu_downproj_persistent_profile_half", &fused_gateup_silu_downproj_persistent_profile_half);
     m.def("decode_attn_persistent_half", &decode_attn_persistent_half);

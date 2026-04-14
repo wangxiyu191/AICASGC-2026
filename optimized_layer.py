@@ -87,6 +87,7 @@ class OptimizedDecoderLayer(nn.Module):
         )
         self._prefer_small_decode_triton = False
         self._splitkv_workspace = None
+        self._o_proj_post_attn_mlp_workspaces: dict[str, dict] = {}
         if _decode_attention_needs_splitkv_workspace():
             self._ensure_splitkv_workspace()
 
@@ -238,8 +239,19 @@ class OptimizedDecoderLayer(nn.Module):
         if not attn_output.is_contiguous():
             attn_output = attn_output.contiguous()
 
-        with _nvtx_range("decode.o_proj_post_attn_mlp_persistent_full", enable_decode_nvtx):
-            fused_o_proj_post_attn_mlp_out = _fused_o_proj_post_attn_mlp_persistent(
+        o_proj_post_attn_mlp_variant = _active_o_proj_post_attn_mlp_variant()
+        o_proj_post_attn_mlp_nvtx = (
+            "decode.o_proj_post_attn_mlp_full"
+            if o_proj_post_attn_mlp_variant is None
+            else f"decode.o_proj_post_attn_mlp_{o_proj_post_attn_mlp_variant}_full"
+        )
+        o_proj_post_attn_mlp_workspace = (
+            None
+            if o_proj_post_attn_mlp_variant is None
+            else self._ensure_o_proj_post_attn_mlp_workspace(o_proj_post_attn_mlp_variant)
+        )
+        with _nvtx_range(o_proj_post_attn_mlp_nvtx, enable_decode_nvtx):
+            fused_o_proj_post_attn_mlp_out = _fused_o_proj_post_attn_mlp(
                 residual,
                 attn_output,
                 self.o_proj_weight,
@@ -250,6 +262,7 @@ class OptimizedDecoderLayer(nn.Module):
                 self.down_proj_bias,
                 self.rms_norm_eps,
                 prefer_small_triton=prefer_small_decode_triton,
+                workspace=o_proj_post_attn_mlp_workspace,
             )
             if fused_o_proj_post_attn_mlp_out is not None:
                 return fused_o_proj_post_attn_mlp_out
@@ -401,6 +414,61 @@ class OptimizedDecoderLayer(nn.Module):
             "out": out,
         }
 
+    def _ensure_o_proj_post_attn_mlp_workspace(self, variant: str):
+        workspace = self._o_proj_post_attn_mlp_workspaces.get(variant)
+        device = self.o_proj_weight.device
+        dtype = self.o_proj_weight.dtype
+
+        if variant == "persistent":
+            if (
+                workspace is not None
+                and workspace.get("type") == "fused_o_proj_post_attn_mlp_persistent"
+                and tuple(workspace["hidden_out"].shape) == (6144,)
+                and tuple(workspace["out"].shape) == (2048,)
+                and workspace["hidden_out"].device == device
+                and workspace["out"].device == device
+                and workspace["hidden_out"].dtype == dtype
+                and workspace["out"].dtype == dtype
+            ):
+                return workspace
+            workspace = {
+                "type": "fused_o_proj_post_attn_mlp_persistent",
+                "hidden_out": torch.empty((6144,), dtype=dtype, device=device),
+                "out": torch.empty((2048,), dtype=dtype, device=device),
+            }
+            self._o_proj_post_attn_mlp_workspaces[variant] = workspace
+            return workspace
+
+        if variant == "softsync":
+            if (
+                workspace is not None
+                and workspace.get("type") == "fused_o_proj_post_attn_mlp_softsync"
+                and tuple(workspace["barrier_count"].shape) == (1,)
+                and tuple(workspace["barrier_generation"].shape) == (1,)
+                and tuple(workspace["hidden_out"].shape) == (6144,)
+                and tuple(workspace["out"].shape) == (2048,)
+                and workspace["barrier_count"].device == device
+                and workspace["barrier_generation"].device == device
+                and workspace["hidden_out"].device == device
+                and workspace["out"].device == device
+                and workspace["barrier_count"].dtype == torch.int32
+                and workspace["barrier_generation"].dtype == torch.int32
+                and workspace["hidden_out"].dtype == dtype
+                and workspace["out"].dtype == dtype
+            ):
+                return workspace
+            workspace = {
+                "type": "fused_o_proj_post_attn_mlp_softsync",
+                "barrier_count": torch.zeros((1,), dtype=torch.int32, device=device),
+                "barrier_generation": torch.zeros((1,), dtype=torch.int32, device=device),
+                "hidden_out": torch.empty((6144,), dtype=dtype, device=device),
+                "out": torch.empty((2048,), dtype=dtype, device=device),
+            }
+            self._o_proj_post_attn_mlp_workspaces[variant] = workspace
+            return workspace
+
+        raise ValueError(f"unsupported o_proj_post_attn_mlp workspace variant: {variant}")
+
 
 _TRITON_ROWS_THRESHOLD = 32
 _ENABLE_TRITON_SMALL_RMSNORM = os.environ.get("ENABLE_TRITON_SMALL_RMSNORM", "1") == "1"
@@ -412,6 +480,9 @@ _ENABLE_CUDA_FUSED_ADD_RMSNORM_GATEUP = os.environ.get("ENABLE_CUDA_FUSED_ADD_RM
 _ENABLE_CUDA_FUSED_POST_ATTN_MLP_PERSISTENT = os.environ.get("ENABLE_CUDA_FUSED_POST_ATTN_MLP_PERSISTENT", "0") == "1"
 _ENABLE_CUDA_FUSED_O_PROJ_POST_ATTN_MLP_PERSISTENT = os.environ.get(
     "ENABLE_CUDA_FUSED_O_PROJ_POST_ATTN_MLP_PERSISTENT", "0"
+) == "1"
+_ENABLE_CUDA_FUSED_O_PROJ_POST_ATTN_MLP_SOFTSYNC = os.environ.get(
+    "ENABLE_CUDA_FUSED_O_PROJ_POST_ATTN_MLP_SOFTSYNC", "0"
 ) == "1"
 _ENABLE_CUDA_FUSED_GATEUP_SILU_DOWNPROJ = os.environ.get("ENABLE_CUDA_FUSED_GATEUP_SILU_DOWNPROJ", "0") == "1"
 _ENABLE_CUDA_FUSED_GATEUP_SILU_DOWNPROJ_MEGA = os.environ.get("ENABLE_CUDA_FUSED_GATEUP_SILU_DOWNPROJ_MEGA", "0") == "1"
@@ -447,6 +518,14 @@ _ENABLE_CUDA_NOSPLIT_GEMV = os.environ.get("ENABLE_CUDA_NOSPLIT_GEMV", "0") == "
 _ENABLE_PARTITION_GEMV = os.environ.get("ENABLE_PARTITION_GEMV", "0") == "1"
 _PARTITION_DATA = None  # Set by evaluation_wrapper after probing
 _ENABLE_DECODE_NVTX = os.environ.get("ENABLE_DECODE_NVTX", "0") == "1"
+
+
+def _active_o_proj_post_attn_mlp_variant() -> str | None:
+    if _ENABLE_CUDA_FUSED_O_PROJ_POST_ATTN_MLP_SOFTSYNC:
+        return "softsync"
+    if _ENABLE_CUDA_FUSED_O_PROJ_POST_ATTN_MLP_PERSISTENT:
+        return "persistent"
+    return None
 
 
 @contextmanager
@@ -1029,6 +1108,7 @@ def _fused_o_proj_post_attn_mlp_persistent(
     down_proj_bias: torch.Tensor | None,
     eps: float,
     prefer_small_triton: bool = False,
+    workspace: dict | None = None,
 ) -> torch.Tensor | None:
     if (
         not prefer_small_triton
@@ -1075,8 +1155,114 @@ def _fused_o_proj_post_attn_mlp_persistent(
         down_proj_weight,
         down_proj_bias,
         eps,
+        workspace=workspace,
     )
     return out
+
+
+def _fused_o_proj_post_attn_mlp_softsync(
+    residual: torch.Tensor,
+    attn_input: torch.Tensor,
+    o_proj_weight: torch.Tensor,
+    o_proj_bias: torch.Tensor | None,
+    norm_weight: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_proj_weight: torch.Tensor,
+    down_proj_bias: torch.Tensor | None,
+    eps: float,
+    prefer_small_triton: bool = False,
+    workspace: dict | None = None,
+) -> torch.Tensor | None:
+    if (
+        not prefer_small_triton
+        or not _ENABLE_CUDA_FUSED_O_PROJ_POST_ATTN_MLP_SOFTSYNC
+        or residual.device.type != "cuda"
+        or attn_input.device.type != "cuda"
+        or o_proj_weight.device.type != "cuda"
+        or norm_weight.device.type != "cuda"
+        or gate_up_weight.device.type != "cuda"
+        or down_proj_weight.device.type != "cuda"
+        or residual.dtype != torch.float16
+        or attn_input.dtype != torch.float16
+        or o_proj_weight.dtype != torch.float16
+        or norm_weight.dtype != torch.float16
+        or gate_up_weight.dtype != torch.float16
+        or down_proj_weight.dtype != torch.float16
+        or residual.ndim < 2
+        or residual.shape[-2] != 1
+        or residual.shape != attn_input.shape
+        or residual.shape[-1] != 2048
+        or o_proj_weight.shape != (2048, 2048)
+        or norm_weight.numel() != 2048
+        or gate_up_weight.shape != (12288, 2048)
+        or down_proj_weight.shape != (2048, 6144)
+        or residual.stride(-1) != 1
+        or attn_input.stride(-1) != 1
+        or o_proj_weight.stride(-1) != 1
+        or norm_weight.stride(-1) != 1
+        or gate_up_weight.stride(-1) != 1
+        or down_proj_weight.stride(-1) != 1
+        or (o_proj_bias is not None and o_proj_bias.dtype != torch.float16)
+        or (down_proj_bias is not None and down_proj_bias.dtype != torch.float16)
+    ):
+        return None
+
+    import cuda_decode_gemv
+    _hidden_states, out = cuda_decode_gemv.fused_o_proj_post_attn_mlp_softsync_half(
+        residual,
+        attn_input,
+        o_proj_weight,
+        o_proj_bias,
+        norm_weight,
+        gate_up_weight,
+        down_proj_weight,
+        down_proj_bias,
+        eps,
+        workspace=workspace,
+    )
+    return out
+
+
+def _fused_o_proj_post_attn_mlp(
+    residual: torch.Tensor,
+    attn_input: torch.Tensor,
+    o_proj_weight: torch.Tensor,
+    o_proj_bias: torch.Tensor | None,
+    norm_weight: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_proj_weight: torch.Tensor,
+    down_proj_bias: torch.Tensor | None,
+    eps: float,
+    prefer_small_triton: bool = False,
+    workspace: dict | None = None,
+) -> torch.Tensor | None:
+    if _ENABLE_CUDA_FUSED_O_PROJ_POST_ATTN_MLP_SOFTSYNC:
+        return _fused_o_proj_post_attn_mlp_softsync(
+            residual,
+            attn_input,
+            o_proj_weight,
+            o_proj_bias,
+            norm_weight,
+            gate_up_weight,
+            down_proj_weight,
+            down_proj_bias,
+            eps,
+            prefer_small_triton=prefer_small_triton,
+            workspace=workspace,
+        )
+    return _fused_o_proj_post_attn_mlp_persistent(
+        residual,
+        attn_input,
+        o_proj_weight,
+        o_proj_bias,
+        norm_weight,
+        gate_up_weight,
+        down_proj_weight,
+        down_proj_bias,
+        eps,
+        prefer_small_triton=prefer_small_triton,
+        workspace=workspace,
+    )
 
 
 def _fused_silu_mul(
@@ -2989,13 +3175,15 @@ def set_cuda_mlp_fusion_flags(
     add_rmsnorm_gateup: bool | None = None,
     post_attn_mlp_persistent: bool | None = None,
     o_proj_post_attn_mlp_persistent: bool | None = None,
+    o_proj_post_attn_mlp_softsync: bool | None = None,
     silu_downproj: bool | None = None,
     gateup_silu_downproj: bool | None = None,
     gateup_silu_downproj_mega: bool | None = None,
-) -> tuple[bool, bool, bool, bool, bool, bool]:
+) -> tuple[bool, bool, bool, bool, bool, bool, bool]:
     global _ENABLE_CUDA_FUSED_ADD_RMSNORM_GATEUP
     global _ENABLE_CUDA_FUSED_POST_ATTN_MLP_PERSISTENT
     global _ENABLE_CUDA_FUSED_O_PROJ_POST_ATTN_MLP_PERSISTENT
+    global _ENABLE_CUDA_FUSED_O_PROJ_POST_ATTN_MLP_SOFTSYNC
     global _ENABLE_CUDA_FUSED_SILU_DOWNPROJ
     global _ENABLE_CUDA_FUSED_GATEUP_SILU_DOWNPROJ
     global _ENABLE_CUDA_FUSED_GATEUP_SILU_DOWNPROJ_MEGA
@@ -3003,6 +3191,7 @@ def set_cuda_mlp_fusion_flags(
         _ENABLE_CUDA_FUSED_ADD_RMSNORM_GATEUP,
         _ENABLE_CUDA_FUSED_POST_ATTN_MLP_PERSISTENT,
         _ENABLE_CUDA_FUSED_O_PROJ_POST_ATTN_MLP_PERSISTENT,
+        _ENABLE_CUDA_FUSED_O_PROJ_POST_ATTN_MLP_SOFTSYNC,
         _ENABLE_CUDA_FUSED_SILU_DOWNPROJ,
         _ENABLE_CUDA_FUSED_GATEUP_SILU_DOWNPROJ,
         _ENABLE_CUDA_FUSED_GATEUP_SILU_DOWNPROJ_MEGA,
@@ -3013,6 +3202,8 @@ def set_cuda_mlp_fusion_flags(
         _ENABLE_CUDA_FUSED_POST_ATTN_MLP_PERSISTENT = post_attn_mlp_persistent
     if o_proj_post_attn_mlp_persistent is not None:
         _ENABLE_CUDA_FUSED_O_PROJ_POST_ATTN_MLP_PERSISTENT = o_proj_post_attn_mlp_persistent
+    if o_proj_post_attn_mlp_softsync is not None:
+        _ENABLE_CUDA_FUSED_O_PROJ_POST_ATTN_MLP_SOFTSYNC = o_proj_post_attn_mlp_softsync
     if silu_downproj is not None:
         _ENABLE_CUDA_FUSED_SILU_DOWNPROJ = silu_downproj
     if gateup_silu_downproj is not None:
