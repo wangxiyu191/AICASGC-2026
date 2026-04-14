@@ -105,6 +105,8 @@ def _install_attention_capture(capture: AttentionCapture):
         prefer_small_triton=False,
         cache_position=None,
         splitkv_workspace=None,
+        prefetch_weight=None,
+        prefetch_blocks=0,
     ):
         capture.maybe_capture(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position)
         return original(
@@ -117,6 +119,8 @@ def _install_attention_capture(capture: AttentionCapture):
             prefer_small_triton=prefer_small_triton,
             cache_position=cache_position,
             splitkv_workspace=splitkv_workspace,
+            prefetch_weight=prefetch_weight,
+            prefetch_blocks=prefetch_blocks,
         )
 
     optimized_layer._small_decode_attention = wrapped

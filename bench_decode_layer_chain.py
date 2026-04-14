@@ -159,6 +159,8 @@ def _run_layer_chain_capture(
         prefer_small_triton=False,
         cache_position=None,
         splitkv_workspace=None,
+        prefetch_weight=None,
+        prefetch_blocks=0,
     ):
         capture.maybe_capture_attention(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position)
         return original_attention(
@@ -171,6 +173,8 @@ def _run_layer_chain_capture(
             prefer_small_triton=prefer_small_triton,
             cache_position=cache_position,
             splitkv_workspace=splitkv_workspace,
+            prefetch_weight=prefetch_weight,
+            prefetch_blocks=prefetch_blocks,
         )
 
     def _capturing_cuda_nosplit_gemv(x, weight, bias):
@@ -351,6 +355,24 @@ def _run_layer_chain_graph(target_layer, payload):
             q = q_view.transpose(1, 2)
             _k_cur = k_view.transpose(1, 2)
 
+            attention_prefetch_weight = None
+            attention_prefetch_blocks = 0
+            if (
+                optimized_layer._ENABLE_CUDA_SMALL_DECODE_ATTENTION_O_PROJ_PREFETCH
+                and target_layer.o_proj_weight.device.type == "cuda"
+                and target_layer.o_proj_weight.dtype == torch.float16
+                and tuple(target_layer.o_proj_weight.shape) == (2048, 2048)
+                and target_layer.o_proj_weight.is_contiguous()
+                and (
+                    optimized_layer._active_o_proj_post_attn_mlp_variant() is not None
+                    or not optimized_layer._ENABLE_PARTITION_GEMV
+                )
+            ):
+                attention_prefetch_weight = target_layer.o_proj_weight
+                attention_prefetch_blocks = (
+                    optimized_layer._CUDA_SMALL_DECODE_ATTENTION_O_PROJ_PREFETCH_BLOCKS
+                )
+
             attn_output = optimized_layer._small_decode_attention(
                 attn["q"],
                 attn["k"],
@@ -361,6 +383,8 @@ def _run_layer_chain_graph(target_layer, payload):
                 prefer_small_triton=prefer_small_triton,
                 cache_position=attn["cache_position"],
                 splitkv_workspace=target_layer._splitkv_workspace,
+                prefetch_weight=attention_prefetch_weight,
+                prefetch_blocks=attention_prefetch_blocks,
             )
             if attn_output is None:
                 raise RuntimeError("layer-chain benchmark expected small decode attention path")

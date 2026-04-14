@@ -1104,6 +1104,8 @@ class VLMModel:
             self._optimizations_applied.append("decode:o_proj_post_attn_mlp_persistent")
         if os.environ.get("ENABLE_CUDA_FUSED_POST_ATTN_MLP_PERSISTENT", "0") == "1":
             self._optimizations_applied.append("decode:post_attn_mlp_persistent")
+        if os.environ.get("ENABLE_CUDA_SMALL_DECODE_ATTENTION_O_PROJ_PREFETCH", "0") == "1":
+            self._optimizations_applied.append("decode:attn_o_proj_prefetch")
         if os.environ.get("ENABLE_CUDA_FUSED_GATEUP_SILU_DOWNPROJ", "0") == "1":
             variant = os.environ.get("CUDA_FUSED_GATEUP_SILU_DOWNPROJ_VARIANT", "persistent").strip().lower()
             self._optimizations_applied.append(f"decode:mlp_fused_{variant}")

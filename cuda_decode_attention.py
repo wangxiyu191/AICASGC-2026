@@ -232,6 +232,8 @@ def decode_attn_v4_splitkv(
     cache_position: torch.Tensor,
     split_k: int | None = None,
     workspace: dict | None = None,
+    prefetch_weight: torch.Tensor | None = None,
+    prefetch_blocks: int = 0,
 ) -> torch.Tensor | None:
     if (
         num_key_value_groups != 2
@@ -276,6 +278,17 @@ def decode_attn_v4_splitkv(
         partial_stats = torch.empty(layout["partial_stats_shape"], dtype=torch.float32, device=q.device)
         out = torch.empty(layout["out_shape"], dtype=q.dtype, device=q.device)
 
+    valid_prefetch = (
+        prefetch_blocks > 0
+        and prefetch_weight is not None
+        and prefetch_weight.device == q.device
+        and prefetch_weight.dtype == torch.float16
+        and prefetch_weight.dim() == 2
+        and tuple(prefetch_weight.shape) == (2048, 2048)
+        and prefetch_weight.is_contiguous()
+    )
+    prefetch_tensor = prefetch_weight if valid_prefetch else q.reshape(-1)[:0]
+
     ext = _load_ext()
     ext.decode_attn_v4_splitkv(
         q, k, v, cache_position,
@@ -283,5 +296,7 @@ def decode_attn_v4_splitkv(
         partial_acc, partial_stats, out,
         int(num_key_value_groups),
         int(split_k),
+        prefetch_tensor,
+        int(prefetch_blocks if valid_prefetch else 0),
     )
     return out.unsqueeze(2).transpose(1, 2)

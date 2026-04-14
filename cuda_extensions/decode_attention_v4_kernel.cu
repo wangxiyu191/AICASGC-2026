@@ -26,7 +26,37 @@ constexpr int kGroupsPerWarp = kWarpSize / kThreadGroup;  // 8
 constexpr int kDimsPerThread = kHeadDim / kThreadGroup;   // 32
 constexpr int kTileSteps    = 8;                          // steps per tile
 constexpr int kTileN        = kGroupsPerWarp * kTileSteps; // 64 tokens per tile
+constexpr int kPrefetchLineBytes = 128;
 constexpr float kNegLarge   = -1.0e20f;
+
+__device__ __forceinline__ void prefetch_global_l2(const void* ptr) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+    asm volatile("prefetch.global.L2 [%0];" :: "l"(ptr));
+#else
+    (void)ptr;
+#endif
+}
+
+__device__ __forceinline__ void prefetch_weight_lines_l2(
+    const __half* weight,
+    int64_t weight_numel,
+    int prefetch_block_idx,
+    int prefetch_blocks) {
+    if (weight == nullptr || weight_numel <= 0 || prefetch_blocks <= 0) {
+        return;
+    }
+
+    const char* weight_bytes = reinterpret_cast<const char*>(weight);
+    const int64_t total_bytes = weight_numel * static_cast<int64_t>(sizeof(__half));
+    const int64_t total_lines = (total_bytes + kPrefetchLineBytes - 1) / kPrefetchLineBytes;
+    const int64_t thread_idx =
+        static_cast<int64_t>(prefetch_block_idx) * blockDim.x + threadIdx.x;
+    const int64_t stride = static_cast<int64_t>(prefetch_blocks) * blockDim.x;
+
+    for (int64_t line_idx = thread_idx; line_idx < total_lines; line_idx += stride) {
+        prefetch_global_l2(weight_bytes + line_idx * kPrefetchLineBytes);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Forward kernel — tiled two-pass, always 64-token tiles
@@ -36,6 +66,7 @@ decode_attn_v4_fwd_kernel(
     const __half* __restrict__ q,
     const __half* __restrict__ k,
     const __half* __restrict__ v,
+    const __half* __restrict__ prefetch_weight,
     const int64_t* __restrict__ cache_position,
     float* __restrict__ partial_acc,
     float* __restrict__ partial_stats,
@@ -45,12 +76,24 @@ decode_attn_v4_fwd_kernel(
     int64_t pa_stride_kh, int64_t pa_stride_split, int64_t pa_stride_head,
     int64_t ps_stride_kh, int64_t ps_stride_split,
     int64_t ps_stride_head, int64_t ps_stride_stat,
+    int64_t prefetch_weight_numel,
     float scale,
     int max_seq_len,
-    int split_k) {
+    int split_k,
+    int attention_blocks) {
 
-    const int kv_head_idx = blockIdx.x;
-    const int split_idx  = blockIdx.y;
+    const int linear_block_idx = blockIdx.x;
+    if (linear_block_idx >= attention_blocks) {
+        prefetch_weight_lines_l2(
+            prefetch_weight,
+            prefetch_weight_numel,
+            linear_block_idx - attention_blocks,
+            gridDim.x - attention_blocks);
+        return;
+    }
+
+    const int kv_head_idx = linear_block_idx / split_k;
+    const int split_idx  = linear_block_idx - kv_head_idx * split_k;
     const int tid = threadIdx.x;
     const int warp_id = tid >> 5;
     const int lane    = tid & 31;
@@ -273,7 +316,9 @@ torch::Tensor decode_attn_v4_splitkv_cuda(
     const torch::Tensor& partial_stats,
     const torch::Tensor& out,
     int64_t num_kv_groups,
-    int64_t split_k) {
+    int64_t split_k,
+    const torch::Tensor& prefetch_weight,
+    int64_t prefetch_blocks) {
 
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "inputs must be CUDA");
     TORCH_CHECK(q.scalar_type() == torch::kHalf, "only float16");
@@ -285,6 +330,7 @@ torch::Tensor decode_attn_v4_splitkv_cuda(
     TORCH_CHECK(split_k > 1, "split_k must be > 1");
     TORCH_CHECK(split_k <= partial_acc.size(1), "split_k exceeds partial_acc capacity");
     TORCH_CHECK(split_k <= partial_stats.size(1), "split_k exceeds partial_stats capacity");
+    TORCH_CHECK(prefetch_blocks >= 0, "prefetch_blocks must be >= 0");
 
     c10::cuda::CUDAGuard device_guard(q.device());
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -293,9 +339,29 @@ torch::Tensor decode_attn_v4_splitkv_cuda(
     auto kp = reinterpret_cast<const __half*>(k.data_ptr<at::Half>());
     auto vp = reinterpret_cast<const __half*>(v.data_ptr<at::Half>());
     auto op = reinterpret_cast<__half*>(out.data_ptr<at::Half>());
+    const __half* prefetch_ptr = nullptr;
+    int64_t prefetch_numel = 0;
+    if (prefetch_blocks > 0 && prefetch_weight.numel() > 0) {
+        TORCH_CHECK(prefetch_weight.is_cuda(), "prefetch_weight must be CUDA");
+        TORCH_CHECK(prefetch_weight.device() == q.device(), "prefetch_weight must match q device");
+        TORCH_CHECK(prefetch_weight.scalar_type() == torch::kHalf, "prefetch_weight must be float16");
+        TORCH_CHECK(
+            prefetch_weight.dim() == 2
+                && prefetch_weight.size(0) == 2048
+                && prefetch_weight.size(1) == 2048
+                && prefetch_weight.stride(0) == 2048
+                && prefetch_weight.stride(1) == 1,
+            "prefetch_weight must be contiguous [2048, 2048]");
+        prefetch_ptr = reinterpret_cast<const __half*>(prefetch_weight.data_ptr<at::Half>());
+        prefetch_numel = prefetch_weight.numel();
+    } else {
+        prefetch_blocks = 0;
+    }
 
-    decode_attn_v4_fwd_kernel<<<dim3(num_kv_heads, split_k), 64, 0, stream>>>(
-        qp, kp, vp,
+    const int attention_blocks = static_cast<int>(num_kv_heads * split_k);
+
+    decode_attn_v4_fwd_kernel<<<attention_blocks + static_cast<int>(prefetch_blocks), 64, 0, stream>>>(
+        qp, kp, vp, prefetch_ptr,
         cache_position.data_ptr<int64_t>(),
         partial_acc.data_ptr<float>(),
         partial_stats.data_ptr<float>(),
@@ -305,9 +371,11 @@ torch::Tensor decode_attn_v4_splitkv_cuda(
         partial_acc.stride(0), partial_acc.stride(1), partial_acc.stride(2),
         partial_stats.stride(0), partial_stats.stride(1),
         partial_stats.stride(2), partial_stats.stride(3),
+        prefetch_numel,
         static_cast<float>(scale),
         static_cast<int>(max_seq_len),
-        static_cast<int>(split_k));
+        static_cast<int>(split_k),
+        attention_blocks);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     decode_attn_v4_merge_kernel<<<num_kv_heads, 128, 0, stream>>>(

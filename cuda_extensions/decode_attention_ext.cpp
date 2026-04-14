@@ -77,7 +77,9 @@ torch::Tensor decode_attn_v4_splitkv_cuda(
     const torch::Tensor& partial_stats,
     const torch::Tensor& out,
     int64_t num_kv_groups,
-    int64_t split_k);
+    int64_t split_k,
+    const torch::Tensor& prefetch_weight,
+    int64_t prefetch_blocks);
 
 torch::Tensor decode_attn_v4_splitkv(
     const torch::Tensor& q,
@@ -89,10 +91,13 @@ torch::Tensor decode_attn_v4_splitkv(
     const torch::Tensor& partial_stats,
     const torch::Tensor& out,
     int64_t num_kv_groups,
-    int64_t split_k) {
+    int64_t split_k,
+    const torch::Tensor& prefetch_weight,
+    int64_t prefetch_blocks) {
     return decode_attn_v4_splitkv_cuda(
         q, k, v, cache_position, scale,
-        partial_acc, partial_stats, out, num_kv_groups, split_k);
+        partial_acc, partial_stats, out, num_kv_groups, split_k,
+        prefetch_weight, prefetch_blocks);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

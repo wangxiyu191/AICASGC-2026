@@ -215,6 +215,20 @@ class OptimizedDecoderLayer(nn.Module):
                     else:
                         attn_key_states, attn_value_states = updated_kv
 
+        o_proj_post_attn_mlp_variant = _active_o_proj_post_attn_mlp_variant()
+        attention_prefetch_weight = None
+        attention_prefetch_blocks = 0
+        if (
+            _ENABLE_CUDA_SMALL_DECODE_ATTENTION_O_PROJ_PREFETCH
+            and self.o_proj_weight.device.type == "cuda"
+            and self.o_proj_weight.dtype == torch.float16
+            and self.o_proj_weight.shape == (2048, 2048)
+            and self.o_proj_weight.is_contiguous()
+            and (o_proj_post_attn_mlp_variant is not None or not _ENABLE_PARTITION_GEMV)
+        ):
+            attention_prefetch_weight = self.o_proj_weight
+            attention_prefetch_blocks = _CUDA_SMALL_DECODE_ATTENTION_O_PROJ_PREFETCH_BLOCKS
+
         # 5. Attention (SDPA)
         with _nvtx_range("decode.attention", enable_decode_nvtx):
             attn_output = _small_decode_attention(
@@ -227,6 +241,8 @@ class OptimizedDecoderLayer(nn.Module):
                 prefer_small_triton=prefer_small_decode_triton,
                 cache_position=cache_position,
                 splitkv_workspace=self._splitkv_workspace,
+                prefetch_weight=attention_prefetch_weight,
+                prefetch_blocks=attention_prefetch_blocks,
             )
             if attn_output is None:
                 attn_output, _ = self._attention_interface(
@@ -239,7 +255,6 @@ class OptimizedDecoderLayer(nn.Module):
         if not attn_output.is_contiguous():
             attn_output = attn_output.contiguous()
 
-        o_proj_post_attn_mlp_variant = _active_o_proj_post_attn_mlp_variant()
         o_proj_post_attn_mlp_nvtx = (
             "decode.o_proj_post_attn_mlp_full"
             if o_proj_post_attn_mlp_variant is None
@@ -510,6 +525,12 @@ _TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_SPLIT_K = int(os.environ.get("TRITON_SMA
 _TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_BLOCK_N = int(os.environ.get("TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_BLOCK_N", "0"))
 _TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_NUM_WARPS = int(os.environ.get("TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_NUM_WARPS", "0"))
 _TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_NUM_STAGES = int(os.environ.get("TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_NUM_STAGES", "0"))
+_ENABLE_CUDA_SMALL_DECODE_ATTENTION_O_PROJ_PREFETCH = os.environ.get(
+    "ENABLE_CUDA_SMALL_DECODE_ATTENTION_O_PROJ_PREFETCH", "0"
+) == "1"
+_CUDA_SMALL_DECODE_ATTENTION_O_PROJ_PREFETCH_BLOCKS = max(
+    0, int(os.environ.get("CUDA_SMALL_DECODE_ATTENTION_O_PROJ_PREFETCH_BLOCKS", "16"))
+)
 _ENABLE_TRITON_SMALL_DECODE_STATIC_KV = os.environ.get("ENABLE_TRITON_SMALL_DECODE_STATIC_KV", "1") == "1"
 _ENABLE_CUDA_FUSED_Q_ROPE_KV_CACHE = os.environ.get("ENABLE_CUDA_FUSED_Q_ROPE_KV_CACHE", "1") == "1"
 _ENABLE_TRITON_SMALL_DECODE_Q_ROPE_KV_CACHE = os.environ.get("ENABLE_TRITON_SMALL_DECODE_Q_ROPE_KV_CACHE", "0") == "1"
@@ -1694,6 +1715,8 @@ def _small_decode_attention(
     prefer_small_triton: bool = False,
     cache_position: torch.Tensor | None = None,
     splitkv_workspace: dict | None = None,
+    prefetch_weight: torch.Tensor | None = None,
+    prefetch_blocks: int = 0,
 ) -> torch.Tensor | None:
     """Single-token decode attention without repeat_kv copies."""
     if not _small_decode_attention_inputs_ok(
@@ -1752,6 +1775,8 @@ def _small_decode_attention(
             num_key_value_groups,
             cache_position,
             workspace=splitkv_workspace,
+            prefetch_weight=prefetch_weight,
+            prefetch_blocks=prefetch_blocks,
         )
         if out is not None:
             return out
