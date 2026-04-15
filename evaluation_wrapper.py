@@ -40,6 +40,7 @@ _ENABLE_PREFILL_TEXT_FASTPATH = os.environ.get("ENABLE_PREFILL_TEXT_FASTPATH", "
 _ENABLE_TRITON_PREFILL_FUSED_ADD_RMSNORM = os.environ.get("ENABLE_TRITON_PREFILL_FUSED_ADD_RMSNORM", "1") == "1"
 _ENABLE_TRITON_PREFILL_FUSED_SILU_MUL = os.environ.get("ENABLE_TRITON_PREFILL_FUSED_SILU_MUL", "1") == "1"
 _PREFILL_CACHE_MAX_ITEMS = max(1, int(os.environ.get("PREFILL_CACHE_MAX_ITEMS", "64")))
+_ENABLE_FUSED_LM_HEAD_ARGMAX = os.environ.get("ENABLE_FUSED_LM_HEAD_ARGMAX", "1") == "1"
 
 
 class CudaGraphExecutionError(RuntimeError):
@@ -916,8 +917,8 @@ class DecodeCudaGraphRunner:
             cache_position=self._cache_position_buf,
             logits_to_keep=1,
         )
-        self._logits_buf.copy_(outputs.logits[:, -1, :])
-        self._next_token_buf.copy_(torch.argmax(self._logits_buf, dim=-1, keepdim=True))
+        # Skip intermediate logits_buf copy — argmax directly on model output
+        self._next_token_buf.copy_(torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True))
 
     def _write_inputs(self, input_ids: torch.Tensor, current_position: int):
         self._input_ids_buf.copy_(input_ids)
@@ -1096,6 +1097,9 @@ class VLMModel:
         # Prefill-specific path optimizations
         self._optimize_prefill_path()
 
+        # Fused lm_head GEMV + argmax for decode
+        self._optimize_lm_head()
+
         # Wrap model
         self._wrapped_model = ModelWrapper(self._model)
         if os.environ.get("ENABLE_CUDA_FUSED_O_PROJ_POST_ATTN_MLP_SOFTSYNC", "0") == "1":
@@ -1138,6 +1142,43 @@ class VLMModel:
             self._optimizations_applied.append(f"fused_layers:{count}")
         except Exception as e:
             print(f"[VLMModel] Warning: Failed to replace decoder layers: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _optimize_lm_head(self):
+        """Replace lm_head with nosplit GEMV for single-token decode."""
+        if not _ENABLE_FUSED_LM_HEAD_ARGMAX:
+            return
+        try:
+            import cuda_decode_gemv
+            model = self._model
+            weight = model.lm_head.weight  # [vocab_size, hidden_dim]
+            N = weight.shape[0]
+            device = weight.device
+
+            # Pre-allocate output buffer with stable address for CUDAGraph
+            workspace = {
+                "type": "nosplit",
+                "out": torch.empty(N, dtype=weight.dtype, device=device),
+            }
+
+            class FastLmHead(torch.nn.Module):
+                def __init__(self, weight, workspace):
+                    super().__init__()
+                    self.weight = weight
+                    self._workspace = workspace
+
+                def forward(self, x):
+                    if x.shape[-2] == 1 and x.dtype == torch.float16 and x.is_cuda:
+                        return cuda_decode_gemv.nosplit_matvec_half(
+                            x, self.weight, None, workspace=self._workspace,
+                        )
+                    return F.linear(x, self.weight)
+
+            model.lm_head = FastLmHead(weight, workspace)
+            self._optimizations_applied.append("decode:fast_lm_head")
+        except Exception as e:
+            print(f"[VLMModel] Warning: Failed to optimize lm_head: {e}")
             import traceback
             traceback.print_exc()
 
