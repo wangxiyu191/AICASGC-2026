@@ -3,8 +3,7 @@
 
 Unlike nsys (which can't see inside CUDAGraph replays), this script
 injects cudaEvent pairs around individual CUDAGraph replays to measure
-the true steady-state decode step time. It also runs a breakdown using
-eager-mode decode with per-operation cudaEvent timing.
+the true steady-state decode step time.
 
 Usage:
     TQDM_DISABLE=1 ./venv/bin/python measure_decode_step.py \
@@ -20,7 +19,7 @@ os.environ.setdefault("ENABLE_CUDAGRAPH", "1")
 
 import torch
 from datasets import load_from_disk
-from statistics import mean, median
+from statistics import mean
 
 
 def prepare_inputs(model, image, question):
@@ -104,126 +103,6 @@ def measure_graph_replay_step(vlm, inputs, num_decode_steps=30, warmup=5):
     return step_times
 
 
-def measure_eager_breakdown(vlm, inputs, num_decode_steps=30, warmup=3):
-    """Run eager-mode decode with per-operation cudaEvent timing.
-
-    This disables CUDAGraph to see individual kernel timings.
-    """
-    from evaluation_wrapper import VLMModel, GreedyDecodeEngine
-    from transformers.cache_utils import StaticCache
-    from optimized_layer import set_small_decode_triton_enabled
-
-    model = vlm._model
-    wrapper = vlm.model
-
-    # Run a full generate first
-    with torch.no_grad():
-        _ = wrapper.generate(**inputs, max_new_tokens=1, do_sample=False, use_cache=True)
-
-    input_ids = inputs["input_ids"]
-    attention_mask = inputs.get("attention_mask")
-    pixel_values = inputs.get("pixel_values")
-    image_grid_thw = inputs.get("image_grid_thw")
-    mm_token_type_ids = inputs.get("mm_token_type_ids")
-
-    batch_size, prompt_length = input_ids.shape
-    device = input_ids.device
-    max_cache_len = prompt_length + num_decode_steps
-
-    if attention_mask is None:
-        prompt_attention_mask = torch.ones((batch_size, prompt_length), dtype=torch.bool, device=device)
-    else:
-        prompt_attention_mask = attention_mask.to(device=device, dtype=torch.bool)
-
-    full_attention_mask = torch.zeros((batch_size, max_cache_len), dtype=torch.bool, device=device)
-    full_attention_mask[:, :prompt_length] = prompt_attention_mask
-
-    static_cache = StaticCache(config=model.config, max_cache_len=max_cache_len)
-
-    # We need to use the actual decode path (with optimized layers) but without CUDAGraph
-    # to measure individual operation timings
-    set_small_decode_triton_enabled(model, True)
-
-    try:
-        with torch.no_grad():
-            # Prefill
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=prompt_attention_mask,
-                pixel_values=pixel_values,
-                image_grid_thw=image_grid_thw,
-                mm_token_type_ids=mm_token_type_ids,
-                past_key_values=static_cache,
-                use_cache=True,
-                logits_to_keep=1,
-            )
-            rope_deltas = outputs.rope_deltas
-            next_tokens = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
-
-            # Warmup decode steps
-            for i in range(min(warmup, num_decode_steps - 1)):
-                current_position = prompt_length + i
-                full_attention_mask[:, current_position] = True
-                text_position_ids = torch.full((1, 1), current_position, dtype=torch.long, device=device)
-                if rope_deltas is not None:
-                    text_position_ids = text_position_ids + rope_deltas.to(device=device, dtype=torch.long).view(1, 1)
-                position_ids = text_position_ids.view(1, 1, 1).expand(3, 1, 1)
-                cache_position = torch.tensor([current_position], dtype=torch.long, device=device)
-
-                outputs = model(
-                    input_ids=next_tokens,
-                    attention_mask=full_attention_mask,
-                    position_ids=position_ids,
-                    past_key_values=static_cache,
-                    use_cache=True,
-                    cache_position=cache_position,
-                    logits_to_keep=1,
-                )
-                next_tokens = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
-
-            # Now measure decode steps with cudaEvent timing
-            measured_steps = []
-            for i in range(warmup, num_decode_steps - 1):
-                current_position = prompt_length + i
-                full_attention_mask[:, current_position] = True
-                text_position_ids = torch.full((1, 1), current_position, dtype=torch.long, device=device)
-                if rope_deltas is not None:
-                    text_position_ids = text_position_ids + rope_deltas.to(device=device, dtype=torch.long).view(1, 1)
-                position_ids = text_position_ids.view(1, 1, 1).expand(3, 1, 1)
-                cache_position = torch.tensor([current_position], dtype=torch.long, device=device)
-
-                # Time the entire decode step
-                start_event = torch.cuda.Event(enable_timing=True)
-                end_event = torch.cuda.Event(enable_timing=True)
-                start_event.record()
-                outputs = model(
-                    input_ids=next_tokens,
-                    attention_mask=full_attention_mask,
-                    position_ids=position_ids,
-                    past_key_values=static_cache,
-                    use_cache=True,
-                    cache_position=cache_position,
-                    logits_to_keep=1,
-                )
-                next_tokens_new = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
-                end_event.record()
-                torch.cuda.synchronize()
-
-                step_ms = start_event.elapsed_time(end_event)
-                cache_len = current_position + 1
-                measured_steps.append({
-                    'step': i,
-                    'cache_len': cache_len,
-                    'step_ms': step_ms,
-                })
-                next_tokens = next_tokens_new
-
-    finally:
-        set_small_decode_triton_enabled(model, False)
-
-    return measured_steps
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--sample-idx", type=int, default=0)
@@ -260,38 +139,6 @@ def main():
                   f"decode={t['decode_ms']:.2f}ms, tokens={t['tokens']}, "
                   f"{t['ms_per_token']:.3f}ms/tok, {t['tok_per_sec']:.1f}tok/s")
         print(f"\n  Average: {avg_ms_per_token:.3f} ms/token, {avg_tok_s:.0f} tok/s")
-
-    # 2. Measure eager decode per-step timing
-    print(f"\n{'='*80}")
-    print("EAGER DECODE PER-STEP TIMING (small_decode_triton=True, no CUDAGraph)")
-    print(f"{'='*80}")
-    eager_steps = measure_eager_breakdown(
-        vlm, inputs, num_decode_steps=args.decode_steps, warmup=args.warmup
-    )
-    if eager_steps:
-        step_times = [s['step_ms'] for s in eager_steps]
-        print(f"\n  Measured {len(eager_steps)} decode steps:")
-        print(f"  Mean:   {mean(step_times):.3f} ms/step")
-        print(f"  Median: {median(step_times):.3f} ms/step")
-        print(f"  Min:    {min(step_times):.3f} ms/step")
-        print(f"  Max:    {max(step_times):.3f} ms/step")
-        print(f"\n  Per-step detail:")
-        for s in eager_steps:
-            print(f"    step={s['step']:>3}, cache_len={s['cache_len']:>5}, "
-                  f"step_ms={s['step_ms']:.3f}")
-
-    # 3. Summary comparison
-    print(f"\n{'='*80}")
-    print("SUMMARY")
-    print(f"{'='*80}")
-    if graph_times:
-        print(f"  CUDAGraph decode: {avg_ms_per_token:.3f} ms/token → {avg_tok_s:.0f} tok/s")
-    if eager_steps:
-        eager_avg = mean(step_times)
-        # Eager doesn't include lm_head + argmax (only model forward)
-        print(f"  Eager decode (model fwd only): {eager_avg:.3f} ms/step")
-        print(f"  Note: Eager step doesn't include lm_head + argmax")
-        print(f"  Note: Eager includes Python dispatch overhead not present in CUDAGraph")
 
 
 if __name__ == "__main__":

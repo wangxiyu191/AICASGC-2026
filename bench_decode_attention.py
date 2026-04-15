@@ -436,34 +436,6 @@ def _triton_current(q, k, v, attention_mask, scaling, num_key_value_groups, cach
     return out
 
 
-def _bench_impl(
-    fn,
-    q,
-    k,
-    v,
-    attention_mask,
-    scaling,
-    num_key_value_groups,
-    cache_position,
-    warmup: int,
-    iters: int,
-):
-    for _ in range(warmup):
-        fn(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position)
-    torch.cuda.synchronize()
-
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    out = None
-    start.record()
-    for _ in range(iters):
-        out = fn(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position)
-    end.record()
-    end.synchronize()
-    elapsed_ms = start.elapsed_time(end) / iters
-    return out, elapsed_ms
-
-
 def _bench_impl_graph(
     fn,
     q,
@@ -543,7 +515,6 @@ def _run_benchmarks(
     payload,
     warmup: int,
     iters: int,
-    use_graph: bool = False,
     graph_capture_repeats: int = 1,
     l2_flush_mb: int = DEFAULT_BENCHMARK_L2_FLUSH_MB,
 ):
@@ -571,24 +542,21 @@ def _run_benchmarks(
         "sdpa_enable_gqa_valid_prefix": lambda q, k, v, attention_mask, scaling, num_key_value_groups, _cache_position: _sdpa_gqa_valid_only(q, k, v, attention_mask, scaling, num_key_value_groups),
     }
 
-    if use_graph:
-        pre_replay = make_l2_flush_runner(payload["q"].device, l2_flush_mb)
-        bench_fn = lambda fn, q, k, v, attention_mask, scaling, num_key_value_groups, cache_position, warmup, iters: _bench_impl_graph(
-            fn,
-            q,
-            k,
-            v,
-            attention_mask,
-            scaling,
-            num_key_value_groups,
-            cache_position,
-            warmup=warmup,
-            iters=iters,
-            capture_repeats=graph_capture_repeats,
-            pre_replay=pre_replay,
-        )
-    else:
-        bench_fn = _bench_impl
+    pre_replay = make_l2_flush_runner(payload["q"].device, l2_flush_mb)
+    bench_fn = lambda fn, q, k, v, attention_mask, scaling, num_key_value_groups, cache_position, warmup, iters: _bench_impl_graph(
+        fn,
+        q,
+        k,
+        v,
+        attention_mask,
+        scaling,
+        num_key_value_groups,
+        cache_position,
+        warmup=warmup,
+        iters=iters,
+        capture_repeats=graph_capture_repeats,
+        pre_replay=pre_replay,
+    )
     results = {}
     ref_out, ref_ms = bench_fn(
         variants["hf_repeat_kv_sdpa"],
@@ -641,8 +609,6 @@ def main():
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--bucketed", action="store_true", default=True, help="Use graph-style bucketed max_cache_len")
     parser.add_argument("--no-bucketed", dest="bucketed", action="store_false")
-    parser.add_argument("--graph", action="store_true", default=True, help="Use CUDAGraph replay to eliminate dispatch overhead (default)")
-    parser.add_argument("--no-graph", dest="graph", action="store_false", help="Use eager mode (includes Python dispatch overhead)")
     parser.add_argument(
         "--timing-profile",
         choices=("realistic", "idealized"),
@@ -657,7 +623,7 @@ def main():
         type=int,
         default=None,
         help=(
-            "Number of identical ops batched into one graph replay when --graph is enabled. "
+            "Number of identical ops batched into one graph replay. "
             "Default: 1 for realistic, 64 for idealized"
         ),
     )
@@ -672,7 +638,7 @@ def main():
         )
     if args.graph_capture_repeats is None:
         args.graph_capture_repeats = 1 if args.timing_profile == "realistic" else 64
-    if args.graph and args.l2_flush_mb > 0 and args.graph_capture_repeats != 1:
+    if args.l2_flush_mb > 0 and args.graph_capture_repeats != 1:
         print(
             f"[AttentionBench] l2 flush enabled ({args.l2_flush_mb} MiB); "
             f"forcing graph_capture_repeats from {args.graph_capture_repeats} to 1 so every replay runs cold."
@@ -720,11 +686,11 @@ def main():
         "max_cache_len": capture_meta["max_cache_len"],
         "captured_decode_step": capture_meta["captured_decode_step"],
         "cache_position": int(payload["cache_position"].item()) if payload["cache_position"] is not None else None,
-        "bench_mode": "graph" if args.graph else "eager",
+        "bench_mode": "graph",
         "timer": "cuda_event",
         "timing_profile": args.timing_profile,
-        "graph_capture_repeats": int(args.graph_capture_repeats if args.graph else 1),
-        "l2_flush_mb": int(args.l2_flush_mb if args.graph else 0),
+        "graph_capture_repeats": int(args.graph_capture_repeats),
+        "l2_flush_mb": int(args.l2_flush_mb),
     }
 
     print(
@@ -732,16 +698,14 @@ def main():
         f"valid_len={metadata['valid_len']}, max_cache_len={metadata['max_cache_len']}, "
         f"q={tuple(metadata['q_shape'])}, k={tuple(metadata['k_shape'])}"
     )
-    bench_mode = "graph" if args.graph else "eager"
     print(
-        f"[AttentionBench] Benchmarking implementations (mode={bench_mode}, "
+        f"[AttentionBench] Benchmarking implementations (mode=graph, "
         f"profile={args.timing_profile}, capture_repeats={args.graph_capture_repeats})..."
     )
     benchmarks = _run_benchmarks(
         payload,
         warmup=args.warmup,
         iters=args.iters,
-        use_graph=args.graph,
         graph_capture_repeats=args.graph_capture_repeats,
         l2_flush_mb=args.l2_flush_mb,
     )

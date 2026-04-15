@@ -503,22 +503,6 @@ def _cuda_nosplit_persistent_hfma2_matvec(x, weight, bias):
     return cuda_decode_gemv.nosplit_matvec_half_variant(x, weight, bias, "persistent_hfma2")
 
 
-def _bench_impl(fn, x, weight, bias, warmup: int, iters: int):
-    for _ in range(warmup):
-        fn(x, weight, bias)
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    out = None
-    start.record()
-    for _ in range(iters):
-        out = fn(x, weight, bias)
-    end.record()
-    end.synchronize()
-    elapsed_ms = start.elapsed_time(end) / iters
-    return out, elapsed_ms
-
-
 def _bench_impl_graph(
     fn,
     x,
@@ -590,7 +574,6 @@ def _run_benchmarks(
     payload,
     warmup: int,
     iters: int,
-    use_graph: bool = False,
     graph_capture_repeats: int = 1,
     l2_flush_mb: int = DEFAULT_BENCHMARK_L2_FLUSH_MB,
 ):
@@ -633,20 +616,17 @@ def _run_benchmarks(
         "cuda_nosplit_persistent_matvec": _cuda_nosplit_persistent_matvec,
         "cuda_nosplit_persistent_hfma2_matvec": _cuda_nosplit_persistent_hfma2_matvec,
     }
-    if use_graph:
-        pre_replay = make_l2_flush_runner(payload["x"].device, l2_flush_mb)
-        bench_fn = lambda fn, x, weight, bias, warmup, iters: _bench_impl_graph(
-            fn,
-            x,
-            weight,
-            bias,
-            warmup=warmup,
-            iters=iters,
-            capture_repeats=graph_capture_repeats,
-            pre_replay=pre_replay,
-        )
-    else:
-        bench_fn = _bench_impl
+    pre_replay = make_l2_flush_runner(payload["x"].device, l2_flush_mb)
+    bench_fn = lambda fn, x, weight, bias, warmup, iters: _bench_impl_graph(
+        fn,
+        x,
+        weight,
+        bias,
+        warmup=warmup,
+        iters=iters,
+        capture_repeats=graph_capture_repeats,
+        pre_replay=pre_replay,
+    )
     results = {}
     ref_out, ref_ms = bench_fn(
         variants["f_linear"],
@@ -697,8 +677,6 @@ def main():
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--bucketed", action="store_true", default=True)
     parser.add_argument("--no-bucketed", dest="bucketed", action="store_false")
-    parser.add_argument("--graph", action="store_true", default=True, help="Use CUDAGraph replay to eliminate dispatch overhead (default)")
-    parser.add_argument("--no-graph", dest="graph", action="store_false", help="Use eager mode (includes Python dispatch overhead)")
     parser.add_argument(
         "--timing-profile",
         choices=("realistic", "idealized"),
@@ -713,7 +691,7 @@ def main():
         type=int,
         default=None,
         help=(
-            "Number of identical ops batched into one graph replay when --graph is enabled. "
+            "Number of identical ops batched into one graph replay. "
             "Default: 1 for realistic, 64 for idealized"
         ),
     )
@@ -728,7 +706,7 @@ def main():
         )
     if args.graph_capture_repeats is None:
         args.graph_capture_repeats = 1 if args.timing_profile == "realistic" else 64
-    if args.graph and args.l2_flush_mb > 0 and args.graph_capture_repeats != 1:
+    if args.l2_flush_mb > 0 and args.graph_capture_repeats != 1:
         print(
             f"[LinearBench] l2 flush enabled ({args.l2_flush_mb} MiB); "
             f"forcing graph_capture_repeats from {args.graph_capture_repeats} to 1 so every replay runs cold."
@@ -755,9 +733,8 @@ def main():
         layer_idx=args.layer_idx,
     )
 
-    bench_mode = "graph" if args.graph else "eager"
     print(
-        f"[LinearBench] Benchmarking implementations (mode={bench_mode}, "
+        f"[LinearBench] Benchmarking implementations (mode=graph, "
         f"profile={args.timing_profile}, capture_repeats={args.graph_capture_repeats})..."
     )
 
@@ -769,7 +746,7 @@ def main():
             "layer_idx": int(args.layer_idx),
             "decode_step": int(args.decode_step),
             "bucketed": bool(args.bucketed),
-            "bench_mode": bench_mode,
+            "bench_mode": "graph",
             "prompt_length": capture_meta["prompt_length"],
             "max_cache_len": capture_meta["max_cache_len"],
             "captured_decode_step": capture_meta["captured_decode_step"],
@@ -792,14 +769,14 @@ def main():
             "device": str(payloads["o_proj"]["x"].device),
             "timer": "cuda_event",
             "timing_profile": args.timing_profile,
-            "graph_capture_repeats": int(args.graph_capture_repeats if args.graph else 1),
-            "l2_flush_mb": int(args.l2_flush_mb if args.graph else 0),
+            "graph_capture_repeats": int(args.graph_capture_repeats),
+            "l2_flush_mb": int(args.l2_flush_mb),
         },
-        "qkv_benchmarks": _run_benchmarks(payloads["qkv"], warmup=args.warmup, iters=args.iters, use_graph=args.graph, graph_capture_repeats=args.graph_capture_repeats, l2_flush_mb=args.l2_flush_mb),
-        "gate_up_benchmarks": _run_benchmarks(payloads["gate_up"], warmup=args.warmup, iters=args.iters, use_graph=args.graph, graph_capture_repeats=args.graph_capture_repeats, l2_flush_mb=args.l2_flush_mb),
-        "o_proj_benchmarks": _run_benchmarks(payloads["o_proj"], warmup=args.warmup, iters=args.iters, use_graph=args.graph, graph_capture_repeats=args.graph_capture_repeats, l2_flush_mb=args.l2_flush_mb),
-        "down_proj_benchmarks": _run_benchmarks(payloads["down_proj"], warmup=args.warmup, iters=args.iters, use_graph=args.graph, graph_capture_repeats=args.graph_capture_repeats, l2_flush_mb=args.l2_flush_mb),
-        "lm_head_benchmarks": _run_benchmarks(payloads["lm_head"], warmup=args.warmup, iters=args.iters, use_graph=args.graph, graph_capture_repeats=args.graph_capture_repeats, l2_flush_mb=args.l2_flush_mb),
+        "qkv_benchmarks": _run_benchmarks(payloads["qkv"], warmup=args.warmup, iters=args.iters, graph_capture_repeats=args.graph_capture_repeats, l2_flush_mb=args.l2_flush_mb),
+        "gate_up_benchmarks": _run_benchmarks(payloads["gate_up"], warmup=args.warmup, iters=args.iters, graph_capture_repeats=args.graph_capture_repeats, l2_flush_mb=args.l2_flush_mb),
+        "o_proj_benchmarks": _run_benchmarks(payloads["o_proj"], warmup=args.warmup, iters=args.iters, graph_capture_repeats=args.graph_capture_repeats, l2_flush_mb=args.l2_flush_mb),
+        "down_proj_benchmarks": _run_benchmarks(payloads["down_proj"], warmup=args.warmup, iters=args.iters, graph_capture_repeats=args.graph_capture_repeats, l2_flush_mb=args.l2_flush_mb),
+        "lm_head_benchmarks": _run_benchmarks(payloads["lm_head"], warmup=args.warmup, iters=args.iters, graph_capture_repeats=args.graph_capture_repeats, l2_flush_mb=args.l2_flush_mb),
     }
 
     output_path = Path(args.output)
