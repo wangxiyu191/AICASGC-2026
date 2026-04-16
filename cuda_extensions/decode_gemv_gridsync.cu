@@ -75,6 +75,36 @@ enum OProjMlpProfileSlot : int {
     OP_SM_ID              = 15,  // SM ID from %smid PTX register
 };
 
+// Full-layer softsync profile slots
+// Slots 0-19: recorded with clock64() (SM cycle counter, ~0.7ns resolution)
+// Slots 20-21: recorded with globaltimer (1024ns quantization) for calibration
+constexpr int kFullLayerProfileSlots = 23;
+enum FullLayerProfileSlot : int {
+    FL_KERNEL_START       = 0,
+    FL_INPUT_RMSNORM_DONE = 1,
+    FL_QKV_DONE           = 2,
+    FL_SYNC1_START        = 3,
+    FL_SYNC1_DONE         = 4,
+    FL_QKVCACHE_DONE      = 5,
+    FL_SYNC2_START        = 6,
+    FL_SYNC2_DONE         = 7,
+    FL_ATTENTION_DONE     = 8,
+    FL_SYNC3_START        = 9,
+    FL_SYNC3_DONE         = 10,
+    FL_OPROJ_DONE         = 11,
+    FL_SYNC4_START        = 12,
+    FL_SYNC4_DONE         = 13,
+    FL_POST_RMSNORM_DONE  = 14,
+    FL_GATEUP_SILU_DONE   = 15,
+    FL_SYNC5_START        = 16,
+    FL_SYNC5_DONE         = 17,
+    FL_DOWNPROJ_DONE      = 18,
+    FL_KERNEL_DONE        = 19,
+    FL_GT_START           = 20,  // globaltimer at kernel start (calibration)
+    FL_GT_END             = 21,  // globaltimer at kernel end (calibration)
+    FL_SM_ID              = 22,  // SM ID from %smid PTX register
+};
+
 __device__ __forceinline__ uint64_t read_globaltimer() {
     uint64_t ts;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(ts));
@@ -2595,6 +2625,7 @@ __launch_bounds__(kFullLayerThreads, 1)
 __global__ void fused_decode_full_layer_softsync_k2048_fwd_kernel(
     const at::Half* __restrict__ hidden_states,
     const at::Half* __restrict__ qkv_weight,
+    const at::Half* __restrict__ input_layernorm_weight,
     const at::Half* __restrict__ q_norm_weight,
     const at::Half* __restrict__ k_norm_weight,
     const at::Half* __restrict__ cos,
@@ -2643,6 +2674,7 @@ __global__ void fused_decode_full_layer_softsync_k2048_fwd_kernel(
 
     const __half* residual_half = reinterpret_cast<const __half*>(hidden_states);
     const __half* qkv_w_half = reinterpret_cast<const __half*>(qkv_weight);
+    const __half* input_norm_half = reinterpret_cast<const __half*>(input_layernorm_weight);
     const __half* q_norm_half = reinterpret_cast<const __half*>(q_norm_weight);
     const __half* k_norm_half = reinterpret_cast<const __half*>(k_norm_weight);
     const __half* cos_half = reinterpret_cast<const __half*>(cos);
@@ -2704,7 +2736,8 @@ __global__ void fused_decode_full_layer_softsync_k2048_fwd_kernel(
     const float input_inv_rms = inv_rms_sh;
     for (int idx = tid; idx < kNosplitSpecializedK2048; idx += kFullLayerThreads) {
         const float v = __half2float(residual_half[idx]);
-        x_small_sh[idx] = __float2half(v * input_inv_rms);
+        const float scale_f = __half2float(input_norm_half[idx]);
+        x_small_sh[idx] = __float2half(v * input_inv_rms * scale_f);
     }
     __syncthreads();
 
@@ -3086,90 +3119,98 @@ __global__ void fused_decode_full_layer_softsync_k2048_fwd_kernel(
     constexpr bool kUseCpAsync = false;
 #endif
 
-    const int row = blockIdx.x * kFullLayerWarps + warp;
-    for (int vec_idx = tid; vec_idx < kAsyncVecsPerTileK6144;
-         vec_idx += kFullLayerThreads) {
-        if constexpr (kUseCpAsync) {
-            cp_async_cg_16(
-                &x_tile_sh[0][vec_idx],
-                reinterpret_cast<const uint4*>(hidden_half) + vec_idx);
-        } else {
-            x_tile_sh[0][vec_idx] =
-                reinterpret_cast<const uint4*>(hidden_half)[vec_idx];
+    // down_proj needs a grid-cycle because this cooperative kernel may launch
+    // fewer than ceil(2048 / 16) blocks when tuned for lower barrier cost.
+    for (int row_base = blockIdx.x * kFullLayerWarps;
+         row_base < kNosplitSpecializedK2048;
+         row_base += gridDim.x * kFullLayerWarps) {
+        const int row = row_base + warp;
+        for (int vec_idx = tid; vec_idx < kAsyncVecsPerTileK6144;
+             vec_idx += kFullLayerThreads) {
+            if constexpr (kUseCpAsync) {
+                cp_async_cg_16(
+                    &x_tile_sh[0][vec_idx],
+                    reinterpret_cast<const uint4*>(hidden_half) + vec_idx);
+            } else {
+                x_tile_sh[0][vec_idx] =
+                    reinterpret_cast<const uint4*>(hidden_half)[vec_idx];
+            }
         }
-    }
-    if constexpr (kUseCpAsync) {
-        cp_async_commit_group();
-        cp_async_wait_group<0>();
-    }
-    __syncthreads();
+        if constexpr (kUseCpAsync) {
+            cp_async_commit_group();
+            cp_async_wait_group<0>();
+        }
+        __syncthreads();
 
-    float sum = 0.0f;
-    #pragma unroll
-    for (int tile_idx = 0; tile_idx < 6; ++tile_idx) {
-        const int stage = tile_idx & 1;
-        const int tile_start = tile_idx * kNosplitAsyncTileK6144;
+        float sum = 0.0f;
+        #pragma unroll
+        for (int tile_idx = 0; tile_idx < 6; ++tile_idx) {
+            const int stage = tile_idx & 1;
+            const int tile_start = tile_idx * kNosplitAsyncTileK6144;
 
-        if (tile_idx + 1 < 6) {
-            const int next_tile_start = tile_start + kNosplitAsyncTileK6144;
-            const uint4* x_next_vec =
-                reinterpret_cast<const uint4*>(hidden_half + next_tile_start);
-            for (int vec_idx = tid; vec_idx < kAsyncVecsPerTileK6144;
-                 vec_idx += kFullLayerThreads) {
+            if (tile_idx + 1 < 6) {
+                const int next_tile_start = tile_start + kNosplitAsyncTileK6144;
+                const uint4* x_next_vec =
+                    reinterpret_cast<const uint4*>(hidden_half + next_tile_start);
+                for (int vec_idx = tid; vec_idx < kAsyncVecsPerTileK6144;
+                     vec_idx += kFullLayerThreads) {
+                    if constexpr (kUseCpAsync) {
+                        cp_async_cg_16(
+                            &x_tile_sh[stage ^ 1][vec_idx],
+                            x_next_vec + vec_idx);
+                    } else {
+                        x_tile_sh[stage ^ 1][vec_idx] = x_next_vec[vec_idx];
+                    }
+                }
                 if constexpr (kUseCpAsync) {
-                    cp_async_cg_16(
-                        &x_tile_sh[stage ^ 1][vec_idx],
-                        x_next_vec + vec_idx);
-                } else {
-                    x_tile_sh[stage ^ 1][vec_idx] = x_next_vec[vec_idx];
+                    cp_async_commit_group();
                 }
             }
+
+            if (row < kNosplitSpecializedK2048) {
+                const uint4* x_sh_stage_vec = x_tile_sh[stage];
+                const uint4* w_row_vec = reinterpret_cast<const uint4*>(
+                    down_w_half + row * down_proj_stride_wn + tile_start);
+                __half2 h2_acc0 = __float2half2_rn(0.0f);
+                __half2 h2_acc1 = __float2half2_rn(0.0f);
+
+                #pragma unroll
+                for (int vec_idx = lane; vec_idx < kAsyncVecsPerTileK6144;
+                     vec_idx += 64) {
+                    const uint4 x_vec0 = x_sh_stage_vec[vec_idx];
+                    const uint4 w_vec0 = w_row_vec[vec_idx];
+                    const uint4 x_vec1 = x_sh_stage_vec[vec_idx + 32];
+                    const uint4 w_vec1 = w_row_vec[vec_idx + 32];
+                    accumulate_hfma2_uint4(x_vec0, w_vec0, h2_acc0);
+                    accumulate_hfma2_uint4(x_vec1, w_vec1, h2_acc1);
+                }
+
+                const float2 f2_0 = __half22float2(h2_acc0);
+                const float2 f2_1 = __half22float2(h2_acc1);
+                sum += f2_0.x + f2_0.y + f2_1.x + f2_1.y;
+            }
+
             if constexpr (kUseCpAsync) {
-                cp_async_commit_group();
+                if (tile_idx + 1 < 6) {
+                    cp_async_wait_group<0>();
+                }
             }
+            __syncthreads();
         }
 
-        if (row < 2048) {
-            const uint4* x_sh_stage_vec = x_tile_sh[stage];
-            const uint4* w_row_vec = reinterpret_cast<const uint4*>(
-                down_w_half + row * down_proj_stride_wn + tile_start);
-            __half2 h2_acc0 = __float2half2_rn(0.0f);
-            __half2 h2_acc1 = __float2half2_rn(0.0f);
-
-            #pragma unroll
-            for (int vec_idx = lane; vec_idx < kAsyncVecsPerTileK6144;
-                 vec_idx += 64) {
-                const uint4 x_vec0 = x_sh_stage_vec[vec_idx];
-                const uint4 w_vec0 = w_row_vec[vec_idx];
-                const uint4 x_vec1 = x_sh_stage_vec[vec_idx + 32];
-                const uint4 w_vec1 = w_row_vec[vec_idx + 32];
-                accumulate_hfma2_uint4(x_vec0, w_vec0, h2_acc0);
-                accumulate_hfma2_uint4(x_vec1, w_vec1, h2_acc1);
-            }
-
-            const float2 f2_0 = __half22float2(h2_acc0);
-            const float2 f2_1 = __half22float2(h2_acc1);
-            sum += f2_0.x + f2_0.y + f2_1.x + f2_1.y;
-        }
-
-        if constexpr (kUseCpAsync) {
-            if (tile_idx + 1 < 6) {
-                cp_async_wait_group<0>();
+        if (row < kNosplitSpecializedK2048) {
+            sum = warp_sum(sum);
+            if (lane == 0) {
+                float result = sum + __half2float(residual_sh[row]);
+                if (has_down_proj_bias) {
+                    result += __half2float(down_bias_half[row]);
+                }
+                out_half[row] = __float2half(result);
             }
         }
         __syncthreads();
     }
 
-    if (row < 2048) {
-        sum = warp_sum(sum);
-        if (lane == 0) {
-            float result = sum + __half2float(residual_sh[row]);
-            if (has_down_proj_bias) {
-                result += __half2float(down_bias_half[row]);
-            }
-            out_half[row] = __float2half(result);
-        }
-    }
 }
 
 }  // anonymous namespace
@@ -3238,6 +3279,7 @@ torch::Tensor decode_attn_persistent_half_cuda(
 torch::Tensor fused_decode_full_layer_softsync_half_cuda(
     const torch::Tensor& hidden_states,
     const torch::Tensor& qkv_weight,
+    const torch::Tensor& input_layernorm_weight,
     const torch::Tensor& q_norm_weight,
     const torch::Tensor& k_norm_weight,
     const torch::Tensor& cos,
@@ -3262,7 +3304,7 @@ torch::Tensor fused_decode_full_layer_softsync_half_cuda(
     bool has_down_proj_bias,
     int64_t launch_blocks) {
     TORCH_CHECK(
-        hidden_states.is_cuda() && qkv_weight.is_cuda() && q_norm_weight.is_cuda()
+        hidden_states.is_cuda() && qkv_weight.is_cuda() && input_layernorm_weight.is_cuda() && q_norm_weight.is_cuda()
             && k_norm_weight.is_cuda() && cos.is_cuda() && sin.is_cuda()
             && k_cache.is_cuda() && v_cache.is_cuda() && cache_position.is_cuda()
             && o_proj_weight.is_cuda() && post_attn_norm_weight.is_cuda()
@@ -3272,6 +3314,7 @@ torch::Tensor fused_decode_full_layer_softsync_half_cuda(
         "fused full layer softsync expects CUDA tensors");
     TORCH_CHECK(hidden_states.scalar_type() == torch::kFloat16, "hidden_states must be fp16");
     TORCH_CHECK(qkv_weight.scalar_type() == torch::kFloat16, "qkv_weight must be fp16");
+    TORCH_CHECK(input_layernorm_weight.scalar_type() == torch::kFloat16, "input_layernorm_weight must be fp16");
     TORCH_CHECK(q_norm_weight.scalar_type() == torch::kFloat16, "q_norm_weight must be fp16");
     TORCH_CHECK(k_norm_weight.scalar_type() == torch::kFloat16, "k_norm_weight must be fp16");
     TORCH_CHECK(cos.scalar_type() == torch::kFloat16, "cos must be fp16");
@@ -3297,6 +3340,11 @@ torch::Tensor fused_decode_full_layer_softsync_half_cuda(
             && qkv_weight.size(1) == kNosplitSpecializedK2048
             && qkv_weight.stride(1) == 1,
         "qkv_weight must be contiguous [4096, 2048]");
+    TORCH_CHECK(
+        input_layernorm_weight.dim() == 1
+            && input_layernorm_weight.numel() == kNosplitSpecializedK2048
+            && input_layernorm_weight.stride(0) == 1,
+        "input_layernorm_weight must be contiguous [2048]");
     TORCH_CHECK(q_norm_weight.dim() == 1 && q_norm_weight.numel() == kAttnHeadDim,
         "q_norm_weight must be [128]");
     TORCH_CHECK(k_norm_weight.dim() == 1 && k_norm_weight.numel() == kAttnHeadDim,
@@ -3376,6 +3424,7 @@ torch::Tensor fused_decode_full_layer_softsync_half_cuda(
 
     auto* hidden_ptr = hidden_states.data_ptr<at::Half>();
     auto* qkv_w_ptr = qkv_weight.data_ptr<at::Half>();
+    auto* input_norm_ptr = input_layernorm_weight.data_ptr<at::Half>();
     auto* q_norm_ptr = q_norm_weight.data_ptr<at::Half>();
     auto* k_norm_ptr = k_norm_weight.data_ptr<at::Half>();
     auto* cos_ptr = cos.data_ptr<at::Half>();
@@ -3410,6 +3459,7 @@ torch::Tensor fused_decode_full_layer_softsync_half_cuda(
     fused_decode_full_layer_softsync_k2048_fwd_kernel<<<grid_blocks, kFullLayerThreads, 0, stream>>>(
         hidden_ptr,
         qkv_w_ptr,
+        input_norm_ptr,
         q_norm_ptr,
         k_norm_ptr,
         cos_ptr,

@@ -119,6 +119,7 @@ class OptimizedDecoderLayer(nn.Module):
                 self.layer_idx,
                 cache_position,
                 self.qkv_weight,
+                self.input_layernorm_weight,
                 self.q_norm_weight,
                 self.k_norm_weight,
                 self.o_proj_weight,
@@ -1139,6 +1140,7 @@ def _fused_decode_full_layer_softsync(
     layer_idx: int,
     cache_position: torch.Tensor | None,
     qkv_weight: torch.Tensor,
+    input_layernorm_weight: torch.Tensor,
     q_norm_weight: torch.Tensor,
     k_norm_weight: torch.Tensor,
     o_proj_weight: torch.Tensor,
@@ -1157,6 +1159,7 @@ def _fused_decode_full_layer_softsync(
         or not _ENABLE_CUDA_FUSED_FULL_LAYER_SOFTSYNC
         or hidden_states.device.type != "cuda"
         or qkv_weight.device.type != "cuda"
+        or input_layernorm_weight.device.type != "cuda"
         or q_norm_weight.device.type != "cuda"
         or k_norm_weight.device.type != "cuda"
         or o_proj_weight.device.type != "cuda"
@@ -1165,6 +1168,7 @@ def _fused_decode_full_layer_softsync(
         or down_proj_weight.device.type != "cuda"
         or hidden_states.dtype != torch.float16
         or qkv_weight.dtype != torch.float16
+        or input_layernorm_weight.dtype != torch.float16
         or q_norm_weight.dtype != torch.float16
         or k_norm_weight.dtype != torch.float16
         or o_proj_weight.dtype != torch.float16
@@ -1175,6 +1179,7 @@ def _fused_decode_full_layer_softsync(
         or hidden_states.shape[-2] != 1
         or hidden_states.shape[-1] != 2048
         or qkv_weight.shape != (4096, 2048)
+        or input_layernorm_weight.numel() != 2048
         or q_norm_weight.numel() != 128
         or k_norm_weight.numel() != 128
         or o_proj_weight.shape != (2048, 2048)
@@ -1183,6 +1188,7 @@ def _fused_decode_full_layer_softsync(
         or down_proj_weight.shape != (2048, 6144)
         or hidden_states.stride(-1) != 1
         or qkv_weight.stride(-1) != 1
+        or input_layernorm_weight.stride(-1) != 1
         or q_norm_weight.stride(-1) != 1
         or k_norm_weight.stride(-1) != 1
         or o_proj_weight.stride(-1) != 1
@@ -1241,6 +1247,7 @@ def _fused_decode_full_layer_softsync(
     return cuda_decode_gemv.fused_decode_full_layer_softsync_half(
         hidden_states,
         qkv_weight,
+        input_layernorm_weight,
         q_norm_weight,
         k_norm_weight,
         cos,

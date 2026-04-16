@@ -1480,6 +1480,7 @@ def fused_o_proj_post_attn_mlp_softsync_half(
 def fused_decode_full_layer_softsync_half(
     hidden_states: torch.Tensor,
     qkv_weight: torch.Tensor,
+    input_layernorm_weight: torch.Tensor,
     q_norm_weight: torch.Tensor,
     k_norm_weight: torch.Tensor,
     cos: torch.Tensor,
@@ -1501,6 +1502,7 @@ def fused_decode_full_layer_softsync_half(
     if (
         hidden_states.device.type != "cuda"
         or qkv_weight.device.type != "cuda"
+        or input_layernorm_weight.device.type != "cuda"
         or q_norm_weight.device.type != "cuda"
         or k_norm_weight.device.type != "cuda"
         or cos.device.type != "cuda"
@@ -1514,6 +1516,7 @@ def fused_decode_full_layer_softsync_half(
         or down_proj_weight.device.type != "cuda"
         or hidden_states.dtype != torch.float16
         or qkv_weight.dtype != torch.float16
+        or input_layernorm_weight.dtype != torch.float16
         or q_norm_weight.dtype != torch.float16
         or k_norm_weight.dtype != torch.float16
         or cos.dtype != torch.float16
@@ -1573,6 +1576,7 @@ def fused_decode_full_layer_softsync_half(
     ext.fused_decode_full_layer_softsync_half(
         hidden_vec,
         qkv_weight,
+        input_layernorm_weight.reshape(-1).contiguous(),
         q_norm_weight.reshape(-1).contiguous(),
         k_norm_weight.reshape(-1).contiguous(),
         cos_vec,
@@ -1598,6 +1602,63 @@ def fused_decode_full_layer_softsync_half(
         int(launch_blocks),
     )
     return out_vec.view(*hidden_states.shape[:-1], n)
+
+
+FULL_LAYER_PROFILE_SLOT_NAMES = (
+    "kernel_start",
+    "input_rmsnorm_done",
+    "qkv_done",
+    "sync1_start",
+    "sync1_done",
+    "qkvcache_done",
+    "sync2_start",
+    "sync2_done",
+    "attention_done",
+    "sync3_start",
+    "sync3_done",
+    "oproj_done",
+    "sync4_start",
+    "sync4_done",
+    "post_rmsnorm_done",
+    "gateup_silu_done",
+    "sync5_start",
+    "sync5_done",
+    "downproj_done",
+    "kernel_done",
+    "gt_start",
+    "gt_end",
+    "sm_id",
+)
+
+
+def fused_decode_full_layer_softsync_profile_half(
+    hidden_states: torch.Tensor,
+    qkv_weight: torch.Tensor,
+    input_layernorm_weight: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cache_position: torch.Tensor,
+    o_proj_weight: torch.Tensor,
+    o_proj_bias: torch.Tensor | None,
+    post_attn_norm_weight: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_proj_weight: torch.Tensor,
+    down_proj_bias: torch.Tensor | None,
+    eps: float,
+    attn_scale: float,
+    workspace: dict | None = None,
+    launch_blocks: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+    raise RuntimeError(
+        "fused_decode_full_layer_softsync_profile_half has been intentionally "
+        "removed from the active build to eliminate profiler-side interference. "
+        "Reference backup: "
+        "cuda_extensions/decode_gemv_gridsync_full_layer_profile_backup_20260417.cu.bak"
+    )
 
 
 def fused_gateup_silu_downproj_mega_half(

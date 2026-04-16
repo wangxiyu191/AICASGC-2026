@@ -372,6 +372,7 @@ torch::Tensor fused_o_proj_post_attn_mlp_softsync_profile_half_cuda(
 torch::Tensor fused_decode_full_layer_softsync_half_cuda(
     const torch::Tensor& hidden_states,
     const torch::Tensor& qkv_weight,
+    const torch::Tensor& input_layernorm_weight,
     const torch::Tensor& q_norm_weight,
     const torch::Tensor& k_norm_weight,
     const torch::Tensor& cos,
@@ -1054,6 +1055,7 @@ torch::Tensor fused_o_proj_post_attn_mlp_softsync_profile_half(
 torch::Tensor fused_decode_full_layer_softsync_half(
     const torch::Tensor& hidden_states,
     const torch::Tensor& qkv_weight,
+    const torch::Tensor& input_layernorm_weight,
     const torch::Tensor& q_norm_weight,
     const torch::Tensor& k_norm_weight,
     const torch::Tensor& cos,
@@ -1080,6 +1082,7 @@ torch::Tensor fused_decode_full_layer_softsync_half(
     return fused_decode_full_layer_softsync_half_cuda(
         hidden_states,
         qkv_weight,
+        input_layernorm_weight,
         q_norm_weight,
         k_norm_weight,
         cos,
