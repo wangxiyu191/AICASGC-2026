@@ -87,6 +87,7 @@ class OptimizedDecoderLayer(nn.Module):
         )
         self._prefer_small_decode_triton = False
         self._splitkv_workspace = None
+        self._full_layer_softsync_workspace = None
         self._o_proj_post_attn_mlp_workspaces: dict[str, dict] = {}
         if _decode_attention_needs_splitkv_workspace():
             self._ensure_splitkv_workspace()
@@ -108,9 +109,37 @@ class OptimizedDecoderLayer(nn.Module):
         hidden_shape_kv = (*input_shape, self.num_kv_heads, self.head_dim)
         prefer_small_decode_triton = self._prefer_small_decode_triton
         enable_decode_nvtx = _should_enable_decode_nvtx(hidden_states, past_key_values)
+        residual = hidden_states
+
+        with _nvtx_range("decode.full_layer_softsync", enable_decode_nvtx):
+            fused_full_layer_out = _fused_decode_full_layer_softsync(
+                hidden_states,
+                position_embeddings,
+                past_key_values,
+                self.layer_idx,
+                cache_position,
+                self.qkv_weight,
+                self.q_norm_weight,
+                self.k_norm_weight,
+                self.o_proj_weight,
+                self.o_proj_bias,
+                self.post_attn_layernorm_weight,
+                self.gate_up_weight,
+                self.down_proj_weight,
+                self.down_proj_bias,
+                self.rms_norm_eps,
+                self.scaling,
+                prefer_small_triton=prefer_small_decode_triton and not prefill_static_cache_no_mask,
+                workspace=(
+                    self._ensure_full_layer_softsync_workspace()
+                    if _ENABLE_CUDA_FUSED_FULL_LAYER_SOFTSYNC
+                    else None
+                ),
+            )
+            if fused_full_layer_out is not None:
+                return fused_full_layer_out
 
         # 1. Input LayerNorm
-        residual = hidden_states
         with _nvtx_range("decode.input_rmsnorm", enable_decode_nvtx):
             hidden_states = _rms_norm(
                 hidden_states,
@@ -430,6 +459,40 @@ class OptimizedDecoderLayer(nn.Module):
             "done_count": torch.zeros(self.num_kv_heads, dtype=torch.int32, device=self.qkv_weight.device),
         }
 
+    def _ensure_full_layer_softsync_workspace(self):
+        device = self.qkv_weight.device
+        dtype = self.qkv_weight.dtype
+        workspace = self._full_layer_softsync_workspace
+        if (
+            workspace is not None
+            and workspace.get("type") == "fused_decode_full_layer_softsync"
+            and tuple(workspace["barrier_count"].shape) == (1,)
+            and tuple(workspace["barrier_generation"].shape) == (1,)
+            and tuple(workspace["qkv_out"].shape) == (4096,)
+            and tuple(workspace["hidden_out"].shape) == (6144,)
+            and tuple(workspace["out"].shape) == (2048,)
+            and workspace["barrier_count"].device == device
+            and workspace["barrier_generation"].device == device
+            and workspace["qkv_out"].device == device
+            and workspace["hidden_out"].device == device
+            and workspace["out"].device == device
+            and workspace["barrier_count"].dtype == torch.int32
+            and workspace["barrier_generation"].dtype == torch.int32
+            and workspace["qkv_out"].dtype == dtype
+            and workspace["hidden_out"].dtype == dtype
+            and workspace["out"].dtype == dtype
+        ):
+            return workspace
+        self._full_layer_softsync_workspace = {
+            "type": "fused_decode_full_layer_softsync",
+            "barrier_count": torch.zeros((1,), dtype=torch.int32, device=device),
+            "barrier_generation": torch.zeros((1,), dtype=torch.int32, device=device),
+            "qkv_out": torch.empty((4096,), dtype=dtype, device=device),
+            "hidden_out": torch.empty((6144,), dtype=dtype, device=device),
+            "out": torch.empty((2048,), dtype=dtype, device=device),
+        }
+        return self._full_layer_softsync_workspace
+
     def _ensure_o_proj_post_attn_mlp_workspace(self, variant: str):
         workspace = self._o_proj_post_attn_mlp_workspaces.get(variant)
         device = self.o_proj_weight.device
@@ -494,6 +557,7 @@ _ENABLE_TRITON_PREFILL_FUSED_ADD_RMSNORM = os.environ.get("ENABLE_TRITON_PREFILL
 _ENABLE_CUDA_FUSED_ADD_RMSNORM = os.environ.get("ENABLE_CUDA_FUSED_ADD_RMSNORM", "0") == "1"
 _ENABLE_CUDA_FUSED_ADD_RMSNORM_GATEUP = os.environ.get("ENABLE_CUDA_FUSED_ADD_RMSNORM_GATEUP", "0") == "1"
 _ENABLE_CUDA_FUSED_POST_ATTN_MLP_PERSISTENT = os.environ.get("ENABLE_CUDA_FUSED_POST_ATTN_MLP_PERSISTENT", "0") == "1"
+_ENABLE_CUDA_FUSED_FULL_LAYER_SOFTSYNC = os.environ.get("ENABLE_CUDA_FUSED_FULL_LAYER_SOFTSYNC", "0") == "1"
 _ENABLE_CUDA_FUSED_O_PROJ_POST_ATTN_MLP_PERSISTENT = os.environ.get(
     "ENABLE_CUDA_FUSED_O_PROJ_POST_ATTN_MLP_PERSISTENT", "0"
 ) == "1"
@@ -1065,6 +1129,134 @@ def _fused_add_rmsnorm_gateup(
         gate_up_weight,
         None,
         eps,
+    )
+
+
+def _fused_decode_full_layer_softsync(
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    past_key_values,
+    layer_idx: int,
+    cache_position: torch.Tensor | None,
+    qkv_weight: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    o_proj_weight: torch.Tensor,
+    o_proj_bias: torch.Tensor | None,
+    post_attn_norm_weight: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_proj_weight: torch.Tensor,
+    down_proj_bias: torch.Tensor | None,
+    eps: float,
+    scaling: float,
+    prefer_small_triton: bool = False,
+    workspace: dict | None = None,
+) -> torch.Tensor | None:
+    if (
+        not prefer_small_triton
+        or not _ENABLE_CUDA_FUSED_FULL_LAYER_SOFTSYNC
+        or hidden_states.device.type != "cuda"
+        or qkv_weight.device.type != "cuda"
+        or q_norm_weight.device.type != "cuda"
+        or k_norm_weight.device.type != "cuda"
+        or o_proj_weight.device.type != "cuda"
+        or post_attn_norm_weight.device.type != "cuda"
+        or gate_up_weight.device.type != "cuda"
+        or down_proj_weight.device.type != "cuda"
+        or hidden_states.dtype != torch.float16
+        or qkv_weight.dtype != torch.float16
+        or q_norm_weight.dtype != torch.float16
+        or k_norm_weight.dtype != torch.float16
+        or o_proj_weight.dtype != torch.float16
+        or post_attn_norm_weight.dtype != torch.float16
+        or gate_up_weight.dtype != torch.float16
+        or down_proj_weight.dtype != torch.float16
+        or hidden_states.ndim < 2
+        or hidden_states.shape[-2] != 1
+        or hidden_states.shape[-1] != 2048
+        or qkv_weight.shape != (4096, 2048)
+        or q_norm_weight.numel() != 128
+        or k_norm_weight.numel() != 128
+        or o_proj_weight.shape != (2048, 2048)
+        or post_attn_norm_weight.numel() != 2048
+        or gate_up_weight.shape != (12288, 2048)
+        or down_proj_weight.shape != (2048, 6144)
+        or hidden_states.stride(-1) != 1
+        or qkv_weight.stride(-1) != 1
+        or q_norm_weight.stride(-1) != 1
+        or k_norm_weight.stride(-1) != 1
+        or o_proj_weight.stride(-1) != 1
+        or post_attn_norm_weight.stride(-1) != 1
+        or gate_up_weight.stride(-1) != 1
+        or down_proj_weight.stride(-1) != 1
+        or (o_proj_bias is not None and o_proj_bias.dtype != torch.float16)
+        or (down_proj_bias is not None and down_proj_bias.dtype != torch.float16)
+        or not isinstance(past_key_values, StaticCache)
+        or cache_position is None
+        or cache_position.device.type != "cuda"
+        or cache_position.ndim != 1
+        or cache_position.numel() != 1
+    ):
+        return None
+
+    if len(position_embeddings) != 2:
+        return None
+    cos, sin = position_embeddings
+    if (
+        cos.device.type != "cuda"
+        or sin.device.type != "cuda"
+        or cos.dtype != torch.float16
+        or sin.dtype != torch.float16
+        or cos.stride(-1) != 1
+        or sin.stride(-1) != 1
+        or cos.numel() != 128
+        or sin.numel() != 128
+    ):
+        return None
+
+    layer = past_key_values.layers[layer_idx]
+    if (
+        not isinstance(layer, StaticLayer)
+        or not layer.is_initialized
+        or layer.keys is None
+        or layer.values is None
+        or layer.keys.device.type != "cuda"
+        or layer.values.device.type != "cuda"
+        or layer.keys.dtype != torch.float16
+        or layer.values.dtype != torch.float16
+        or layer.keys.ndim != 4
+        or layer.values.ndim != 4
+        or layer.keys.shape[0] != 1
+        or layer.values.shape[0] != 1
+        or layer.keys.shape[1] != 8
+        or layer.values.shape[1] != 8
+        or layer.keys.shape[-1] != 128
+        or layer.values.shape[-1] != 128
+        or layer.keys.stride(-1) != 1
+        or layer.values.stride(-1) != 1
+    ):
+        return None
+
+    import cuda_decode_gemv
+    return cuda_decode_gemv.fused_decode_full_layer_softsync_half(
+        hidden_states,
+        qkv_weight,
+        q_norm_weight,
+        k_norm_weight,
+        cos,
+        sin,
+        layer.keys,
+        layer.values,
+        cache_position,
+        o_proj_weight,
+        o_proj_bias,
+        post_attn_norm_weight,
+        gate_up_weight,
+        down_proj_weight,
+        down_proj_bias,
+        eps,
+        scaling,
+        workspace=workspace,
     )
 
 
@@ -3214,14 +3406,16 @@ def set_small_decode_triton_enabled(model, enabled: bool) -> bool:
 def set_cuda_mlp_fusion_flags(
     *,
     add_rmsnorm_gateup: bool | None = None,
+    full_layer_softsync: bool | None = None,
     post_attn_mlp_persistent: bool | None = None,
     o_proj_post_attn_mlp_persistent: bool | None = None,
     o_proj_post_attn_mlp_softsync: bool | None = None,
     silu_downproj: bool | None = None,
     gateup_silu_downproj: bool | None = None,
     gateup_silu_downproj_mega: bool | None = None,
-) -> tuple[bool, bool, bool, bool, bool, bool, bool]:
+) -> tuple[bool, bool, bool, bool, bool, bool, bool, bool]:
     global _ENABLE_CUDA_FUSED_ADD_RMSNORM_GATEUP
+    global _ENABLE_CUDA_FUSED_FULL_LAYER_SOFTSYNC
     global _ENABLE_CUDA_FUSED_POST_ATTN_MLP_PERSISTENT
     global _ENABLE_CUDA_FUSED_O_PROJ_POST_ATTN_MLP_PERSISTENT
     global _ENABLE_CUDA_FUSED_O_PROJ_POST_ATTN_MLP_SOFTSYNC
@@ -3230,6 +3424,7 @@ def set_cuda_mlp_fusion_flags(
     global _ENABLE_CUDA_FUSED_GATEUP_SILU_DOWNPROJ_MEGA
     previous = (
         _ENABLE_CUDA_FUSED_ADD_RMSNORM_GATEUP,
+        _ENABLE_CUDA_FUSED_FULL_LAYER_SOFTSYNC,
         _ENABLE_CUDA_FUSED_POST_ATTN_MLP_PERSISTENT,
         _ENABLE_CUDA_FUSED_O_PROJ_POST_ATTN_MLP_PERSISTENT,
         _ENABLE_CUDA_FUSED_O_PROJ_POST_ATTN_MLP_SOFTSYNC,
@@ -3239,6 +3434,8 @@ def set_cuda_mlp_fusion_flags(
     )
     if add_rmsnorm_gateup is not None:
         _ENABLE_CUDA_FUSED_ADD_RMSNORM_GATEUP = add_rmsnorm_gateup
+    if full_layer_softsync is not None:
+        _ENABLE_CUDA_FUSED_FULL_LAYER_SOFTSYNC = full_layer_softsync
     if post_attn_mlp_persistent is not None:
         _ENABLE_CUDA_FUSED_POST_ATTN_MLP_PERSISTENT = post_attn_mlp_persistent
     if o_proj_post_attn_mlp_persistent is not None:

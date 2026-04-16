@@ -15,6 +15,7 @@ namespace {
 // Constants duplicated from decode_gemv_kernel.cu (they live in an anonymous
 // namespace there, so we must re-declare them here).
 constexpr int kRow8Threads = 256;
+constexpr int kWarpSize = 32;
 constexpr int kRowsPerBlockAsync = 8;
 constexpr int kNosplitSpecializedK2048 = 2048;
 constexpr int kNosplitAsyncTileK6144 = 1024;
@@ -2323,9 +2324,60 @@ constexpr int kAttnDimsPerThread = kAttnHeadDim / kAttnThreadGroup;   // 32
 constexpr int kAttnTileSteps    = 8;
 constexpr int kAttnTileN        = kAttnGroupsPerWarp * kAttnTileSteps; // 64
 constexpr float kAttnNegLarge   = -1.0e20f;
+constexpr int kAttnHalfHeadDim  = kAttnHeadDim / 2;
 
 constexpr int kAttnGqaRatio       = 2;
 constexpr int kAttnInternalSplits = kPersistentWarps;  // 32 (all warps)
+constexpr int kFullLayerThreads = 512;
+constexpr int kFullLayerWarps = kFullLayerThreads / kWarpSize;  // 16
+constexpr int kFullLayerInternalSplits = kFullLayerWarps;
+
+__device__ __forceinline__ __half rope_out_half(
+    __half a,
+    __half b,
+    __half cos,
+    __half sin,
+    bool second_half) {
+    const float af = __half2float(a);
+    const float bf = __half2float(b);
+    const float cf = __half2float(cos);
+    const float sf = __half2float(sin);
+    const float out = second_half ? (bf * cf + af * sf) : (af * cf - bf * sf);
+    return __float2half_rn(out);
+}
+
+__device__ __forceinline__ void fused_rms_norm_rope_one_head(
+    const __half* __restrict__ x,
+    const __half* __restrict__ weight,
+    const __half* __restrict__ cos,
+    const __half* __restrict__ sin,
+    __half* __restrict__ out,
+    float eps,
+    int lane) {
+    float sum_sq = 0.0f;
+    #pragma unroll
+    for (int idx = lane; idx < kAttnHeadDim; idx += kWarpSize) {
+        const float v = __half2float(x[idx]);
+        sum_sq += v * v;
+    }
+    sum_sq = warp_sum(sum_sq);
+    const float rstd = rsqrtf(
+        __shfl_sync(0xffffffff, sum_sq / static_cast<float>(kAttnHeadDim) + eps, 0));
+
+    for (int rk = lane; rk < kAttnHalfHeadDim; rk += kWarpSize) {
+        const float n0f =
+            __half2float(x[rk]) * rstd * __half2float(weight[rk]);
+        const float n1f =
+            __half2float(x[kAttnHalfHeadDim + rk]) * rstd
+            * __half2float(weight[kAttnHalfHeadDim + rk]);
+        const __half n0 = __float2half_rn(n0f);
+        const __half n1 = __float2half_rn(n1f);
+        const __half c = cos[rk];
+        const __half s = sin[rk];
+        out[rk] = rope_out_half(n0, n1, c, s, false);
+        out[kAttnHalfHeadDim + rk] = rope_out_half(n0, n1, c, s, true);
+    }
+}
 
 __launch_bounds__(1024, 1)
 __global__ void decode_attn_persistent_fwd_kernel(
@@ -2539,6 +2591,587 @@ __global__ void decode_attn_persistent_fwd_kernel(
     }
 }
 
+__launch_bounds__(kFullLayerThreads, 1)
+__global__ void fused_decode_full_layer_softsync_k2048_fwd_kernel(
+    const at::Half* __restrict__ hidden_states,
+    const at::Half* __restrict__ qkv_weight,
+    const at::Half* __restrict__ q_norm_weight,
+    const at::Half* __restrict__ k_norm_weight,
+    const at::Half* __restrict__ cos,
+    const at::Half* __restrict__ sin,
+    at::Half* __restrict__ k_cache,
+    at::Half* __restrict__ v_cache,
+    const int64_t* __restrict__ cache_position,
+    const at::Half* __restrict__ o_proj_weight,
+    const at::Half* __restrict__ o_proj_bias,
+    const at::Half* __restrict__ post_attn_norm_weight,
+    const at::Half* __restrict__ gate_up_weight,
+    const at::Half* __restrict__ down_proj_weight,
+    const at::Half* __restrict__ down_proj_bias,
+    unsigned int* __restrict__ barrier_count,
+    unsigned int* __restrict__ barrier_generation,
+    at::Half* __restrict__ qkv_out,
+    at::Half* __restrict__ hidden_out,
+    at::Half* __restrict__ out,
+    float eps,
+    float attn_scale,
+    bool has_o_proj_bias,
+    bool has_down_proj_bias,
+    int64_t qkv_stride_wn,
+    int64_t k_cache_stride_h,
+    int64_t k_cache_stride_s,
+    int64_t v_cache_stride_h,
+    int64_t v_cache_stride_s,
+    int64_t o_proj_stride_wn,
+    int64_t gate_up_stride_wn,
+    int64_t down_proj_stride_wn,
+    int max_seq_len,
+    int num_kv_heads) {
+    __shared__ __align__(16) __half residual_sh[kNosplitSpecializedK2048];
+    __shared__ __align__(16) __half x_small_sh[kNosplitSpecializedK2048];
+    __shared__ float warp_sums[kFullLayerWarps];
+    __shared__ float inv_rms_sh;
+    __shared__ __align__(16) uint4 x_tile_sh[2][kAsyncVecsPerTileK6144];
+    __shared__ unsigned int local_gen_sh;
+    __shared__ float smem_acc[kFullLayerWarps][kAttnHeadDim];
+    __shared__ float smem_m[kFullLayerWarps];
+    __shared__ float smem_l[kFullLayerWarps];
+
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+
+    const __half* residual_half = reinterpret_cast<const __half*>(hidden_states);
+    const __half* qkv_w_half = reinterpret_cast<const __half*>(qkv_weight);
+    const __half* q_norm_half = reinterpret_cast<const __half*>(q_norm_weight);
+    const __half* k_norm_half = reinterpret_cast<const __half*>(k_norm_weight);
+    const __half* cos_half = reinterpret_cast<const __half*>(cos);
+    const __half* sin_half = reinterpret_cast<const __half*>(sin);
+    __half* k_cache_half = reinterpret_cast<__half*>(k_cache);
+    __half* v_cache_half = reinterpret_cast<__half*>(v_cache);
+    const __half* o_w_half = reinterpret_cast<const __half*>(o_proj_weight);
+    const __half* o_bias_half = reinterpret_cast<const __half*>(o_proj_bias);
+    const __half* post_norm_half = reinterpret_cast<const __half*>(post_attn_norm_weight);
+    const __half* gate_w_half = reinterpret_cast<const __half*>(gate_up_weight);
+    const __half* down_w_half = reinterpret_cast<const __half*>(down_proj_weight);
+    const __half* down_bias_half = reinterpret_cast<const __half*>(down_proj_bias);
+    __half* qkv_half = reinterpret_cast<__half*>(qkv_out);
+    __half* hidden_half = reinterpret_cast<__half*>(hidden_out);
+    __half* out_half = reinterpret_cast<__half*>(out);
+    uint4* x_small_vec = reinterpret_cast<uint4*>(x_small_sh);
+    constexpr int vecs_k2048 = kNosplitSpecializedK2048 / kHalfPerVec128;  // 256
+    constexpr int kQRows = 2048;
+    constexpr int kKRows = 1024;
+    constexpr int kVRows = 1024;
+    constexpr int kQKVRows = kQRows + kKRows + kVRows;
+    constexpr int kKOffset = kQRows;
+    constexpr int kVOffset = kQRows + kKRows;
+
+    if (tid == 0) {
+        local_gen_sh = barrier_generation[0];
+    }
+    __syncthreads();
+
+    AtomicGridSync grid_sync{
+        barrier_count,
+        barrier_generation,
+        static_cast<unsigned int>(gridDim.x),
+        &local_gen_sh,
+    };
+
+    // Phase 0: input RMSNorm on the decoder residual input.
+    float thread_sum_sq = 0.0f;
+    for (int idx = tid; idx < kNosplitSpecializedK2048; idx += kFullLayerThreads) {
+        const float v = __half2float(residual_half[idx]);
+        thread_sum_sq += v * v;
+    }
+    thread_sum_sq = warp_sum(thread_sum_sq);
+    if (lane == 0) {
+        warp_sums[warp] = thread_sum_sq;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        float block_sum_sq = lane < kFullLayerWarps ? warp_sums[lane] : 0.0f;
+        block_sum_sq = warp_sum(block_sum_sq);
+        if (lane == 0) {
+            inv_rms_sh = rsqrtf(
+                block_sum_sq / static_cast<float>(kNosplitSpecializedK2048) + eps);
+        }
+    }
+    __syncthreads();
+
+    const float input_inv_rms = inv_rms_sh;
+    for (int idx = tid; idx < kNosplitSpecializedK2048; idx += kFullLayerThreads) {
+        const float v = __half2float(residual_half[idx]);
+        x_small_sh[idx] = __float2half(v * input_inv_rms);
+    }
+    __syncthreads();
+
+    // Phase 1: fused QKV GEMV into qkv_out[4096].
+    for (int out_base = blockIdx.x * kFullLayerWarps;
+         out_base < kQKVRows;
+         out_base += gridDim.x * kFullLayerWarps) {
+        const int out_idx = out_base + warp;
+        if (out_idx < kQKVRows) {
+            const uint4* qkv_row_vec = reinterpret_cast<const uint4*>(
+                qkv_w_half + out_idx * qkv_stride_wn);
+            __half2 acc0 = __float2half2_rn(0.0f);
+            __half2 acc1 = __float2half2_rn(0.0f);
+
+            #pragma unroll
+            for (int vec_idx = lane; vec_idx < vecs_k2048; vec_idx += 64) {
+                const uint4 x_vec0 = x_small_vec[vec_idx];
+                const uint4 x_vec1 = x_small_vec[vec_idx + 32];
+                accumulate_hfma2_uint4(x_vec0, qkv_row_vec[vec_idx], acc0);
+                accumulate_hfma2_uint4(x_vec1, qkv_row_vec[vec_idx + 32], acc1);
+            }
+
+            const float2 f0 = __half22float2(acc0);
+            const float2 f1 = __half22float2(acc1);
+            float sum = f0.x + f0.y + f1.x + f1.y;
+            sum = warp_sum(sum);
+            if (lane == 0) {
+                qkv_half[out_idx] = __float2half(sum);
+            }
+        }
+    }
+
+    grid_sync.sync();
+
+    // Phase 2: q_norm+rope, k_norm+rope->cache, v->cache.
+    if (static_cast<int>(blockIdx.x) < num_kv_heads) {
+        const int kv_h = static_cast<int>(blockIdx.x);
+        const int64_t pos = cache_position[0];
+        const __half* q0_in = qkv_half + (kv_h * kAttnGqaRatio + 0) * kAttnHeadDim;
+        const __half* q1_in = qkv_half + (kv_h * kAttnGqaRatio + 1) * kAttnHeadDim;
+        const __half* k_in = qkv_half + kKOffset + kv_h * kAttnHeadDim;
+        const __half* v_in = qkv_half + kVOffset + kv_h * kAttnHeadDim;
+        __half* q0_out = qkv_half + (kv_h * kAttnGqaRatio + 0) * kAttnHeadDim;
+        __half* q1_out = qkv_half + (kv_h * kAttnGqaRatio + 1) * kAttnHeadDim;
+        __half* k_dst =
+            k_cache_half + kv_h * k_cache_stride_h + pos * k_cache_stride_s;
+        __half* v_dst =
+            v_cache_half + kv_h * v_cache_stride_h + pos * v_cache_stride_s;
+
+        if (warp == 0) {
+            fused_rms_norm_rope_one_head(
+                k_in,
+                k_norm_half,
+                cos_half,
+                sin_half,
+                k_dst,
+                eps,
+                lane);
+        } else if (warp == 1) {
+            fused_rms_norm_rope_one_head(
+                q0_in,
+                q_norm_half,
+                cos_half,
+                sin_half,
+                q0_out,
+                eps,
+                lane);
+        } else if (warp == 2) {
+            fused_rms_norm_rope_one_head(
+                q1_in,
+                q_norm_half,
+                cos_half,
+                sin_half,
+                q1_out,
+                eps,
+                lane);
+        } else if (warp == 3) {
+            #pragma unroll
+            for (int idx = lane; idx < kAttnHeadDim; idx += kWarpSize) {
+                v_dst[idx] = v_in[idx];
+            }
+        }
+    }
+
+    grid_sync.sync();
+
+    // Phase 3: persistent attention. Reuse qkv_out[0:2048] as the attention output buffer.
+    const int valid_len = min(
+        static_cast<int>(cache_position[0] + 1), max_seq_len);
+    const int num_q_heads = num_kv_heads * kAttnGqaRatio;
+    const int group_id = lane / kAttnThreadGroup;
+    const int group_lane = lane % kAttnThreadGroup;
+    const int dim_offset = group_lane * kAttnDimsPerThread;
+
+    for (int q_head_idx = blockIdx.x; q_head_idx < num_q_heads; q_head_idx += gridDim.x) {
+        const int kv_head_idx = q_head_idx / kAttnGqaRatio;
+        const int chunk_size =
+            (valid_len + kFullLayerInternalSplits - 1) / kFullLayerInternalSplits;
+        const int chunk_start = warp * chunk_size;
+        const int chunk_end = min(chunk_start + chunk_size, valid_len);
+
+        float q_reg[kAttnDimsPerThread];
+        {
+            const __half* qp = qkv_half + q_head_idx * kAttnHeadDim + dim_offset;
+            #pragma unroll
+            for (int i = 0; i < kAttnDimsPerThread; i += 8) {
+                uint4 d = __ldg(reinterpret_cast<const uint4*>(qp + i));
+                const __half* h = reinterpret_cast<const __half*>(&d);
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    q_reg[i + j] = __half2float(h[j]);
+                }
+            }
+        }
+
+        float m_val = kAttnNegLarge;
+        float l_val = 0.0f;
+        float acc[kAttnDimsPerThread];
+        #pragma unroll
+        for (int i = 0; i < kAttnDimsPerThread; ++i) {
+            acc[i] = 0.0f;
+        }
+
+        const __half* k_base = k_cache_half + kv_head_idx * k_cache_stride_h;
+        const __half* v_base = v_cache_half + kv_head_idx * v_cache_stride_h;
+
+        if (chunk_start < chunk_end) {
+            for (int tile_start = chunk_start; tile_start < chunk_end;
+                 tile_start += kAttnTileN) {
+                const int tile_end = min(tile_start + kAttnTileN, chunk_end);
+                float local_scores[kAttnTileSteps];
+                float tile_max = kAttnNegLarge;
+
+                #pragma unroll
+                for (int step = 0; step < kAttnTileSteps; ++step) {
+                    const int t = tile_start + step * kAttnGroupsPerWarp + group_id;
+                    const bool valid = (t < tile_end);
+                    float dot = 0.0f;
+                    if (valid) {
+                        const __half* kp = k_base + t * k_cache_stride_s + dim_offset;
+                        #pragma unroll
+                        for (int i = 0; i < kAttnDimsPerThread; i += 8) {
+                            uint4 d = __ldg(reinterpret_cast<const uint4*>(kp + i));
+                            const __half* h = reinterpret_cast<const __half*>(&d);
+                            #pragma unroll
+                            for (int j = 0; j < 8; ++j) {
+                                dot += q_reg[i + j] * __half2float(h[j]);
+                            }
+                        }
+                    }
+                    dot += __shfl_xor_sync(0xffffffff, dot, 1);
+                    dot += __shfl_xor_sync(0xffffffff, dot, 2);
+                    const float score = valid ? (dot * attn_scale) : kAttnNegLarge;
+                    local_scores[step] = score;
+                    tile_max = fmaxf(tile_max, score);
+                }
+
+                tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 4));
+                tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 8));
+                tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 16));
+
+                const float new_m = fmaxf(m_val, tile_max);
+                const float alpha = expf(m_val - new_m);
+                #pragma unroll
+                for (int i = 0; i < kAttnDimsPerThread; ++i) {
+                    acc[i] *= alpha;
+                }
+                l_val *= alpha;
+                m_val = new_m;
+
+                #pragma unroll
+                for (int step = 0; step < kAttnTileSteps; ++step) {
+                    const int t = tile_start + step * kAttnGroupsPerWarp + group_id;
+                    const bool valid = (t < tile_end);
+                    if (valid) {
+                        const float p = expf(local_scores[step] - m_val);
+                        l_val += p;
+                        const __half* vp = v_base + t * v_cache_stride_s + dim_offset;
+                        #pragma unroll
+                        for (int i = 0; i < kAttnDimsPerThread; i += 8) {
+                            uint4 d = __ldg(reinterpret_cast<const uint4*>(vp + i));
+                            const __half* h = reinterpret_cast<const __half*>(&d);
+                            #pragma unroll
+                            for (int j = 0; j < 8; ++j) {
+                                acc[i + j] += p * __half2float(h[j]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        #pragma unroll
+        for (int xor_mask = kAttnThreadGroup; xor_mask < kAttnWarpSize;
+             xor_mask <<= 1) {
+            const float pm = __shfl_xor_sync(0xffffffff, m_val, xor_mask);
+            const float pl = __shfl_xor_sync(0xffffffff, l_val, xor_mask);
+            const float nm = fmaxf(m_val, pm);
+            const float s_me = expf(m_val - nm);
+            const float s_pa = expf(pm - nm);
+            #pragma unroll
+            for (int i = 0; i < kAttnDimsPerThread; ++i) {
+                const float pa_v = __shfl_xor_sync(0xffffffff, acc[i], xor_mask);
+                acc[i] = acc[i] * s_me + pa_v * s_pa;
+            }
+            l_val = l_val * s_me + pl * s_pa;
+            m_val = nm;
+        }
+
+        if (group_id == 0) {
+            #pragma unroll
+            for (int i = 0; i < kAttnDimsPerThread; ++i) {
+                smem_acc[warp][dim_offset + i] = acc[i];
+            }
+            if (group_lane == 0) {
+                smem_m[warp] = m_val;
+                smem_l[warp] = l_val;
+            }
+        }
+        __syncthreads();
+
+        constexpr int kDimsPerLane = kAttnHeadDim / kAttnWarpSize;  // 4
+        #pragma unroll
+        for (int stride = kFullLayerInternalSplits / 2; stride >= 1; stride >>= 1) {
+            if (warp < stride) {
+                const int src = warp + stride;
+                const float pm = smem_m[src];
+                const float pl = smem_l[src];
+                const float my_m = smem_m[warp];
+                const float my_l = smem_l[warp];
+                const float nm = fmaxf(my_m, pm);
+                const float s_me = expf(my_m - nm);
+                const float s_pa = expf(pm - nm);
+                #pragma unroll
+                for (int i = 0; i < kDimsPerLane; ++i) {
+                    const float my_a = smem_acc[warp][lane * kDimsPerLane + i];
+                    const float pa_v = smem_acc[src][lane * kDimsPerLane + i];
+                    smem_acc[warp][lane * kDimsPerLane + i] = my_a * s_me + pa_v * s_pa;
+                }
+                if (lane == 0) {
+                    smem_m[warp] = nm;
+                    smem_l[warp] = my_l * s_me + pl * s_pa;
+                }
+            }
+            __syncthreads();
+        }
+
+        if (warp == 0) {
+            const float inv_l = (smem_l[0] > 0.0f) ? (1.0f / smem_l[0]) : 0.0f;
+            __half* op = qkv_half + q_head_idx * kAttnHeadDim;
+            #pragma unroll
+            for (int i = 0; i < kDimsPerLane; ++i) {
+                op[lane * kDimsPerLane + i] =
+                    __float2half(smem_acc[0][lane * kDimsPerLane + i] * inv_l);
+            }
+        }
+        __syncthreads();
+    }
+
+    grid_sync.sync();
+
+    // Phase 4: existing new softsync path for o_proj -> post_attn_mlp -> residual.
+    for (int idx = tid; idx < vecs_k2048; idx += kFullLayerThreads) {
+        x_small_vec[idx] = reinterpret_cast<const uint4*>(qkv_half)[idx];
+    }
+    __syncthreads();
+
+    for (int out_base = blockIdx.x * kFullLayerWarps;
+         out_base < kNosplitSpecializedK2048;
+         out_base += gridDim.x * kFullLayerWarps) {
+        const int out_idx = out_base + warp;
+        if (out_idx < kNosplitSpecializedK2048) {
+            const uint4* o_row_vec = reinterpret_cast<const uint4*>(
+                o_w_half + out_idx * o_proj_stride_wn);
+            __half2 acc0 = __float2half2_rn(0.0f);
+            __half2 acc1 = __float2half2_rn(0.0f);
+
+            #pragma unroll
+            for (int vec_idx = lane; vec_idx < vecs_k2048; vec_idx += 64) {
+                const uint4 x_vec0 = x_small_vec[vec_idx];
+                const uint4 x_vec1 = x_small_vec[vec_idx + 32];
+                accumulate_hfma2_uint4(x_vec0, o_row_vec[vec_idx], acc0);
+                accumulate_hfma2_uint4(x_vec1, o_row_vec[vec_idx + 32], acc1);
+            }
+
+            const float2 f0 = __half22float2(acc0);
+            const float2 f1 = __half22float2(acc1);
+            float sum = f0.x + f0.y + f1.x + f1.y;
+            sum = warp_sum(sum);
+            if (lane == 0) {
+                if (has_o_proj_bias) {
+                    sum += __half2float(o_bias_half[out_idx]);
+                }
+                hidden_half[out_idx] = __float2half(sum);
+            }
+        }
+    }
+
+    grid_sync.sync();
+
+    thread_sum_sq = 0.0f;
+    for (int idx = tid; idx < kNosplitSpecializedK2048; idx += kFullLayerThreads) {
+        const float summed_f =
+            __half2float(residual_half[idx]) + __half2float(hidden_half[idx]);
+        residual_sh[idx] = __float2half(summed_f);
+        thread_sum_sq += summed_f * summed_f;
+    }
+
+    thread_sum_sq = warp_sum(thread_sum_sq);
+    if (lane == 0) {
+        warp_sums[warp] = thread_sum_sq;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        float block_sum_sq = lane < kFullLayerWarps ? warp_sums[lane] : 0.0f;
+        block_sum_sq = warp_sum(block_sum_sq);
+        if (lane == 0) {
+            inv_rms_sh = rsqrtf(
+                block_sum_sq / static_cast<float>(kNosplitSpecializedK2048) + eps);
+        }
+    }
+    __syncthreads();
+
+    const float post_inv_rms = inv_rms_sh;
+    for (int idx = tid; idx < kNosplitSpecializedK2048; idx += kFullLayerThreads) {
+        const float summed_f = __half2float(residual_sh[idx]);
+        const float scale_f = __half2float(post_norm_half[idx]);
+        x_small_sh[idx] = __float2half(summed_f * post_inv_rms * scale_f);
+    }
+    __syncthreads();
+
+    {
+        for (int hidden_base = blockIdx.x * kFullLayerWarps;
+             hidden_base < 6144;
+             hidden_base += gridDim.x * kFullLayerWarps) {
+            const int hidden_idx = hidden_base + warp;
+            if (hidden_idx < 6144) {
+                const uint4* gate_row_vec = reinterpret_cast<const uint4*>(
+                    gate_w_half + hidden_idx * gate_up_stride_wn);
+                const uint4* up_row_vec = reinterpret_cast<const uint4*>(
+                    gate_w_half + (hidden_idx + 6144) * gate_up_stride_wn);
+                __half2 gate_acc0 = __float2half2_rn(0.0f);
+                __half2 gate_acc1 = __float2half2_rn(0.0f);
+                __half2 up_acc0 = __float2half2_rn(0.0f);
+                __half2 up_acc1 = __float2half2_rn(0.0f);
+
+                #pragma unroll
+                for (int vec_idx = lane; vec_idx < vecs_k2048; vec_idx += 64) {
+                    const uint4 x_vec0 = x_small_vec[vec_idx];
+                    const uint4 x_vec1 = x_small_vec[vec_idx + 32];
+                    accumulate_hfma2_uint4(x_vec0, gate_row_vec[vec_idx], gate_acc0);
+                    accumulate_hfma2_uint4(x_vec1, gate_row_vec[vec_idx + 32], gate_acc1);
+                    accumulate_hfma2_uint4(x_vec0, up_row_vec[vec_idx], up_acc0);
+                    accumulate_hfma2_uint4(x_vec1, up_row_vec[vec_idx + 32], up_acc1);
+                }
+
+                const float2 gate_f0 = __half22float2(gate_acc0);
+                const float2 gate_f1 = __half22float2(gate_acc1);
+                const float2 up_f0 = __half22float2(up_acc0);
+                const float2 up_f1 = __half22float2(up_acc1);
+                float gate_sum = gate_f0.x + gate_f0.y + gate_f1.x + gate_f1.y;
+                float up_sum = up_f0.x + up_f0.y + up_f1.x + up_f1.y;
+                gate_sum = warp_sum(gate_sum);
+                up_sum = warp_sum(up_sum);
+                if (lane == 0) {
+                    hidden_half[hidden_idx] =
+                        __float2half(gate_sum / (1.0f + __expf(-gate_sum)) * up_sum);
+                }
+            }
+        }
+    }
+
+    grid_sync.sync();
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    constexpr bool kUseCpAsync = true;
+#else
+    constexpr bool kUseCpAsync = false;
+#endif
+
+    const int row = blockIdx.x * kFullLayerWarps + warp;
+    for (int vec_idx = tid; vec_idx < kAsyncVecsPerTileK6144;
+         vec_idx += kFullLayerThreads) {
+        if constexpr (kUseCpAsync) {
+            cp_async_cg_16(
+                &x_tile_sh[0][vec_idx],
+                reinterpret_cast<const uint4*>(hidden_half) + vec_idx);
+        } else {
+            x_tile_sh[0][vec_idx] =
+                reinterpret_cast<const uint4*>(hidden_half)[vec_idx];
+        }
+    }
+    if constexpr (kUseCpAsync) {
+        cp_async_commit_group();
+        cp_async_wait_group<0>();
+    }
+    __syncthreads();
+
+    float sum = 0.0f;
+    #pragma unroll
+    for (int tile_idx = 0; tile_idx < 6; ++tile_idx) {
+        const int stage = tile_idx & 1;
+        const int tile_start = tile_idx * kNosplitAsyncTileK6144;
+
+        if (tile_idx + 1 < 6) {
+            const int next_tile_start = tile_start + kNosplitAsyncTileK6144;
+            const uint4* x_next_vec =
+                reinterpret_cast<const uint4*>(hidden_half + next_tile_start);
+            for (int vec_idx = tid; vec_idx < kAsyncVecsPerTileK6144;
+                 vec_idx += kFullLayerThreads) {
+                if constexpr (kUseCpAsync) {
+                    cp_async_cg_16(
+                        &x_tile_sh[stage ^ 1][vec_idx],
+                        x_next_vec + vec_idx);
+                } else {
+                    x_tile_sh[stage ^ 1][vec_idx] = x_next_vec[vec_idx];
+                }
+            }
+            if constexpr (kUseCpAsync) {
+                cp_async_commit_group();
+            }
+        }
+
+        if (row < 2048) {
+            const uint4* x_sh_stage_vec = x_tile_sh[stage];
+            const uint4* w_row_vec = reinterpret_cast<const uint4*>(
+                down_w_half + row * down_proj_stride_wn + tile_start);
+            __half2 h2_acc0 = __float2half2_rn(0.0f);
+            __half2 h2_acc1 = __float2half2_rn(0.0f);
+
+            #pragma unroll
+            for (int vec_idx = lane; vec_idx < kAsyncVecsPerTileK6144;
+                 vec_idx += 64) {
+                const uint4 x_vec0 = x_sh_stage_vec[vec_idx];
+                const uint4 w_vec0 = w_row_vec[vec_idx];
+                const uint4 x_vec1 = x_sh_stage_vec[vec_idx + 32];
+                const uint4 w_vec1 = w_row_vec[vec_idx + 32];
+                accumulate_hfma2_uint4(x_vec0, w_vec0, h2_acc0);
+                accumulate_hfma2_uint4(x_vec1, w_vec1, h2_acc1);
+            }
+
+            const float2 f2_0 = __half22float2(h2_acc0);
+            const float2 f2_1 = __half22float2(h2_acc1);
+            sum += f2_0.x + f2_0.y + f2_1.x + f2_1.y;
+        }
+
+        if constexpr (kUseCpAsync) {
+            if (tile_idx + 1 < 6) {
+                cp_async_wait_group<0>();
+            }
+        }
+        __syncthreads();
+    }
+
+    if (row < 2048) {
+        sum = warp_sum(sum);
+        if (lane == 0) {
+            float result = sum + __half2float(residual_sh[row]);
+            if (has_down_proj_bias) {
+                result += __half2float(down_bias_half[row]);
+            }
+            out_half[row] = __float2half(result);
+        }
+    }
+}
+
 }  // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -2596,6 +3229,217 @@ torch::Tensor decode_attn_persistent_half_cuda(
         v_s1, v_s2,
         o_s0,
         scale_f,
+        max_sl,
+        n_kv);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+torch::Tensor fused_decode_full_layer_softsync_half_cuda(
+    const torch::Tensor& hidden_states,
+    const torch::Tensor& qkv_weight,
+    const torch::Tensor& q_norm_weight,
+    const torch::Tensor& k_norm_weight,
+    const torch::Tensor& cos,
+    const torch::Tensor& sin,
+    const torch::Tensor& k_cache,
+    const torch::Tensor& v_cache,
+    const torch::Tensor& cache_position,
+    const torch::Tensor& o_proj_weight,
+    const torch::Tensor& o_proj_bias,
+    const torch::Tensor& post_attn_norm_weight,
+    const torch::Tensor& gate_up_weight,
+    const torch::Tensor& down_proj_weight,
+    const torch::Tensor& down_proj_bias,
+    const torch::Tensor& barrier_count,
+    const torch::Tensor& barrier_generation,
+    const torch::Tensor& qkv_out,
+    const torch::Tensor& hidden_out,
+    const torch::Tensor& out,
+    double eps,
+    double attn_scale,
+    bool has_o_proj_bias,
+    bool has_down_proj_bias,
+    int64_t launch_blocks) {
+    TORCH_CHECK(
+        hidden_states.is_cuda() && qkv_weight.is_cuda() && q_norm_weight.is_cuda()
+            && k_norm_weight.is_cuda() && cos.is_cuda() && sin.is_cuda()
+            && k_cache.is_cuda() && v_cache.is_cuda() && cache_position.is_cuda()
+            && o_proj_weight.is_cuda() && post_attn_norm_weight.is_cuda()
+            && gate_up_weight.is_cuda() && down_proj_weight.is_cuda()
+            && barrier_count.is_cuda() && barrier_generation.is_cuda()
+            && qkv_out.is_cuda() && hidden_out.is_cuda() && out.is_cuda(),
+        "fused full layer softsync expects CUDA tensors");
+    TORCH_CHECK(hidden_states.scalar_type() == torch::kFloat16, "hidden_states must be fp16");
+    TORCH_CHECK(qkv_weight.scalar_type() == torch::kFloat16, "qkv_weight must be fp16");
+    TORCH_CHECK(q_norm_weight.scalar_type() == torch::kFloat16, "q_norm_weight must be fp16");
+    TORCH_CHECK(k_norm_weight.scalar_type() == torch::kFloat16, "k_norm_weight must be fp16");
+    TORCH_CHECK(cos.scalar_type() == torch::kFloat16, "cos must be fp16");
+    TORCH_CHECK(sin.scalar_type() == torch::kFloat16, "sin must be fp16");
+    TORCH_CHECK(k_cache.scalar_type() == torch::kFloat16, "k_cache must be fp16");
+    TORCH_CHECK(v_cache.scalar_type() == torch::kFloat16, "v_cache must be fp16");
+    TORCH_CHECK(o_proj_weight.scalar_type() == torch::kFloat16, "o_proj_weight must be fp16");
+    TORCH_CHECK(post_attn_norm_weight.scalar_type() == torch::kFloat16, "post_attn_norm_weight must be fp16");
+    TORCH_CHECK(gate_up_weight.scalar_type() == torch::kFloat16, "gate_up_weight must be fp16");
+    TORCH_CHECK(down_proj_weight.scalar_type() == torch::kFloat16, "down_proj_weight must be fp16");
+    TORCH_CHECK(barrier_count.scalar_type() == torch::kInt32, "barrier_count must be int32");
+    TORCH_CHECK(barrier_generation.scalar_type() == torch::kInt32, "barrier_generation must be int32");
+    TORCH_CHECK(qkv_out.scalar_type() == torch::kFloat16, "qkv_out must be fp16");
+    TORCH_CHECK(hidden_out.scalar_type() == torch::kFloat16, "hidden_out must be fp16");
+    TORCH_CHECK(out.scalar_type() == torch::kFloat16, "out must be fp16");
+    TORCH_CHECK(cache_position.scalar_type() == torch::kLong, "cache_position must be int64");
+
+    TORCH_CHECK(hidden_states.dim() == 1 && hidden_states.numel() == kNosplitSpecializedK2048,
+        "hidden_states must be flattened [2048]");
+    TORCH_CHECK(
+        qkv_weight.dim() == 2
+            && qkv_weight.size(0) == 4096
+            && qkv_weight.size(1) == kNosplitSpecializedK2048
+            && qkv_weight.stride(1) == 1,
+        "qkv_weight must be contiguous [4096, 2048]");
+    TORCH_CHECK(q_norm_weight.dim() == 1 && q_norm_weight.numel() == kAttnHeadDim,
+        "q_norm_weight must be [128]");
+    TORCH_CHECK(k_norm_weight.dim() == 1 && k_norm_weight.numel() == kAttnHeadDim,
+        "k_norm_weight must be [128]");
+    TORCH_CHECK(cos.numel() == kAttnHeadDim, "cos must have 128 elements");
+    TORCH_CHECK(sin.numel() == kAttnHeadDim, "sin must have 128 elements");
+    TORCH_CHECK(k_cache.dim() == 4 && v_cache.dim() == 4, "k_cache/v_cache must be [1, kv_heads, seq, 128]");
+    TORCH_CHECK(k_cache.size(0) == 1 && v_cache.size(0) == 1, "only batch=1 cache is supported");
+    TORCH_CHECK(k_cache.size(1) == 8 && v_cache.size(1) == 8, "k_cache/v_cache must have 8 kv heads");
+    TORCH_CHECK(k_cache.size(3) == kAttnHeadDim && v_cache.size(3) == kAttnHeadDim,
+        "k_cache/v_cache head_dim must be 128");
+    TORCH_CHECK(cache_position.dim() == 1 && cache_position.numel() == 1, "cache_position must be [1]");
+    TORCH_CHECK(
+        o_proj_weight.dim() == 2
+            && o_proj_weight.size(0) == 2048
+            && o_proj_weight.size(1) == kNosplitSpecializedK2048
+            && o_proj_weight.stride(1) == 1,
+        "o_proj_weight must be contiguous [2048, 2048]");
+    TORCH_CHECK(
+        post_attn_norm_weight.dim() == 1
+            && post_attn_norm_weight.numel() == kNosplitSpecializedK2048,
+        "post_attn_norm_weight must be [2048]");
+    TORCH_CHECK(
+        gate_up_weight.dim() == 2
+            && gate_up_weight.size(0) == 12288
+            && gate_up_weight.size(1) == kNosplitSpecializedK2048
+            && gate_up_weight.stride(1) == 1,
+        "gate_up_weight must be contiguous [12288, 2048]");
+    TORCH_CHECK(
+        down_proj_weight.dim() == 2
+            && down_proj_weight.size(0) == 2048
+            && down_proj_weight.size(1) == 6144
+            && down_proj_weight.stride(1) == 1,
+        "down_proj_weight must be contiguous [2048, 6144]");
+    TORCH_CHECK(barrier_count.dim() == 1 && barrier_count.numel() == 1, "barrier_count must be [1]");
+    TORCH_CHECK(barrier_generation.dim() == 1 && barrier_generation.numel() == 1,
+        "barrier_generation must be [1]");
+    TORCH_CHECK(qkv_out.dim() == 1 && qkv_out.numel() == 4096, "qkv_out must be [4096]");
+    TORCH_CHECK(hidden_out.dim() == 1 && hidden_out.numel() == 6144, "hidden_out must be [6144]");
+    TORCH_CHECK(out.dim() == 1 && out.numel() == 2048, "out must be [2048]");
+    TORCH_CHECK(
+        !has_o_proj_bias
+            || (o_proj_bias.is_cuda() && o_proj_bias.scalar_type() == torch::kFloat16
+                && o_proj_bias.dim() == 1 && o_proj_bias.numel() == 2048
+                && o_proj_bias.stride(0) == 1),
+        "o_proj_bias must be contiguous [2048] when provided");
+    TORCH_CHECK(
+        !has_down_proj_bias
+            || (down_proj_bias.is_cuda() && down_proj_bias.scalar_type() == torch::kFloat16
+                && down_proj_bias.dim() == 1 && down_proj_bias.numel() == 2048
+                && down_proj_bias.stride(0) == 1),
+        "down_proj_bias must be contiguous [2048] when provided");
+
+    int device_idx = static_cast<int>(hidden_states.device().index());
+    int num_sms = 0;
+    C10_CUDA_CHECK(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device_idx));
+    const int requested_blocks = static_cast<int>(launch_blocks);
+    const int grid_blocks = max(
+        1,
+        min(num_sms, requested_blocks > 0 ? requested_blocks : num_sms));
+
+    int max_blocks_per_sm = 0;
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &max_blocks_per_sm,
+        fused_decode_full_layer_softsync_k2048_fwd_kernel,
+        kFullLayerThreads,
+        0));
+    TORCH_CHECK(
+        max_blocks_per_sm * num_sms >= grid_blocks,
+        "fused_decode_full_layer_softsync launch would deadlock: resident blocks ",
+        max_blocks_per_sm * num_sms,
+        " < required grid blocks ",
+        grid_blocks);
+
+    c10::cuda::CUDAGuard device_guard(hidden_states.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    auto* hidden_ptr = hidden_states.data_ptr<at::Half>();
+    auto* qkv_w_ptr = qkv_weight.data_ptr<at::Half>();
+    auto* q_norm_ptr = q_norm_weight.data_ptr<at::Half>();
+    auto* k_norm_ptr = k_norm_weight.data_ptr<at::Half>();
+    auto* cos_ptr = cos.data_ptr<at::Half>();
+    auto* sin_ptr = sin.data_ptr<at::Half>();
+    auto* k_cache_ptr = k_cache.data_ptr<at::Half>();
+    auto* v_cache_ptr = v_cache.data_ptr<at::Half>();
+    auto* cache_pos_ptr = cache_position.data_ptr<int64_t>();
+    auto* o_w_ptr = o_proj_weight.data_ptr<at::Half>();
+    auto* o_b_ptr = has_o_proj_bias ? o_proj_bias.data_ptr<at::Half>() : nullptr;
+    auto* post_norm_ptr = post_attn_norm_weight.data_ptr<at::Half>();
+    auto* gate_up_ptr = gate_up_weight.data_ptr<at::Half>();
+    auto* down_w_ptr = down_proj_weight.data_ptr<at::Half>();
+    auto* down_b_ptr = has_down_proj_bias ? down_proj_bias.data_ptr<at::Half>() : nullptr;
+    auto* barrier_count_ptr = reinterpret_cast<unsigned int*>(barrier_count.data_ptr<int32_t>());
+    auto* barrier_generation_ptr = reinterpret_cast<unsigned int*>(barrier_generation.data_ptr<int32_t>());
+    auto* qkv_out_ptr = qkv_out.data_ptr<at::Half>();
+    auto* hidden_out_ptr = hidden_out.data_ptr<at::Half>();
+    auto* out_ptr = out.data_ptr<at::Half>();
+    float eps_f = static_cast<float>(eps);
+    float attn_scale_f = static_cast<float>(attn_scale);
+    int64_t qkv_s0 = qkv_weight.stride(0);
+    int64_t k_cache_s1 = k_cache.stride(1);
+    int64_t k_cache_s2 = k_cache.stride(2);
+    int64_t v_cache_s1 = v_cache.stride(1);
+    int64_t v_cache_s2 = v_cache.stride(2);
+    int64_t o_s0 = o_proj_weight.stride(0);
+    int64_t gate_up_s0 = gate_up_weight.stride(0);
+    int64_t down_s0 = down_proj_weight.stride(0);
+    int max_sl = static_cast<int>(k_cache.size(2));
+    int n_kv = static_cast<int>(k_cache.size(1));
+
+    fused_decode_full_layer_softsync_k2048_fwd_kernel<<<grid_blocks, kFullLayerThreads, 0, stream>>>(
+        hidden_ptr,
+        qkv_w_ptr,
+        q_norm_ptr,
+        k_norm_ptr,
+        cos_ptr,
+        sin_ptr,
+        k_cache_ptr,
+        v_cache_ptr,
+        cache_pos_ptr,
+        o_w_ptr,
+        o_b_ptr,
+        post_norm_ptr,
+        gate_up_ptr,
+        down_w_ptr,
+        down_b_ptr,
+        barrier_count_ptr,
+        barrier_generation_ptr,
+        qkv_out_ptr,
+        hidden_out_ptr,
+        out_ptr,
+        eps_f,
+        attn_scale_f,
+        has_o_proj_bias,
+        has_down_proj_bias,
+        qkv_s0,
+        k_cache_s1,
+        k_cache_s2,
+        v_cache_s1,
+        v_cache_s2,
+        o_s0,
+        gate_up_s0,
+        down_s0,
         max_sl,
         n_kv);
     C10_CUDA_KERNEL_LAUNCH_CHECK();

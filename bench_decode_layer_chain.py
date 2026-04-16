@@ -682,6 +682,7 @@ def main():
     )
     capture_flag_restore = optimized_layer.set_cuda_mlp_fusion_flags(
         add_rmsnorm_gateup=False,
+        full_layer_softsync=False,
         post_attn_mlp_persistent=False,
         o_proj_post_attn_mlp_persistent=False,
         o_proj_post_attn_mlp_softsync=False,
@@ -701,12 +702,13 @@ def main():
     finally:
         optimized_layer.set_cuda_mlp_fusion_flags(
             add_rmsnorm_gateup=capture_flag_restore[0],
-            post_attn_mlp_persistent=capture_flag_restore[1],
-            o_proj_post_attn_mlp_persistent=capture_flag_restore[2],
-            o_proj_post_attn_mlp_softsync=capture_flag_restore[3],
-            silu_downproj=capture_flag_restore[4],
-            gateup_silu_downproj=capture_flag_restore[5],
-            gateup_silu_downproj_mega=capture_flag_restore[6],
+            full_layer_softsync=capture_flag_restore[1],
+            post_attn_mlp_persistent=capture_flag_restore[2],
+            o_proj_post_attn_mlp_persistent=capture_flag_restore[3],
+            o_proj_post_attn_mlp_softsync=capture_flag_restore[4],
+            silu_downproj=capture_flag_restore[5],
+            gateup_silu_downproj=capture_flag_restore[6],
+            gateup_silu_downproj_mega=capture_flag_restore[7],
         )
 
     target_layer = vlm._model.model.language_model.layers[args.layer_idx]
@@ -732,12 +734,13 @@ def main():
     finally:
         optimized_layer.set_cuda_mlp_fusion_flags(
             add_rmsnorm_gateup=capture_flag_restore[0],
-            post_attn_mlp_persistent=capture_flag_restore[1],
-            o_proj_post_attn_mlp_persistent=capture_flag_restore[2],
-            o_proj_post_attn_mlp_softsync=capture_flag_restore[3],
-            silu_downproj=capture_flag_restore[4],
-            gateup_silu_downproj=capture_flag_restore[5],
-            gateup_silu_downproj_mega=capture_flag_restore[6],
+            full_layer_softsync=capture_flag_restore[1],
+            post_attn_mlp_persistent=capture_flag_restore[2],
+            o_proj_post_attn_mlp_persistent=capture_flag_restore[3],
+            o_proj_post_attn_mlp_softsync=capture_flag_restore[4],
+            silu_downproj=capture_flag_restore[5],
+            gateup_silu_downproj=capture_flag_restore[6],
+            gateup_silu_downproj_mega=capture_flag_restore[7],
         )
         set_small_decode_triton_enabled(vlm._model, previous_small_decode_triton)
 

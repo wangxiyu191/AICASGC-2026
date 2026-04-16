@@ -369,6 +369,33 @@ torch::Tensor fused_o_proj_post_attn_mlp_softsync_profile_half_cuda(
     bool has_down_proj_bias,
     int64_t gate_up_active_sms);
 
+torch::Tensor fused_decode_full_layer_softsync_half_cuda(
+    const torch::Tensor& hidden_states,
+    const torch::Tensor& qkv_weight,
+    const torch::Tensor& q_norm_weight,
+    const torch::Tensor& k_norm_weight,
+    const torch::Tensor& cos,
+    const torch::Tensor& sin,
+    const torch::Tensor& k_cache,
+    const torch::Tensor& v_cache,
+    const torch::Tensor& cache_position,
+    const torch::Tensor& o_proj_weight,
+    const torch::Tensor& o_proj_bias,
+    const torch::Tensor& post_attn_norm_weight,
+    const torch::Tensor& gate_up_weight,
+    const torch::Tensor& down_proj_weight,
+    const torch::Tensor& down_proj_bias,
+    const torch::Tensor& barrier_count,
+    const torch::Tensor& barrier_generation,
+    const torch::Tensor& qkv_out,
+    const torch::Tensor& hidden_out,
+    const torch::Tensor& out,
+    double eps,
+    double attn_scale,
+    bool has_o_proj_bias,
+    bool has_down_proj_bias,
+    int64_t launch_blocks);
+
 torch::Tensor fused_gateup_silu_downproj_persistent_half_cuda(
     const torch::Tensor& x,
     const torch::Tensor& gate_up_weight,
@@ -1024,6 +1051,60 @@ torch::Tensor fused_o_proj_post_attn_mlp_softsync_profile_half(
         gate_up_active_sms);
 }
 
+torch::Tensor fused_decode_full_layer_softsync_half(
+    const torch::Tensor& hidden_states,
+    const torch::Tensor& qkv_weight,
+    const torch::Tensor& q_norm_weight,
+    const torch::Tensor& k_norm_weight,
+    const torch::Tensor& cos,
+    const torch::Tensor& sin,
+    const torch::Tensor& k_cache,
+    const torch::Tensor& v_cache,
+    const torch::Tensor& cache_position,
+    const torch::Tensor& o_proj_weight,
+    const torch::Tensor& o_proj_bias,
+    const torch::Tensor& post_attn_norm_weight,
+    const torch::Tensor& gate_up_weight,
+    const torch::Tensor& down_proj_weight,
+    const torch::Tensor& down_proj_bias,
+    const torch::Tensor& barrier_count,
+    const torch::Tensor& barrier_generation,
+    const torch::Tensor& qkv_out,
+    const torch::Tensor& hidden_out,
+    const torch::Tensor& out,
+    double eps,
+    double attn_scale,
+    bool has_o_proj_bias,
+    bool has_down_proj_bias,
+    int64_t launch_blocks) {
+    return fused_decode_full_layer_softsync_half_cuda(
+        hidden_states,
+        qkv_weight,
+        q_norm_weight,
+        k_norm_weight,
+        cos,
+        sin,
+        k_cache,
+        v_cache,
+        cache_position,
+        o_proj_weight,
+        o_proj_bias,
+        post_attn_norm_weight,
+        gate_up_weight,
+        down_proj_weight,
+        down_proj_bias,
+        barrier_count,
+        barrier_generation,
+        qkv_out,
+        hidden_out,
+        out,
+        eps,
+        attn_scale,
+        has_o_proj_bias,
+        has_down_proj_bias,
+        launch_blocks);
+}
+
 torch::Tensor fused_gateup_silu_downproj_persistent_profile_half(
     const torch::Tensor& x,
     const torch::Tensor& gate_up_weight,
@@ -1079,6 +1160,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_o_proj_post_attn_mlp_softsync_half", &fused_o_proj_post_attn_mlp_softsync_half);
     m.def("fused_o_proj_post_attn_mlp_persistent_profile_half", &fused_o_proj_post_attn_mlp_persistent_profile_half);
     m.def("fused_o_proj_post_attn_mlp_softsync_profile_half", &fused_o_proj_post_attn_mlp_softsync_profile_half);
+    m.def("fused_decode_full_layer_softsync_half", &fused_decode_full_layer_softsync_half);
     m.def("fused_gateup_silu_downproj_persistent_half", &fused_gateup_silu_downproj_persistent_half);
     m.def("fused_gateup_silu_downproj_persistent_profile_half", &fused_gateup_silu_downproj_persistent_profile_half);
     m.def("decode_attn_persistent_half", &decode_attn_persistent_half);

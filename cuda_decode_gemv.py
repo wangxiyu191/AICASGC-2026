@@ -1477,6 +1477,129 @@ def fused_o_proj_post_attn_mlp_softsync_half(
     return hidden_out.view(*residual.shape[:-1], 6144), out_vec.view(*residual.shape[:-1], n)
 
 
+def fused_decode_full_layer_softsync_half(
+    hidden_states: torch.Tensor,
+    qkv_weight: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cache_position: torch.Tensor,
+    o_proj_weight: torch.Tensor,
+    o_proj_bias: torch.Tensor | None,
+    post_attn_norm_weight: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_proj_weight: torch.Tensor,
+    down_proj_bias: torch.Tensor | None,
+    eps: float,
+    attn_scale: float,
+    workspace: dict | None = None,
+    launch_blocks: int | None = None,
+) -> torch.Tensor:
+    if (
+        hidden_states.device.type != "cuda"
+        or qkv_weight.device.type != "cuda"
+        or q_norm_weight.device.type != "cuda"
+        or k_norm_weight.device.type != "cuda"
+        or cos.device.type != "cuda"
+        or sin.device.type != "cuda"
+        or k_cache.device.type != "cuda"
+        or v_cache.device.type != "cuda"
+        or cache_position.device.type != "cuda"
+        or o_proj_weight.device.type != "cuda"
+        or post_attn_norm_weight.device.type != "cuda"
+        or gate_up_weight.device.type != "cuda"
+        or down_proj_weight.device.type != "cuda"
+        or hidden_states.dtype != torch.float16
+        or qkv_weight.dtype != torch.float16
+        or q_norm_weight.dtype != torch.float16
+        or k_norm_weight.dtype != torch.float16
+        or cos.dtype != torch.float16
+        or sin.dtype != torch.float16
+        or k_cache.dtype != torch.float16
+        or v_cache.dtype != torch.float16
+        or o_proj_weight.dtype != torch.float16
+        or post_attn_norm_weight.dtype != torch.float16
+        or gate_up_weight.dtype != torch.float16
+        or down_proj_weight.dtype != torch.float16
+        or hidden_states.ndim < 2
+        or hidden_states.shape[-2] != 1
+    ):
+        raise RuntimeError(
+            "fused_decode_full_layer_softsync_half expects fp16 CUDA single-token decode tensors"
+        )
+
+    hidden_vec = hidden_states.reshape(-1).contiguous()
+    cos_vec = cos.reshape(-1).contiguous()
+    sin_vec = sin.reshape(-1).contiguous()
+    n = hidden_states.shape[-1]
+    if (
+        workspace is not None
+        and workspace.get("type") == "fused_decode_full_layer_softsync"
+        and tuple(workspace["barrier_count"].shape) == (1,)
+        and tuple(workspace["barrier_generation"].shape) == (1,)
+        and tuple(workspace["qkv_out"].shape) == (4096,)
+        and tuple(workspace["hidden_out"].shape) == (6144,)
+        and tuple(workspace["out"].shape) == (n,)
+        and workspace["barrier_count"].device == hidden_states.device
+        and workspace["barrier_generation"].device == hidden_states.device
+        and workspace["qkv_out"].device == hidden_states.device
+        and workspace["hidden_out"].device == hidden_states.device
+        and workspace["out"].device == hidden_states.device
+        and workspace["barrier_count"].dtype == torch.int32
+        and workspace["barrier_generation"].dtype == torch.int32
+        and workspace["qkv_out"].dtype == hidden_states.dtype
+        and workspace["hidden_out"].dtype == hidden_states.dtype
+        and workspace["out"].dtype == hidden_states.dtype
+    ):
+        barrier_count = workspace["barrier_count"]
+        barrier_generation = workspace["barrier_generation"]
+        qkv_out = workspace["qkv_out"]
+        hidden_out = workspace["hidden_out"]
+        out_vec = workspace["out"]
+    else:
+        barrier_count = torch.zeros((1,), dtype=torch.int32, device=hidden_states.device)
+        barrier_generation = torch.zeros((1,), dtype=torch.int32, device=hidden_states.device)
+        qkv_out = torch.empty((4096,), dtype=hidden_states.dtype, device=hidden_states.device)
+        hidden_out = torch.empty((6144,), dtype=hidden_states.dtype, device=hidden_states.device)
+        out_vec = torch.empty((n,), dtype=hidden_states.dtype, device=hidden_states.device)
+
+    if launch_blocks is None:
+        launch_blocks = int(os.environ.get("CUDA_FUSED_FULL_LAYER_SOFTSYNC_BLOCKS", "0"))
+
+    ext = _load_ext()
+    ext.fused_decode_full_layer_softsync_half(
+        hidden_vec,
+        qkv_weight,
+        q_norm_weight.reshape(-1).contiguous(),
+        k_norm_weight.reshape(-1).contiguous(),
+        cos_vec,
+        sin_vec,
+        k_cache,
+        v_cache,
+        cache_position,
+        o_proj_weight,
+        o_proj_bias if o_proj_bias is not None else torch.empty(0, device=hidden_states.device, dtype=hidden_states.dtype),
+        post_attn_norm_weight.reshape(-1).contiguous(),
+        gate_up_weight,
+        down_proj_weight,
+        down_proj_bias if down_proj_bias is not None else torch.empty(0, device=hidden_states.device, dtype=hidden_states.dtype),
+        barrier_count,
+        barrier_generation,
+        qkv_out,
+        hidden_out,
+        out_vec,
+        eps,
+        attn_scale,
+        o_proj_bias is not None,
+        down_proj_bias is not None,
+        int(launch_blocks),
+    )
+    return out_vec.view(*hidden_states.shape[:-1], n)
+
+
 def fused_gateup_silu_downproj_mega_half(
     x: torch.Tensor,
     gate_up_weight: torch.Tensor,
