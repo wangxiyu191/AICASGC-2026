@@ -77,6 +77,11 @@ def _maybe_clone_tensor(value):
     return None if value is None else value.detach().clone()
 
 
+def _copy_if_present(dst: torch.Tensor | None, src: torch.Tensor | None):
+    if dst is not None and src is not None:
+        dst.copy_(src)
+
+
 def _capture_prefill_text_payload(
     vlm: VLMModel,
     inputs,
@@ -342,6 +347,175 @@ class PrefillLayerSubgraphRunner:
         return self.hidden_out
 
 
+class PrefillGenericSubgraphRunner:
+    def __init__(
+        self,
+        template_layer,
+        example_hidden: torch.Tensor,
+        position_embeddings,
+        warmup_steps: int = 2,
+    ):
+        self.template_layer = template_layer
+        self.position_embeddings = position_embeddings
+        self.hidden_in_buf = example_hidden.detach().clone()
+        self.attn_out_buf = torch.empty_like(self.hidden_in_buf)
+        self.pre_graph = None
+        self.post_graph = None
+        self.q_out = None
+        self.k_out = None
+        self.v_out = None
+        self.hidden_out = None
+
+        self.input_layernorm_weight_buf = torch.empty_like(template_layer.input_layernorm_weight)
+        self.q_norm_weight_buf = torch.empty_like(template_layer.q_norm_weight)
+        self.k_norm_weight_buf = torch.empty_like(template_layer.k_norm_weight)
+        self.qkv_weight_buf = torch.empty_like(template_layer.qkv_weight)
+        self.o_proj_weight_buf = torch.empty_like(template_layer.o_proj_weight)
+        self.o_proj_bias_buf = (
+            None if template_layer.o_proj_bias is None else torch.empty_like(template_layer.o_proj_bias)
+        )
+        self.post_attn_layernorm_weight_buf = torch.empty_like(template_layer.post_attn_layernorm_weight)
+        self.gate_up_weight_buf = torch.empty_like(template_layer.gate_up_weight)
+        self.down_proj_weight_buf = torch.empty_like(template_layer.down_proj_weight)
+        self.down_proj_bias_buf = (
+            None if template_layer.down_proj_bias is None else torch.empty_like(template_layer.down_proj_bias)
+        )
+
+        self._stage_pre_weights(template_layer)
+        self._stage_post_weights(template_layer)
+        self._capture(max(1, warmup_steps))
+
+    def _stage_pre_weights(self, layer):
+        self.input_layernorm_weight_buf.copy_(layer.input_layernorm_weight)
+        self.q_norm_weight_buf.copy_(layer.q_norm_weight)
+        self.k_norm_weight_buf.copy_(layer.k_norm_weight)
+        self.qkv_weight_buf.copy_(layer.qkv_weight)
+
+    def _stage_post_weights(self, layer):
+        self.o_proj_weight_buf.copy_(layer.o_proj_weight)
+        _copy_if_present(self.o_proj_bias_buf, layer.o_proj_bias)
+        self.post_attn_layernorm_weight_buf.copy_(layer.post_attn_layernorm_weight)
+        self.gate_up_weight_buf.copy_(layer.gate_up_weight)
+        self.down_proj_weight_buf.copy_(layer.down_proj_weight)
+        _copy_if_present(self.down_proj_bias_buf, layer.down_proj_bias)
+
+    def _run_pre_segment(self):
+        input_shape = self.hidden_in_buf.shape[:-1]
+        hidden_shape_q = (*input_shape, self.template_layer.num_heads, self.template_layer.head_dim)
+        hidden_shape_kv = (*input_shape, self.template_layer.num_kv_heads, self.template_layer.head_dim)
+
+        hidden_states = _rms_norm(
+            self.hidden_in_buf,
+            self.input_layernorm_weight_buf,
+            self.template_layer.rms_norm_eps,
+            prefer_small_triton=False,
+        )
+        qkv = F.linear(hidden_states, self.qkv_weight_buf)
+        q, k, v = qkv.split([self.template_layer.q_size, self.template_layer.kv_size, self.template_layer.kv_size], dim=-1)
+
+        q_view = q.view(hidden_shape_q)
+        k_view = k.view(hidden_shape_kv)
+        cos, sin = self.position_embeddings
+        fused_qk = _fused_qk_rms_norm_rope(
+            q_view,
+            k_view,
+            self.q_norm_weight_buf,
+            self.k_norm_weight_buf,
+            self.template_layer.rms_norm_eps,
+            cos,
+            sin,
+            prefer_small_triton=False,
+        )
+        if fused_qk is None:
+            q_view = _fused_rms_norm_rope(
+                q_view,
+                self.q_norm_weight_buf,
+                self.template_layer.rms_norm_eps,
+                cos,
+                sin,
+                prefer_small_triton=False,
+            )
+            k_view = _fused_rms_norm_rope(
+                k_view,
+                self.k_norm_weight_buf,
+                self.template_layer.rms_norm_eps,
+                cos,
+                sin,
+                prefer_small_triton=False,
+            )
+        else:
+            q_view, k_view = fused_qk
+
+        self.q_out = q_view.transpose(1, 2)
+        self.k_out = k_view.transpose(1, 2)
+        self.v_out = v.view(hidden_shape_kv).transpose(1, 2)
+
+    def _run_attention(self, layer):
+        attn_output, _ = layer._attention_interface(
+            layer,
+            self.q_out,
+            self.k_out,
+            self.v_out,
+            None,
+            dropout=0.0,
+            scaling=layer.scaling,
+        )
+        attn_output = attn_output.reshape(*self.hidden_in_buf.shape[:-1], -1)
+        if not attn_output.is_contiguous():
+            attn_output = attn_output.contiguous()
+        return attn_output
+
+    def _run_post_segment(self):
+        attn_output = F.linear(self.attn_out_buf, self.o_proj_weight_buf, self.o_proj_bias_buf)
+        residual, hidden_states = _fused_add_rms_norm(
+            self.hidden_in_buf,
+            attn_output,
+            self.post_attn_layernorm_weight_buf,
+            self.template_layer.rms_norm_eps,
+            prefer_small_triton=False,
+        )
+        gate_up = F.linear(hidden_states, self.gate_up_weight_buf)
+        hidden_states = _fused_silu_mul_packed(gate_up, prefer_small_triton=False)
+        if hidden_states is None:
+            gate, up = gate_up.chunk(2, dim=-1)
+            hidden_states = _fused_silu_mul(gate, up, prefer_small_triton=False)
+        down_proj = F.linear(hidden_states, self.down_proj_weight_buf, self.down_proj_bias_buf)
+        self.hidden_out = _add(residual, down_proj, prefer_small_triton=False)
+
+    def _capture_graph(self, run_fn, graph_name: str):
+        side_stream = torch.cuda.Stream(device=self.hidden_in_buf.device)
+        with torch.cuda.stream(side_stream):
+            for _ in range(2):
+                run_fn()
+        torch.cuda.current_stream(device=self.hidden_in_buf.device).wait_stream(side_stream)
+        torch.cuda.synchronize(self.hidden_in_buf.device)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run_fn()
+        torch.cuda.synchronize(self.hidden_in_buf.device)
+        setattr(self, graph_name, graph)
+
+    def _capture(self, warmup_steps: int):
+        self._capture_graph(self._run_pre_segment, "pre_graph")
+        for _ in range(warmup_steps):
+            self.pre_graph.replay()
+            attn_output = self._run_attention(self.template_layer)
+            self.attn_out_buf.copy_(attn_output)
+        torch.cuda.synchronize(self.hidden_in_buf.device)
+        self.pre_graph.replay()
+        self.attn_out_buf.copy_(self._run_attention(self.template_layer))
+        self._capture_graph(self._run_post_segment, "post_graph")
+
+    def replay_layer(self, layer, hidden_states: torch.Tensor) -> torch.Tensor:
+        self.hidden_in_buf.copy_(hidden_states)
+        self._stage_pre_weights(layer)
+        self.pre_graph.replay()
+        self.attn_out_buf.copy_(self._run_attention(layer))
+        self._stage_post_weights(layer)
+        self.post_graph.replay()
+        return self.hidden_out
+
+
 def _build_runners(
     language_model,
     example_inputs: dict[int, torch.Tensor],
@@ -363,6 +537,21 @@ def _build_runners(
     return runners
 
 
+def _build_generic_runner(
+    language_model,
+    example_inputs: dict[int, torch.Tensor],
+    position_embeddings,
+    start_layer_idx: int,
+    warmup_steps: int,
+):
+    return PrefillGenericSubgraphRunner(
+        template_layer=language_model.layers[start_layer_idx],
+        example_hidden=example_inputs[start_layer_idx],
+        position_embeddings=position_embeddings,
+        warmup_steps=warmup_steps,
+    )
+
+
 def _run_layers_graphed(
     language_model,
     runners: list[PrefillLayerSubgraphRunner],
@@ -372,6 +561,21 @@ def _run_layers_graphed(
     with torch.no_grad():
         for runner in runners:
             hidden_states = runner.replay(hidden_states)
+        hidden_states = language_model.norm(hidden_states)
+    return hidden_states
+
+
+def _run_layers_graphed_generic(
+    language_model,
+    generic_runner: PrefillGenericSubgraphRunner,
+    start_hidden: torch.Tensor,
+    start_layer_idx: int,
+    end_layer_idx: int,
+):
+    hidden_states = start_hidden
+    with torch.no_grad():
+        for layer_idx in range(start_layer_idx, end_layer_idx + 1):
+            hidden_states = generic_runner.replay_layer(language_model.layers[layer_idx], hidden_states)
         hidden_states = language_model.norm(hidden_states)
     return hidden_states
 
@@ -468,6 +672,14 @@ def main():
         end_layer_idx=end_layer_idx,
         warmup_steps=args.graph_warmup,
     )
+    print("[PrefillTextSubgraphs] Building shared 2-graph runner with per-layer weight staging...")
+    generic_runner = _build_generic_runner(
+        language_model=language_model,
+        example_inputs=example_inputs,
+        position_embeddings=payload["position_embeddings"],
+        start_layer_idx=args.start_layer_idx,
+        warmup_steps=args.graph_warmup,
+    )
 
     device = payload["start_hidden"].device
     pre_replay = make_l2_flush_runner(device, args.l2_flush_mb)
@@ -501,10 +713,25 @@ def main():
         iters=args.iters,
         pre_replay=pre_replay,
     )
+    generic_graph_measured = _measure_variant(
+        lambda: _run_layers_graphed_generic(
+            language_model=language_model,
+            generic_runner=generic_runner,
+            start_hidden=payload["start_hidden"],
+            start_layer_idx=args.start_layer_idx,
+            end_layer_idx=end_layer_idx,
+        ),
+        warmup=args.warmup,
+        iters=args.iters,
+        pre_replay=pre_replay,
+    )
 
     graph_diff = _max_abs_diff(eager_measured["last_out"], graph_measured["last_out"])
+    generic_graph_diff = _max_abs_diff(eager_measured["last_out"], generic_graph_measured["last_out"])
     speedup = eager_measured["gpu_ms"]["median_ms"] / graph_measured["gpu_ms"]["median_ms"]
     delta_ms = eager_measured["gpu_ms"]["median_ms"] - graph_measured["gpu_ms"]["median_ms"]
+    generic_speedup = eager_measured["gpu_ms"]["median_ms"] / generic_graph_measured["gpu_ms"]["median_ms"]
+    generic_delta_ms = eager_measured["gpu_ms"]["median_ms"] - generic_graph_measured["gpu_ms"]["median_ms"]
 
     metadata = {
         "question_id": int(sample["question_id"]),
@@ -515,6 +742,10 @@ def main():
         "capture_mode": "fixed_seq_no_bucket",
         "attention_mode": "eager",
         "graph_segments": ["pre_attn_nonattn", "post_attn_nonattn"],
+        "graph_topologies": {
+            "per_layer": int((end_layer_idx - args.start_layer_idx + 1) * 2),
+            "generic_shared": 2,
+        },
         "graph_warmup": int(args.graph_warmup),
         "warmup": int(args.warmup),
         "iters": int(args.iters),
@@ -535,19 +766,26 @@ def main():
         "metadata": metadata,
         "correctness": {
             "full_model_ref_vs_current_eager_max_abs_diff": ref_diff,
-            "current_eager_vs_graph_max_abs_diff": graph_diff,
+            "current_eager_vs_per_layer_graph_max_abs_diff": graph_diff,
+            "current_eager_vs_generic_shared_graph_max_abs_diff": generic_graph_diff,
         },
         "timings": {
             "current_eager": {
                 "host_ms": eager_measured["host_ms"],
                 "gpu_ms": eager_measured["gpu_ms"],
             },
-            "graph_prepost_plus_eager_attention": {
+            "graph_prepost_plus_eager_attention_per_layer": {
                 "host_ms": graph_measured["host_ms"],
                 "gpu_ms": graph_measured["gpu_ms"],
             },
-            "delta_gpu_median_ms": float(delta_ms),
-            "speedup_vs_eager": float(speedup),
+            "graph_prepost_plus_eager_attention_generic_shared": {
+                "host_ms": generic_graph_measured["host_ms"],
+                "gpu_ms": generic_graph_measured["gpu_ms"],
+            },
+            "per_layer_delta_gpu_median_ms": float(delta_ms),
+            "per_layer_speedup_vs_eager": float(speedup),
+            "generic_shared_delta_gpu_median_ms": float(generic_delta_ms),
+            "generic_shared_speedup_vs_eager": float(generic_speedup),
         },
     }
 
@@ -561,13 +799,20 @@ def main():
         f"{eager_measured['gpu_ms']['mean_ms']:.3f} / {eager_measured['gpu_ms']['median_ms']:.3f} ms"
     )
     print(
-        "  graph gpu mean/median : "
+        "  per-layer graph gpu   : "
         f"{graph_measured['gpu_ms']['mean_ms']:.3f} / {graph_measured['gpu_ms']['median_ms']:.3f} ms"
     )
-    print(f"  delta gpu median      : {delta_ms:.3f} ms")
-    print(f"  speedup               : {speedup:.4f}x")
+    print(
+        "  shared-2graph gpu     : "
+        f"{generic_graph_measured['gpu_ms']['mean_ms']:.3f} / {generic_graph_measured['gpu_ms']['median_ms']:.3f} ms"
+    )
+    print(f"  per-layer delta       : {delta_ms:.3f} ms")
+    print(f"  per-layer speedup     : {speedup:.4f}x")
+    print(f"  shared-2graph delta   : {generic_delta_ms:.3f} ms")
+    print(f"  shared-2graph speedup : {generic_speedup:.4f}x")
     print(f"  ref diff              : {ref_diff:.6g}")
-    print(f"  graph diff            : {graph_diff:.6g}")
+    print(f"  per-layer diff        : {graph_diff:.6g}")
+    print(f"  shared-2graph diff    : {generic_graph_diff:.6g}")
     print(f"  output                : {out_path}")
 
 
