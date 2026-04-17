@@ -41,7 +41,6 @@ _ENABLE_PREFILL_ROPE_FASTPATH = os.environ.get("ENABLE_PREFILL_ROPE_FASTPATH", "
 _ENABLE_PREFILL_PATCH_EMBED_LINEAR = os.environ.get("ENABLE_PREFILL_PATCH_EMBED_LINEAR", "1") == "1"
 _ENABLE_PREFILL_MM_SLICE_FASTPATH = os.environ.get("ENABLE_PREFILL_MM_SLICE_FASTPATH", "1") == "1"
 _ENABLE_PREFILL_TEXT_FASTPATH = os.environ.get("ENABLE_PREFILL_TEXT_FASTPATH", "1") == "1"
-_ENABLE_PREFILL_INPUT_META_CACHE = os.environ.get("ENABLE_PREFILL_INPUT_META_CACHE", "1") == "1"
 _ENABLE_TRITON_PREFILL_FUSED_ADD_RMSNORM = os.environ.get("ENABLE_TRITON_PREFILL_FUSED_ADD_RMSNORM", "1") == "1"
 _ENABLE_TRITON_PREFILL_FUSED_SILU_MUL = os.environ.get("ENABLE_TRITON_PREFILL_FUSED_SILU_MUL", "1") == "1"
 _PREFILL_CACHE_MAX_ITEMS = max(1, int(os.environ.get("PREFILL_CACHE_MAX_ITEMS", "64")))
@@ -1276,7 +1275,6 @@ class VLMModel:
         if model_core is None:
             return
         visual = getattr(model_core, "visual", None)
-        visual_dtype = getattr(visual, "dtype", None)
         spatial_merge_size = int(model_core.config.vision_config.spatial_merge_size)
 
         def _cache_put(cache, key, value):
@@ -1287,14 +1285,8 @@ class VLMModel:
                 cache.pop(next(iter(cache)))
             return value
 
-        prefill_grid_key_by_ptr = {}
         prefill_grid_key_by_tensor = {}
-        prefill_segment_info_by_ptr = {}
         prefill_segment_info_by_input_ids = {}
-        def _tensor_ptr(tensor):
-            if torch.is_tensor(tensor):
-                return int(tensor.data_ptr())
-            return None
 
         def _tensor_obj_cache_get(cache, tensor):
             if not torch.is_tensor(tensor):
@@ -1369,26 +1361,6 @@ class VLMModel:
             })
             return segment
 
-        def _segment_ptr_key(
-            input_ids: torch.Tensor | None,
-            mm_token_type_ids: torch.Tensor | None,
-            image_grid_thw: torch.Tensor | None,
-            video_grid_thw: torch.Tensor | None = None,
-            attention_mask: torch.Tensor | None = None,
-        ):
-            if (
-                not torch.is_tensor(input_ids)
-                or not torch.is_tensor(mm_token_type_ids)
-                or not torch.is_tensor(image_grid_thw)
-                or video_grid_thw is not None
-            ):
-                return None
-            return (
-                int(input_ids.data_ptr()),
-                int(mm_token_type_ids.data_ptr()),
-                int(image_grid_thw.data_ptr()),
-            )
-
         def _grid_key_from_rows(rows):
             if rows is None:
                 return ()
@@ -1444,118 +1416,11 @@ class VLMModel:
                 "rope_delta_value": image_advance - image_token_count,
             }
 
-        def _extract_prefill_host_meta(batch):
-            if not hasattr(batch, "get"):
-                return None
-
-            image_grid_thw = batch.get("image_grid_thw")
-            grid_key = None
-            if torch.is_tensor(image_grid_thw):
-                grid_key = _grid_key_from_rows(image_grid_thw.tolist())
-
-            input_ids = batch.get("input_ids")
-            mm_token_type_ids = batch.get("mm_token_type_ids")
-            video_grid_thw = batch.get("video_grid_thw")
-            attention_mask = batch.get("attention_mask")
-            segment = None
-            can_use = (
-                torch.is_tensor(input_ids)
-                and torch.is_tensor(mm_token_type_ids)
-                and torch.is_tensor(image_grid_thw)
-                and video_grid_thw is None
-                and input_ids.ndim == 2
-                and input_ids.shape[0] == 1
-                and mm_token_type_ids.shape == input_ids.shape
-                and image_grid_thw.ndim == 2
-                and image_grid_thw.shape[0] == 1
-            )
-            if can_use:
-                active_tokens = None
-                if attention_mask is not None:
-                    if not torch.is_tensor(attention_mask) or attention_mask.ndim != 2 or attention_mask.shape != input_ids.shape:
-                        can_use = False
-                    else:
-                        active_tokens = int(attention_mask[0].sum().item())
-                if can_use:
-                    segment = _build_single_image_segment_info(
-                        input_len=int(input_ids.shape[1]),
-                        token_types=[int(v) for v in mm_token_type_ids[0].tolist()],
-                        grid_tuple=grid_key[0] if grid_key else None,
-                        active_tokens=active_tokens,
-                    )
-
-            return {
-                "grid_key": grid_key,
-                "segment": segment,
-            }
-
-        def _register_prefill_batch_meta(batch, meta):
-            if not meta or not hasattr(batch, "get"):
-                return
-            image_grid_thw = batch.get("image_grid_thw")
-            grid_key = meta.get("grid_key")
-            if grid_key and torch.is_tensor(image_grid_thw):
-                _tensor_obj_cache_put(prefill_grid_key_by_tensor, image_grid_thw, grid_key)
-                _cache_put(prefill_grid_key_by_ptr, int(image_grid_thw.data_ptr()), grid_key)
-
-            segment = meta.get("segment")
-            _segment_tensor_cache_put(
-                input_ids=batch.get("input_ids"),
-                mm_token_type_ids=batch.get("mm_token_type_ids"),
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=batch.get("video_grid_thw"),
-                attention_mask=batch.get("attention_mask"),
-                segment=segment,
-            )
-            segment_key = _segment_ptr_key(
-                input_ids=batch.get("input_ids"),
-                mm_token_type_ids=batch.get("mm_token_type_ids"),
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=batch.get("video_grid_thw"),
-                attention_mask=batch.get("attention_mask"),
-            )
-            if segment is not None and segment_key is not None:
-                _cache_put(prefill_segment_info_by_ptr, segment_key, segment)
-
-        orig_apply_chat_template = getattr(self._processor, "apply_chat_template", None)
-        if callable(orig_apply_chat_template):
-            def _apply_chat_template_with_prefill_meta(this_processor, *args, **kwargs):
-                batch = orig_apply_chat_template(*args, **kwargs)
-                if not hasattr(batch, "to"):
-                    return batch
-                if visual_dtype is not None and hasattr(batch, "data"):
-                    for name in ("pixel_values", "pixel_values_videos"):
-                        value = batch.data.get(name)
-                        if torch.is_tensor(value) and value.device.type == "cpu" and value.dtype != visual_dtype:
-                            batch.data[name] = value.to(dtype=visual_dtype)
-                if not _ENABLE_PREFILL_INPUT_META_CACHE:
-                    return batch
-                batch._prefill_host_meta = _extract_prefill_host_meta(batch) or {}
-                orig_to = batch.to
-
-                def _to_with_prefill_meta(this_batch, *to_args, **to_kwargs):
-                    result = orig_to(*to_args, **to_kwargs)
-                    _register_prefill_batch_meta(this_batch, getattr(this_batch, "_prefill_host_meta", None))
-                    return result
-
-                batch.to = MethodType(_to_with_prefill_meta, batch)
-                return batch
-
-            self._processor.apply_chat_template = MethodType(_apply_chat_template_with_prefill_meta, self._processor)
-            if _ENABLE_PREFILL_INPUT_META_CACHE:
-                self._optimizations_applied.append("prefill:input_meta_cache")
-
         def _grid_key(grid_thw):
             if torch.is_tensor(grid_thw):
                 cached = _tensor_obj_cache_get(prefill_grid_key_by_tensor, grid_thw)
                 if cached is not None:
                     return cached
-                if _ENABLE_PREFILL_INPUT_META_CACHE:
-                    tensor_key = _tensor_ptr(grid_thw)
-                    cached = prefill_grid_key_by_ptr.get(tensor_key)
-                    if cached is not None:
-                        _tensor_obj_cache_put(prefill_grid_key_by_tensor, grid_thw, cached)
-                        return cached
                 rows = grid_thw.detach().cpu().tolist()
                 key = _grid_key_from_rows(rows)
                 _tensor_obj_cache_put(prefill_grid_key_by_tensor, grid_thw, key)
@@ -1593,26 +1458,6 @@ class VLMModel:
             if cached is not None:
                 return cached
 
-            segment_key = _segment_ptr_key(
-                input_ids=input_ids,
-                mm_token_type_ids=mm_token_type_ids,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                attention_mask=attention_mask,
-            )
-            if _ENABLE_PREFILL_INPUT_META_CACHE and segment_key is not None:
-                cached = prefill_segment_info_by_ptr.get(segment_key)
-                if cached is not None:
-                    _segment_tensor_cache_put(
-                        input_ids=input_ids,
-                        mm_token_type_ids=mm_token_type_ids,
-                        image_grid_thw=image_grid_thw,
-                        video_grid_thw=video_grid_thw,
-                        attention_mask=attention_mask,
-                        segment=cached,
-                    )
-                    return cached
-
             active_tokens = None
             if attention_mask is not None:
                 if attention_mask.ndim != 2 or attention_mask.shape != input_ids.shape:
@@ -1634,8 +1479,6 @@ class VLMModel:
                 attention_mask=attention_mask,
                 segment=segment,
             )
-            if _ENABLE_PREFILL_INPUT_META_CACHE and segment is not None and segment_key is not None:
-                _cache_put(prefill_segment_info_by_ptr, segment_key, segment)
             return segment
 
         if _ENABLE_PREFILL_VISION_GRID_CACHE:
