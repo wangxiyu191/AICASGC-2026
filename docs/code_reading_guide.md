@@ -35,13 +35,15 @@ benchmark.py
 submission.zip
 ├── evaluation_wrapper.py          # [核心] VLMModel 类，所有优化入口
 ├── optimized_layer.py             # [核心] 融合的 decoder layer + Triton kernels
-├── cuda_decode_gemv.py            # CUDA GEMV 的 Python 加载器
+├── cuda_decode_gemv.py            # CUDA GEMV 的兼容 facade
+├── cuda_decode_gemv_ops/          # 按算子族拆分后的 GEMV Python 包
 ├── cuda_decode_attention.py       # CUDA decode attention 的 Python 加载器
 ├── requirements.txt               # 依赖声明
 ├── cuda_extensions/               # CUDA kernel 源码 + 预编译 .so
 │   ├── cuda_decode_gemv_ext*.so   # 预编译的 GEMV CUDA extension
 │   ├── cuda_decode_attention_ext*.so  # 预编译的 attention CUDA extension
-│   ├── decode_gemv_kernel.cu      # GEMV kernel 源码
+│   ├── decode_gemv_kernel.cu      # GEMV kernel 薄入口
+│   ├── decode_gemv_kernel_*.cuh   # GEMV kernel 分片（common/matvec/fused/xwarp/launchers）
 │   ├── decode_gemv_ext.cpp        # GEMV pybind11 绑定
 │   ├── decode_attention_kernel.cu # attention kernel 源码
 │   ├── decode_attention_ext.cpp   # attention pybind11 绑定
@@ -171,9 +173,10 @@ _small_decode_attention()
 
 ## 5. CUDA Extensions 阅读路线
 
-### 5.1 cuda_decode_gemv.py — GEMV 加载器
+### 5.1 cuda_decode_gemv.py / cuda_decode_gemv_ops/ — GEMV 加载器
 
-- 自动查找预编译 `.so`，如果过时则重新编译
+- `cuda_decode_gemv.py` 只保留兼容入口，真正实现拆到 `cuda_decode_gemv_ops/{runtime,matvec,fused,profile}.py`
+- `runtime.py` 负责自动查找预编译 `.so`，如果过时则重新编译
 - 核心函数: `nosplit_matvec_half()` — 评测时默认使用的 GEMV
   - 对 down_proj (2048x6144) 自动路由到 `k6144_n8k1024_xwarp_w_async` 变体
 - 融合函数: `fused_add_rmsnorm_gateup_half()`, `fused_silu_downproj_half()`, `fused_gateup_silu_downproj_half()` 等
@@ -184,7 +187,8 @@ _small_decode_attention()
 
 ### 5.3 CUDA kernel 源码
 
-- `decode_gemv_kernel.cu`: nosplit GEMV 实现，含多种变体（k2048/k6144，row2/row4，async，xwarp 等）
+- `decode_gemv_kernel.cu`: 仅保留编译入口，按顺序 `#include` 各个 GEMV 子模块
+- `decode_gemv_kernel_*.cuh`: nosplit GEMV 实现分片，覆盖 k2048/k6144、row2/row4、async、xwarp、launchers 等
 - `decode_attention_kernel.cu`: split-KV decode attention kernel
 
 ---

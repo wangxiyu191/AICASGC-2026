@@ -14,10 +14,11 @@ AICAS 2026 竞赛项目 — Qwen3-VL-2B-Instruct 推理优化。
 
 | 文件 | 说明 |
 |------|------|
-| [cuda_decode_gemv.py](./cuda_decode_gemv.py) | CUDA nosplit GEMV 的 Python 接口（decode 阶段 o_proj/down_proj 等） |
+| [cuda_decode_gemv.py](./cuda_decode_gemv.py) | CUDA decode GEMV 的兼容 facade，统一转发到拆分后的子模块包 |
+| [cuda_decode_gemv_ops/](./cuda_decode_gemv_ops/) | 按算子族拆分的 CUDA decode GEMV Python 包（runtime/matvec/fused/profile） |
 | [cuda_decode_attention.py](./cuda_decode_attention.py) | 实验级 CUDA decode attention 的 Python 接口 |
 | [cuda_extensions/](./cuda_extensions/) | CUDA kernel 源码目录 |
-| `cuda_extensions/decode_gemv_ext.cpp` / `decode_gemv_kernel.cu` | nosplit GEMV CUDA kernel（含 k2048/k6144 专用路径、row2/row4 变体、internal profiling） |
+| `cuda_extensions/decode_gemv_ext.cpp` / `decode_gemv_kernel.cu` | nosplit GEMV CUDA extension 入口；其中 `decode_gemv_kernel.cu` 现为薄入口，真实实现拆到 `decode_gemv_kernel_{common,matvec,fused,xwarp,launchers}.cuh` |
 | `cuda_extensions/decode_attention_ext.cpp` / `decode_attention_kernel.cu` | 实验级 CUDA decode attention kernel |
 | `cuda_extensions/setup.py` / `setup_decode_gemv.py` | Extension 构建脚本 |
 

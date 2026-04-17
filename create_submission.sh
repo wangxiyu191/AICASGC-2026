@@ -85,6 +85,11 @@ for py_file in cuda_decode_gemv.py cuda_decode_attention.py cuda_decode_small_op
     fi
 done
 
+if [ -d "$SCRIPT_DIR/cuda_decode_gemv_ops" ]; then
+    cp -r "$SCRIPT_DIR/cuda_decode_gemv_ops" "$TEMP_DIR/"
+    echo "Including cuda_decode_gemv_ops/"
+fi
+
 # Include selected CUDA extension sources / setup files / prebuilt shared libraries
 if [ -d "$SCRIPT_DIR/cuda_extensions" ]; then
     mkdir -p "$TEMP_DIR/cuda_extensions"
@@ -97,6 +102,11 @@ if [ -d "$SCRIPT_DIR/cuda_extensions" ]; then
         decode_attention_kernel.cu \
         decode_gemv_ext.cpp \
         decode_gemv_kernel.cu \
+        decode_gemv_kernel_common.cuh \
+        decode_gemv_kernel_matvec.cuh \
+        decode_gemv_kernel_fused.cuh \
+        decode_gemv_kernel_xwarp.cuh \
+        decode_gemv_kernel_launchers.cuh \
         decode_gemv_gridsync.cu \
         decode_small_ops_ext.cpp \
         decode_small_ops_kernel.cu \
@@ -144,6 +154,7 @@ required_files = [
     "optimized_layer.py",
     "cuda_decode_attention.py",
     "cuda_decode_gemv.py",
+    "cuda_decode_gemv_ops/__init__.py",
     "cuda_decode_small_ops.py",
     "cuda_extensions/setup.py",
     "cuda_extensions/setup_decode_gemv.py",
@@ -160,6 +171,7 @@ required_modules = [
     "optimized_layer",
     "cuda_decode_attention",
     "cuda_decode_gemv",
+    "cuda_decode_gemv_ops",
     "cuda_decode_small_ops",
 ]
 with tempfile.TemporaryDirectory() as td:
