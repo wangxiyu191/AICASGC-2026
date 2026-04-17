@@ -1260,6 +1260,55 @@ std::vector<torch::Tensor> fused_add_rmsnorm_gateup_half_cuda(
     return {residual_out, gate_up_out};
 }
 
+torch::Tensor fused_rmsnorm_qkv_half_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& norm_weight,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& out,
+    double eps,
+    bool has_bias) {
+    TORCH_CHECK(x.is_cuda(), "x must be CUDA");
+    TORCH_CHECK(norm_weight.is_cuda(), "norm_weight must be CUDA");
+    TORCH_CHECK(weight.is_cuda(), "weight must be CUDA");
+    TORCH_CHECK(out.is_cuda(), "out must be CUDA");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat16, "fused_rmsnorm_qkv only supports fp16");
+    TORCH_CHECK(norm_weight.scalar_type() == torch::kFloat16, "norm_weight must be fp16");
+    TORCH_CHECK(weight.scalar_type() == torch::kFloat16, "weight must be fp16");
+    TORCH_CHECK(out.scalar_type() == torch::kFloat16, "out must be fp16");
+    TORCH_CHECK(weight.stride(1) == 1, "weight must be row-contiguous");
+    TORCH_CHECK(x.dim() == 1, "x must be flattened [K]");
+    TORCH_CHECK(norm_weight.dim() == 1, "norm_weight must be flattened [K]");
+    TORCH_CHECK(weight.dim() == 2, "weight must be [N, K]");
+    TORCH_CHECK(x.numel() == kNosplitSpecializedK2048, "x expects K=2048");
+    TORCH_CHECK(norm_weight.numel() == kNosplitSpecializedK2048, "norm_weight expects K=2048");
+    TORCH_CHECK(weight.size(1) == kNosplitSpecializedK2048, "weight K dim must be 2048");
+    TORCH_CHECK(out.numel() == weight.size(0), "out size mismatch");
+    if (has_bias) {
+        TORCH_CHECK(bias.is_cuda() && bias.scalar_type() == torch::kFloat16, "bias must be CUDA fp16");
+        TORCH_CHECK(bias.numel() == weight.size(0), "bias size mismatch");
+    }
+
+    const int n = static_cast<int>(weight.size(0));
+    const int grid_blocks = (n + 3) / 4;
+    c10::cuda::CUDAGuard device_guard(x.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    fused_rmsnorm_qkv_k2048_hfma2_fwd_kernel<<<grid_blocks, kRow4Threads, 0, stream>>>(
+        x.data_ptr<at::Half>(),
+        norm_weight.data_ptr<at::Half>(),
+        weight.data_ptr<at::Half>(),
+        has_bias ? bias.data_ptr<at::Half>() : nullptr,
+        out.data_ptr<at::Half>(),
+        static_cast<float>(eps),
+        weight.stride(0),
+        n,
+        has_bias
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
 torch::Tensor fused_silu_downproj_half_cuda(
     const torch::Tensor& gate_up,
     const torch::Tensor& weight,
@@ -1901,6 +1950,95 @@ torch::Tensor l2_sequential_pointer_chase_trace_cuda(
             flush_sink.data_ptr<int32_t>());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return latency;
+}
+
+torch::Tensor fused_post_attn_mlp_softsync_half_cuda(
+    const torch::Tensor& residual,
+    const torch::Tensor& attn_output,
+    const torch::Tensor& norm_weight,
+    const torch::Tensor& gate_up_weight,
+    const torch::Tensor& down_proj_weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& barrier_count,
+    const torch::Tensor& barrier_generation,
+    const torch::Tensor& hidden_out,
+    const torch::Tensor& out,
+    double eps,
+    bool has_bias,
+    int64_t threads_per_block) {
+    TORCH_CHECK(
+        residual.is_cuda() && attn_output.is_cuda() && norm_weight.is_cuda()
+            && gate_up_weight.is_cuda() && down_proj_weight.is_cuda(),
+        "inputs must be CUDA");
+    TORCH_CHECK(hidden_out.is_cuda() && out.is_cuda(), "outputs must be CUDA");
+    TORCH_CHECK(barrier_count.is_cuda() && barrier_generation.is_cuda(),
+        "barrier tensors must be CUDA");
+    TORCH_CHECK(residual.scalar_type() == torch::kFloat16, "softsync only supports fp16");
+    TORCH_CHECK(attn_output.scalar_type() == torch::kFloat16, "softsync only supports fp16");
+    TORCH_CHECK(norm_weight.scalar_type() == torch::kFloat16, "softsync fp16");
+    TORCH_CHECK(gate_up_weight.scalar_type() == torch::kFloat16, "softsync fp16");
+    TORCH_CHECK(down_proj_weight.scalar_type() == torch::kFloat16, "softsync fp16");
+    TORCH_CHECK(barrier_count.scalar_type() == torch::kInt32, "barrier_count int32");
+    TORCH_CHECK(barrier_generation.scalar_type() == torch::kInt32, "barrier_generation int32");
+    TORCH_CHECK(residual.dim() == 1 && residual.numel() == kNosplitSpecializedK2048, "residual [2048]");
+    TORCH_CHECK(attn_output.dim() == 1 && attn_output.numel() == kNosplitSpecializedK2048, "attn_output [2048]");
+    TORCH_CHECK(norm_weight.dim() == 1 && norm_weight.numel() == kNosplitSpecializedK2048, "norm_weight [2048]");
+    TORCH_CHECK(gate_up_weight.dim() == 2 && gate_up_weight.size(0) == 12288 &&
+        gate_up_weight.size(1) == kNosplitSpecializedK2048 && gate_up_weight.stride(1) == 1,
+        "gate_up [12288,2048] contiguous");
+    TORCH_CHECK(down_proj_weight.dim() == 2 && down_proj_weight.size(0) == 2048 &&
+        down_proj_weight.size(1) == 6144 && down_proj_weight.stride(1) == 1,
+        "down_proj [2048,6144] contiguous");
+    TORCH_CHECK(barrier_count.dim() == 1 && barrier_count.numel() == 1, "barrier_count [1]");
+    TORCH_CHECK(barrier_generation.dim() == 1 && barrier_generation.numel() == 1,
+        "barrier_generation [1]");
+    TORCH_CHECK(hidden_out.dim() == 1 && hidden_out.numel() == 6144, "hidden [6144]");
+    TORCH_CHECK(out.dim() == 1 && out.numel() == 2048, "out [2048]");
+    TORCH_CHECK(!has_bias || (bias.is_cuda() && bias.scalar_type() == torch::kFloat16 &&
+        bias.dim() == 1 && bias.numel() == 2048 && bias.stride(0) == 1),
+        "bias [2048] contiguous when provided");
+    TORCH_CHECK(threads_per_block == 512 || threads_per_block == 1024,
+        "threads_per_block must be 512 or 1024, got ", threads_per_block);
+
+    int device_idx = static_cast<int>(residual.device().index());
+    int num_sms = 0;
+    C10_CUDA_CHECK(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device_idx));
+
+    c10::cuda::CUDAGuard device_guard(residual.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    auto launch_args = [&](auto kernel_fn, int tpb) {
+        int max_blocks_per_sm = 0;
+        C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &max_blocks_per_sm, kernel_fn, tpb, 0));
+        TORCH_CHECK(
+            max_blocks_per_sm * num_sms >= num_sms,
+            "fused_post_attn_mlp_softsync launch would deadlock: resident blocks ",
+            max_blocks_per_sm * num_sms, " < required grid blocks ", num_sms);
+        kernel_fn<<<num_sms, tpb, 0, stream>>>(
+            residual.data_ptr<at::Half>(),
+            attn_output.data_ptr<at::Half>(),
+            norm_weight.data_ptr<at::Half>(),
+            gate_up_weight.data_ptr<at::Half>(),
+            down_proj_weight.data_ptr<at::Half>(),
+            has_bias ? bias.data_ptr<at::Half>() : nullptr,
+            reinterpret_cast<unsigned int*>(barrier_count.data_ptr<int32_t>()),
+            reinterpret_cast<unsigned int*>(barrier_generation.data_ptr<int32_t>()),
+            hidden_out.data_ptr<at::Half>(),
+            out.data_ptr<at::Half>(),
+            static_cast<float>(eps),
+            has_bias,
+            gate_up_weight.stride(0),
+            down_proj_weight.stride(0));
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    };
+
+    if (threads_per_block == 512) {
+        launch_args(fused_post_attn_mlp_softsync_k2048_k6144_fwd_kernel<512, 16>, 512);
+    } else {
+        launch_args(fused_post_attn_mlp_softsync_k2048_k6144_fwd_kernel<1024, 32>, 1024);
+    }
+    return out;
 }
 
 torch::Tensor nosplit_weight_only_half_variant_cuda(

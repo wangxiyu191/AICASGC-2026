@@ -68,6 +68,43 @@ def fused_add_rmsnorm_gateup_half(
     return residual_out.view_as(residual), gate_up_out.view(*residual.shape[:-1], n)
 
 
+def fused_rmsnorm_qkv_half(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    eps: float,
+) -> torch.Tensor:
+    if (
+        x.device.type != "cuda"
+        or norm_weight.device.type != "cuda"
+        or weight.device.type != "cuda"
+        or x.dtype != torch.float16
+        or norm_weight.dtype != torch.float16
+        or weight.dtype != torch.float16
+        or x.ndim < 2
+        or x.shape[-2] != 1
+    ):
+        raise RuntimeError("fused_rmsnorm_qkv_half expects fp16 CUDA single-token decode tensors")
+
+    x_vec = x.reshape(-1).contiguous()
+    norm_vec = norm_weight.reshape(-1).contiguous()
+    n, _k = weight.shape
+    out_vec = torch.empty((n,), dtype=x.dtype, device=x.device)
+
+    ext = _load_ext()
+    ext.fused_rmsnorm_qkv_half(
+        x_vec,
+        norm_vec,
+        weight,
+        bias if bias is not None else torch.empty(0, device=x.device, dtype=x.dtype),
+        out_vec,
+        eps,
+        bias is not None,
+    )
+    return out_vec.view(*x.shape[:-1], n)
+
+
 def fused_silu_downproj_half(
     gate_up: torch.Tensor,
     weight: torch.Tensor,
@@ -217,6 +254,83 @@ def fused_post_attn_mlp_persistent_half(
         out_vec,
         eps,
         bias is not None,
+    )
+    return hidden_out.view(*residual.shape[:-1], 6144), out_vec.view(*residual.shape[:-1], n)
+
+
+def fused_post_attn_mlp_softsync_half(
+    residual: torch.Tensor,
+    attn_output: torch.Tensor,
+    norm_weight: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_proj_weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    eps: float,
+    workspace: dict | None = None,
+    threads_per_block: int = 1024,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if (
+        residual.device.type != "cuda"
+        or attn_output.device.type != "cuda"
+        or norm_weight.device.type != "cuda"
+        or gate_up_weight.device.type != "cuda"
+        or down_proj_weight.device.type != "cuda"
+        or residual.dtype != torch.float16
+        or attn_output.dtype != torch.float16
+        or norm_weight.dtype != torch.float16
+        or gate_up_weight.dtype != torch.float16
+        or down_proj_weight.dtype != torch.float16
+        or residual.ndim < 2
+        or residual.shape[-2] != 1
+        or residual.shape != attn_output.shape
+    ):
+        raise RuntimeError("fused_post_attn_mlp_softsync_half expects fp16 CUDA single-token decode tensors")
+
+    residual_vec = residual.reshape(-1).contiguous()
+    attn_vec = attn_output.reshape(-1).contiguous()
+    norm_vec = norm_weight.reshape(-1).contiguous()
+    n, _k = down_proj_weight.shape
+    if (
+        workspace is not None
+        and workspace.get("type") == "fused_post_attn_mlp_softsync"
+        and tuple(workspace["barrier_count"].shape) == (1,)
+        and tuple(workspace["barrier_generation"].shape) == (1,)
+        and tuple(workspace["hidden_out"].shape) == (6144,)
+        and tuple(workspace["out"].shape) == (n,)
+        and workspace["barrier_count"].device == residual.device
+        and workspace["barrier_generation"].device == residual.device
+        and workspace["hidden_out"].device == residual.device
+        and workspace["out"].device == residual.device
+        and workspace["barrier_count"].dtype == torch.int32
+        and workspace["barrier_generation"].dtype == torch.int32
+        and workspace["hidden_out"].dtype == residual.dtype
+        and workspace["out"].dtype == residual.dtype
+    ):
+        barrier_count = workspace["barrier_count"]
+        barrier_generation = workspace["barrier_generation"]
+        hidden_out = workspace["hidden_out"]
+        out_vec = workspace["out"]
+    else:
+        barrier_count = torch.zeros((1,), dtype=torch.int32, device=residual.device)
+        barrier_generation = torch.zeros((1,), dtype=torch.int32, device=residual.device)
+        hidden_out = torch.empty((6144,), dtype=residual.dtype, device=residual.device)
+        out_vec = torch.empty((n,), dtype=residual.dtype, device=residual.device)
+
+    ext = _load_ext()
+    ext.fused_post_attn_mlp_softsync_half(
+        residual_vec,
+        attn_vec,
+        norm_vec,
+        gate_up_weight,
+        down_proj_weight,
+        bias if bias is not None else torch.empty(0, device=residual.device, dtype=residual.dtype),
+        barrier_count,
+        barrier_generation,
+        hidden_out,
+        out_vec,
+        eps,
+        bias is not None,
+        threads_per_block,
     )
     return hidden_out.view(*residual.shape[:-1], 6144), out_vec.view(*residual.shape[:-1], n)
 
@@ -816,9 +930,11 @@ def decode_attn_persistent_half(
 
 __all__ = [
     "fused_add_rmsnorm_gateup_half",
+    "fused_rmsnorm_qkv_half",
     "fused_silu_downproj_half",
     "fused_gateup_silu_downproj_half",
     "fused_post_attn_mlp_persistent_half",
+    "fused_post_attn_mlp_softsync_half",
     "fused_o_proj_post_attn_mlp_persistent_half",
     "fused_o_proj_post_attn_mlp_softsync_half",
     "fused_decode_full_layer_softsync_half",

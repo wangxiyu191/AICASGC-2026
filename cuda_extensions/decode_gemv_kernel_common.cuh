@@ -63,6 +63,37 @@ __device__ inline void software_grid_sync(
     __syncthreads();
 }
 
+constexpr int kPersistentThreads = 1024;
+constexpr int kPersistentWarps   = 32;  // 1024 / 32
+
+struct AtomicGridSync {
+    unsigned int* counter;
+    unsigned int* generation;
+    unsigned int nblocks;
+    unsigned int* local_gen;
+
+    __device__ __forceinline__ void sync() const {
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            const unsigned int my_gen = *local_gen;
+            asm volatile("fence.acq_rel.gpu;" ::: "memory");
+            const unsigned int arrived = atomicAdd(counter, 1u);
+            if (arrived == nblocks - 1) {
+                *counter = 0;
+                asm volatile("fence.acq_rel.gpu;" ::: "memory");
+                atomicAdd(generation, 1u);
+            } else {
+                volatile unsigned int* vgen =
+                    reinterpret_cast<volatile unsigned int*>(generation);
+                while (*vgen <= my_gen) {
+                }
+            }
+            *local_gen = my_gen + 1;
+        }
+        __syncthreads();
+    }
+};
+
 enum NosplitProfileSlot : int {
     kProfileKernelStart = 0,
     kProfileTile0LoadDone = 1,

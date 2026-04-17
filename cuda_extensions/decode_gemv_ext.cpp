@@ -218,6 +218,15 @@ std::vector<torch::Tensor> fused_add_rmsnorm_gateup_half_cuda(
     double eps,
     bool has_bias);
 
+torch::Tensor fused_rmsnorm_qkv_half_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& norm_weight,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& out,
+    double eps,
+    bool has_bias);
+
 torch::Tensor fused_silu_downproj_half_cuda(
     const torch::Tensor& gate_up,
     const torch::Tensor& weight,
@@ -299,6 +308,21 @@ torch::Tensor fused_post_attn_mlp_persistent_half_cuda(
     const torch::Tensor& out,
     double eps,
     bool has_bias);
+
+torch::Tensor fused_post_attn_mlp_softsync_half_cuda(
+    const torch::Tensor& residual,
+    const torch::Tensor& attn_output,
+    const torch::Tensor& norm_weight,
+    const torch::Tensor& gate_up_weight,
+    const torch::Tensor& down_proj_weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& barrier_count,
+    const torch::Tensor& barrier_generation,
+    const torch::Tensor& hidden_out,
+    const torch::Tensor& out,
+    double eps,
+    bool has_bias,
+    int64_t threads_per_block);
 
 torch::Tensor fused_o_proj_post_attn_mlp_persistent_half_cuda(
     const torch::Tensor& residual,
@@ -779,6 +803,17 @@ std::vector<torch::Tensor> fused_add_rmsnorm_gateup_half(
         has_bias);
 }
 
+torch::Tensor fused_rmsnorm_qkv_half(
+    const torch::Tensor& x,
+    const torch::Tensor& norm_weight,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& out,
+    double eps,
+    bool has_bias) {
+    return fused_rmsnorm_qkv_half_cuda(x, norm_weight, weight, bias, out, eps, has_bias);
+}
+
 torch::Tensor fused_silu_downproj_half(
     const torch::Tensor& gate_up,
     const torch::Tensor& weight,
@@ -945,6 +980,36 @@ torch::Tensor fused_post_attn_mlp_persistent_half(
         out,
         eps,
         has_bias);
+}
+
+torch::Tensor fused_post_attn_mlp_softsync_half(
+    const torch::Tensor& residual,
+    const torch::Tensor& attn_output,
+    const torch::Tensor& norm_weight,
+    const torch::Tensor& gate_up_weight,
+    const torch::Tensor& down_proj_weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& barrier_count,
+    const torch::Tensor& barrier_generation,
+    const torch::Tensor& hidden_out,
+    const torch::Tensor& out,
+    double eps,
+    bool has_bias,
+    int64_t threads_per_block) {
+    return fused_post_attn_mlp_softsync_half_cuda(
+        residual,
+        attn_output,
+        norm_weight,
+        gate_up_weight,
+        down_proj_weight,
+        bias,
+        barrier_count,
+        barrier_generation,
+        hidden_out,
+        out,
+        eps,
+        has_bias,
+        threads_per_block);
 }
 
 torch::Tensor fused_o_proj_post_attn_mlp_persistent_half(
@@ -1249,6 +1314,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("l2_sequential_pointer_chase_trace", &l2_sequential_pointer_chase_trace);
     m.def("nosplit_weight_only_half_variant", &nosplit_weight_only_half_variant);
     m.def("fused_add_rmsnorm_gateup_half", &fused_add_rmsnorm_gateup_half);
+    m.def("fused_rmsnorm_qkv_half", &fused_rmsnorm_qkv_half);
     m.def("fused_silu_downproj_half", &fused_silu_downproj_half);
     m.def("fused_gateup_silu_downproj_half", &fused_gateup_silu_downproj_half);
     m.def("fused_gateup_silu_downproj_mega_half", &fused_gateup_silu_downproj_mega_half);
@@ -1258,6 +1324,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_gateup_silu_downproj_gridsync_half", &fused_gateup_silu_downproj_gridsync_half);
     m.def("fused_gateup_silu_downproj_gridsync_profile_half", &fused_gateup_silu_downproj_gridsync_profile_half);
     m.def("fused_post_attn_mlp_persistent_half", &fused_post_attn_mlp_persistent_half);
+    m.def("fused_post_attn_mlp_softsync_half", &fused_post_attn_mlp_softsync_half);
     m.def("fused_o_proj_post_attn_mlp_persistent_half", &fused_o_proj_post_attn_mlp_persistent_half);
     m.def("fused_o_proj_post_attn_mlp_softsync_half", &fused_o_proj_post_attn_mlp_softsync_half);
     m.def("fused_o_proj_post_attn_mlp_persistent_profile_half", &fused_o_proj_post_attn_mlp_persistent_profile_half);
