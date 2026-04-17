@@ -25,8 +25,8 @@ from transformers import AutoModelForImageTextToText, AutoProcessor
 from transformers.cache_utils import StaticCache
 
 os.environ.setdefault("ENABLE_CUDA_NOSPLIT_GEMV", "1")
-os.environ.setdefault("ENABLE_CUDA_FUSED_FULL_LAYER_SOFTSYNC", "1")
-os.environ.setdefault("CUDA_FUSED_FULL_LAYER_SOFTSYNC_BLOCKS", "56")
+os.environ.setdefault("ENABLE_CUDA_FUSED_FULL_LAYER_SOFTSYNC", "0")
+os.environ.setdefault("CUDA_FUSED_FULL_LAYER_SOFTSYNC_BLOCKS", "64")
 os.environ.setdefault("ENABLE_CUDA_FUSED_POST_ATTN_MLP_PERSISTENT", "1")
 os.environ.setdefault("ENABLE_CUDA_FUSED_GATEUP_SILU_DOWNPROJ", "1")
 os.environ.setdefault("CUDA_FUSED_GATEUP_SILU_DOWNPROJ_VARIANT", "persistent")
