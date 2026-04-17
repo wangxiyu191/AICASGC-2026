@@ -79,6 +79,8 @@ def _precompile_gridsync():
         cmd = [
             _NVCC, "-c", "-rdc=true",
             "-O3", "--use_fast_math", "-lineinfo",
+            "--extra-device-vectorization",
+            "-Xptxas", "--allow-expensive-optimizations=true",
             _GENCODE,
             "--expt-relaxed-constexpr",
             "--compiler-options", "-fPIC",
@@ -143,7 +145,11 @@ setup(
             ],
             extra_compile_args={
                 "cxx": ["-O3"],
-                "nvcc": ["-O3", "--use_fast_math", "-lineinfo"],
+                "nvcc": [
+                    "-O3", "--use_fast_math", "-lineinfo",
+                    "--extra-device-vectorization",
+                    "-Xptxas", "--allow-expensive-optimizations=true",
+                ],
             },
             extra_objects=[_GRIDSYNC_OBJ, _GRIDSYNC_DLINK],
             libraries=["cudadevrt"],
