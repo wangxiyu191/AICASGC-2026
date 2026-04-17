@@ -1,0 +1,10 @@
+rank,prefetch_blocks,budget_ns,budget_us,avg_ttft_ms,avg_throughput_tokens_per_sec,exact_match_vs_baseline,num_samples,output_json
+1,4,16000,16.0,35.32,258.73,10,10,benchmark_full_layer_softsync_blocks96_10samples_20260417_oprojprefetch_b4_gt16000ns.json
+2,4,12000,12.0,35.83,258.52,10,10,benchmark_full_layer_softsync_blocks96_10samples_20260417_oprojprefetch_b4_gt12000ns.json
+3,2,12000,12.0,34.99,258.46,10,10,benchmark_full_layer_softsync_blocks96_10samples_20260417_oprojprefetch_b2_gt12000ns.json
+4,2,8000,8.0,36.63,258.35,10,10,benchmark_full_layer_softsync_blocks96_10samples_20260417_oprojprefetch_b2_gt8000ns.json
+5,4,8000,8.0,35.1,258.25,10,10,benchmark_full_layer_softsync_blocks96_10samples_20260417_oprojprefetch_b4_gt8000ns.json
+6,8,16000,16.0,35.88,257.53,10,10,benchmark_full_layer_softsync_blocks96_10samples_20260417_oprojprefetch_b8_gt16000ns.json
+7,8,12000,12.0,35.33,257.3,10,10,benchmark_full_layer_softsync_blocks96_10samples_20260417_oprojprefetch_b8_gt12000ns.json
+8,8,8000,8.0,36.5,257.05,10,10,benchmark_full_layer_softsync_blocks96_10samples_20260417_oprojprefetch_b8_gt8000ns.json
+9,2,16000,16.0,35.24,256.09,10,10,benchmark_full_layer_softsync_blocks96_10samples_20260417_oprojprefetch_b2_gt16000ns.json

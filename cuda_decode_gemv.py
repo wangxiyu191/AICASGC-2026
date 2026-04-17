@@ -1543,28 +1543,38 @@ def fused_decode_full_layer_softsync_half(
         and workspace.get("type") == "fused_decode_full_layer_softsync"
         and tuple(workspace["barrier_count"].shape) == (1,)
         and tuple(workspace["barrier_generation"].shape) == (1,)
+        and tuple(workspace["kv_ready_count"].shape) == (1,)
+        and tuple(workspace["attn_done_count"].shape) == (1,)
         and tuple(workspace["qkv_out"].shape) == (4096,)
         and tuple(workspace["hidden_out"].shape) == (6144,)
         and tuple(workspace["out"].shape) == (n,)
         and workspace["barrier_count"].device == hidden_states.device
         and workspace["barrier_generation"].device == hidden_states.device
+        and workspace["kv_ready_count"].device == hidden_states.device
+        and workspace["attn_done_count"].device == hidden_states.device
         and workspace["qkv_out"].device == hidden_states.device
         and workspace["hidden_out"].device == hidden_states.device
         and workspace["out"].device == hidden_states.device
         and workspace["barrier_count"].dtype == torch.int32
         and workspace["barrier_generation"].dtype == torch.int32
+        and workspace["kv_ready_count"].dtype == torch.int32
+        and workspace["attn_done_count"].dtype == torch.int32
         and workspace["qkv_out"].dtype == hidden_states.dtype
         and workspace["hidden_out"].dtype == hidden_states.dtype
         and workspace["out"].dtype == hidden_states.dtype
     ):
         barrier_count = workspace["barrier_count"]
         barrier_generation = workspace["barrier_generation"]
+        kv_ready_count = workspace["kv_ready_count"]
+        attn_done_count = workspace["attn_done_count"]
         qkv_out = workspace["qkv_out"]
         hidden_out = workspace["hidden_out"]
         out_vec = workspace["out"]
     else:
         barrier_count = torch.zeros((1,), dtype=torch.int32, device=hidden_states.device)
         barrier_generation = torch.zeros((1,), dtype=torch.int32, device=hidden_states.device)
+        kv_ready_count = torch.zeros((1,), dtype=torch.int32, device=hidden_states.device)
+        attn_done_count = torch.zeros((1,), dtype=torch.int32, device=hidden_states.device)
         qkv_out = torch.empty((4096,), dtype=hidden_states.dtype, device=hidden_states.device)
         hidden_out = torch.empty((6144,), dtype=hidden_states.dtype, device=hidden_states.device)
         out_vec = torch.empty((n,), dtype=hidden_states.dtype, device=hidden_states.device)
@@ -1592,6 +1602,8 @@ def fused_decode_full_layer_softsync_half(
         down_proj_bias if down_proj_bias is not None else torch.empty(0, device=hidden_states.device, dtype=hidden_states.dtype),
         barrier_count,
         barrier_generation,
+        kv_ready_count,
+        attn_done_count,
         qkv_out,
         hidden_out,
         out_vec,
@@ -1628,6 +1640,7 @@ FULL_LAYER_PROFILE_SLOT_NAMES = (
     "gt_start",
     "gt_end",
     "sm_id",
+    "attn_prefetch_lines",
 )
 
 
@@ -1653,11 +1666,162 @@ def fused_decode_full_layer_softsync_profile_half(
     workspace: dict | None = None,
     launch_blocks: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
-    raise RuntimeError(
-        "fused_decode_full_layer_softsync_profile_half has been intentionally "
-        "removed from the active build to eliminate profiler-side interference. "
-        "Reference backup: "
-        "cuda_extensions/decode_gemv_gridsync_full_layer_profile_backup_20260417.cu.bak"
+    if (
+        hidden_states.device.type != "cuda"
+        or qkv_weight.device.type != "cuda"
+        or input_layernorm_weight.device.type != "cuda"
+        or q_norm_weight.device.type != "cuda"
+        or k_norm_weight.device.type != "cuda"
+        or cos.device.type != "cuda"
+        or sin.device.type != "cuda"
+        or k_cache.device.type != "cuda"
+        or v_cache.device.type != "cuda"
+        or cache_position.device.type != "cuda"
+        or o_proj_weight.device.type != "cuda"
+        or post_attn_norm_weight.device.type != "cuda"
+        or gate_up_weight.device.type != "cuda"
+        or down_proj_weight.device.type != "cuda"
+        or hidden_states.dtype != torch.float16
+        or qkv_weight.dtype != torch.float16
+        or input_layernorm_weight.dtype != torch.float16
+        or q_norm_weight.dtype != torch.float16
+        or k_norm_weight.dtype != torch.float16
+        or cos.dtype != torch.float16
+        or sin.dtype != torch.float16
+        or k_cache.dtype != torch.float16
+        or v_cache.dtype != torch.float16
+        or o_proj_weight.dtype != torch.float16
+        or post_attn_norm_weight.dtype != torch.float16
+        or gate_up_weight.dtype != torch.float16
+        or down_proj_weight.dtype != torch.float16
+        or hidden_states.ndim < 2
+        or hidden_states.shape[-2] != 1
+    ):
+        raise RuntimeError(
+            "fused_decode_full_layer_softsync_profile_half expects fp16 CUDA single-token decode tensors"
+        )
+
+    hidden_vec = hidden_states.reshape(-1).contiguous()
+    cos_vec = cos.reshape(-1).contiguous()
+    sin_vec = sin.reshape(-1).contiguous()
+    n = hidden_states.shape[-1]
+
+    if launch_blocks is None:
+        launch_blocks = int(os.environ.get("CUDA_FUSED_FULL_LAYER_SOFTSYNC_BLOCKS", "0"))
+
+    props = torch.cuda.get_device_properties(hidden_states.device)
+    num_sms = props.multi_processor_count
+    requested_blocks = int(launch_blocks)
+    grid_blocks = max(1, min(num_sms, requested_blocks if requested_blocks > 0 else num_sms))
+    num_slots = len(FULL_LAYER_PROFILE_SLOT_NAMES)
+
+    if (
+        workspace is not None
+        and workspace.get("type") == "fused_decode_full_layer_softsync_profile"
+        and tuple(workspace["barrier_count"].shape) == (1,)
+        and tuple(workspace["barrier_generation"].shape) == (1,)
+        and tuple(workspace["kv_ready_count"].shape) == (1,)
+        and tuple(workspace["attn_done_count"].shape) == (1,)
+        and tuple(workspace["qkv_out"].shape) == (4096,)
+        and tuple(workspace["hidden_out"].shape) == (6144,)
+        and tuple(workspace["out"].shape) == (n,)
+        and workspace["barrier_count"].device == hidden_states.device
+        and workspace["barrier_generation"].device == hidden_states.device
+        and workspace["kv_ready_count"].device == hidden_states.device
+        and workspace["attn_done_count"].device == hidden_states.device
+        and workspace["qkv_out"].device == hidden_states.device
+        and workspace["hidden_out"].device == hidden_states.device
+        and workspace["out"].device == hidden_states.device
+        and workspace["barrier_count"].dtype == torch.int32
+        and workspace["barrier_generation"].dtype == torch.int32
+        and workspace["kv_ready_count"].dtype == torch.int32
+        and workspace["attn_done_count"].dtype == torch.int32
+        and workspace["qkv_out"].dtype == hidden_states.dtype
+        and workspace["hidden_out"].dtype == hidden_states.dtype
+        and workspace["out"].dtype == hidden_states.dtype
+        and workspace.get("profile") is not None
+        and workspace["profile"].shape == (grid_blocks, num_slots)
+        and workspace["profile"].device == hidden_states.device
+        and workspace["profile"].dtype == torch.int64
+    ):
+        barrier_count = workspace["barrier_count"]
+        barrier_generation = workspace["barrier_generation"]
+        kv_ready_count = workspace["kv_ready_count"]
+        attn_done_count = workspace["attn_done_count"]
+        qkv_out = workspace["qkv_out"]
+        hidden_out = workspace["hidden_out"]
+        out_vec = workspace["out"]
+        profile = workspace["profile"]
+    else:
+        barrier_count = torch.zeros((1,), dtype=torch.int32, device=hidden_states.device)
+        barrier_generation = torch.zeros((1,), dtype=torch.int32, device=hidden_states.device)
+        kv_ready_count = torch.zeros((1,), dtype=torch.int32, device=hidden_states.device)
+        attn_done_count = torch.zeros((1,), dtype=torch.int32, device=hidden_states.device)
+        qkv_out = torch.empty((4096,), dtype=hidden_states.dtype, device=hidden_states.device)
+        hidden_out = torch.empty((6144,), dtype=hidden_states.dtype, device=hidden_states.device)
+        out_vec = torch.empty((n,), dtype=hidden_states.dtype, device=hidden_states.device)
+        profile = torch.empty((grid_blocks, num_slots), dtype=torch.int64, device=hidden_states.device)
+
+    ext = _load_ext()
+    ext.fused_decode_full_layer_softsync_profile_half(
+        hidden_vec,
+        qkv_weight,
+        input_layernorm_weight.reshape(-1).contiguous(),
+        q_norm_weight.reshape(-1).contiguous(),
+        k_norm_weight.reshape(-1).contiguous(),
+        cos_vec,
+        sin_vec,
+        k_cache,
+        v_cache,
+        cache_position,
+        o_proj_weight,
+        o_proj_bias if o_proj_bias is not None else torch.empty(0, device=hidden_states.device, dtype=hidden_states.dtype),
+        post_attn_norm_weight.reshape(-1).contiguous(),
+        gate_up_weight,
+        down_proj_weight,
+        down_proj_bias if down_proj_bias is not None else torch.empty(0, device=hidden_states.device, dtype=hidden_states.dtype),
+        barrier_count,
+        barrier_generation,
+        kv_ready_count,
+        attn_done_count,
+        qkv_out,
+        hidden_out,
+        out_vec,
+        profile,
+        eps,
+        attn_scale,
+        o_proj_bias is not None,
+        down_proj_bias is not None,
+        int(launch_blocks),
+    )
+    full_layer_gqa_ratio = 2
+    num_q_heads = int(k_cache.shape[1]) * full_layer_gqa_ratio
+    o_proj_idle_only = os.environ.get(
+        "ENABLE_CUDA_FUSED_FULL_LAYER_SOFTSYNC_O_PROJ_IDLE_ONLY", "0"
+    ) == "1"
+    partial_attn_flags = os.environ.get(
+        "ENABLE_CUDA_FUSED_FULL_LAYER_SOFTSYNC_PARTIAL_ATTN_FLAGS", "0"
+    ) == "1"
+    idle_blocks = max(0, grid_blocks - num_q_heads)
+    o_proj_active_blocks = idle_blocks if o_proj_idle_only else grid_blocks
+
+    meta = {
+        "kernel_name": "fused_decode_full_layer_softsync_profile",
+        "grid_blocks": grid_blocks,
+        "num_q_heads": num_q_heads,
+        "idle_blocks": idle_blocks,
+        "partial_attn_flags": partial_attn_flags,
+        "o_proj_idle_only": o_proj_idle_only,
+        "o_proj_active_blocks": o_proj_active_blocks,
+        "rows_per_wave": grid_blocks * 16,
+        "downproj_row_passes": (2048 + grid_blocks * 16 - 1) // (grid_blocks * 16),
+        "slot_names": list(FULL_LAYER_PROFILE_SLOT_NAMES),
+    }
+    return (
+        hidden_out.view(*hidden_states.shape[:-1], 6144),
+        out_vec.view(*hidden_states.shape[:-1], n),
+        profile,
+        meta,
     )
 
 

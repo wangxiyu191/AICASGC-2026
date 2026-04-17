@@ -469,16 +469,22 @@ class OptimizedDecoderLayer(nn.Module):
             and workspace.get("type") == "fused_decode_full_layer_softsync"
             and tuple(workspace["barrier_count"].shape) == (1,)
             and tuple(workspace["barrier_generation"].shape) == (1,)
+            and tuple(workspace["kv_ready_count"].shape) == (1,)
+            and tuple(workspace["attn_done_count"].shape) == (1,)
             and tuple(workspace["qkv_out"].shape) == (4096,)
             and tuple(workspace["hidden_out"].shape) == (6144,)
             and tuple(workspace["out"].shape) == (2048,)
             and workspace["barrier_count"].device == device
             and workspace["barrier_generation"].device == device
+            and workspace["kv_ready_count"].device == device
+            and workspace["attn_done_count"].device == device
             and workspace["qkv_out"].device == device
             and workspace["hidden_out"].device == device
             and workspace["out"].device == device
             and workspace["barrier_count"].dtype == torch.int32
             and workspace["barrier_generation"].dtype == torch.int32
+            and workspace["kv_ready_count"].dtype == torch.int32
+            and workspace["attn_done_count"].dtype == torch.int32
             and workspace["qkv_out"].dtype == dtype
             and workspace["hidden_out"].dtype == dtype
             and workspace["out"].dtype == dtype
@@ -488,6 +494,8 @@ class OptimizedDecoderLayer(nn.Module):
             "type": "fused_decode_full_layer_softsync",
             "barrier_count": torch.zeros((1,), dtype=torch.int32, device=device),
             "barrier_generation": torch.zeros((1,), dtype=torch.int32, device=device),
+            "kv_ready_count": torch.zeros((1,), dtype=torch.int32, device=device),
+            "attn_done_count": torch.zeros((1,), dtype=torch.int32, device=device),
             "qkv_out": torch.empty((4096,), dtype=dtype, device=device),
             "hidden_out": torch.empty((6144,), dtype=dtype, device=device),
             "out": torch.empty((2048,), dtype=dtype, device=device),

@@ -1,0 +1,6 @@
+rank,tag,prefetch_blocks_env,attn_prefetch_lines,attn_prefetch_mb,attn_prefetch_vs_oproj_pct,attention_us,sync3_us,oproj_us,total_us,delta_total_us,output_html
+1,allidle,0,49152,6.291,75.0,14.882,4.019,5.962,92.705,-1.598,full_layer_profile_sample0_layer14_step16_blocks96_ownerprefetch_allidle_delay12us_budget4us_20260417.html
+2,b32,32,24576,3.146,37.5,14.873,16.253,6.431,93.129,-1.174,full_layer_profile_sample0_layer14_step16_blocks96_ownerprefetch_b32_delay12us_budget4us_20260417.html
+3,b48,48,32768,4.194,50.0,14.834,16.233,6.318,93.178,-1.125,full_layer_profile_sample0_layer14_step16_blocks96_ownerprefetch_b48_delay12us_budget4us_20260417.html
+4,b64,64,40960,5.243,62.5,14.857,16.137,6.013,93.207,-1.096,full_layer_profile_sample0_layer14_step16_blocks96_ownerprefetch_b64_delay12us_budget4us_20260417.html
+5,b16,16,16384,2.097,25.0,14.882,16.203,6.972,94.091,-0.212,full_layer_profile_sample0_layer14_step16_blocks96_ownerprefetch_b16_delay12us_budget4us_20260417.html

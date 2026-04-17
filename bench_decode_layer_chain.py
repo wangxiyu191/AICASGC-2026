@@ -230,11 +230,15 @@ def _run_layer_chain_capture(
                 )
                 next_tokens = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
                 if capture.is_complete():
+                    layer_cache = static_cache.layers[layer_idx]
                     return {
                         "layer_input": capture.payload["hidden_states"],
                         "cos": capture.payload["cos"],
                         "sin": capture.payload["sin"],
                         "attention": capture.payload["attention"],
+                        "cache_position": capture.payload["attention"]["cache_position"],
+                        "k_cache": layer_cache.keys.detach().clone(),
+                        "v_cache": layer_cache.values.detach().clone(),
                         "o_proj_input": capture.payload["o_proj_input"],
                         "down_proj_input": capture.payload["down_proj_input"],
                     }, {

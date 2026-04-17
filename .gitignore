@@ -13,3 +13,6 @@ cuda_extensions/*.o
 results/*.json
 results/*.html
 results/ncu/
+results/full_layer_profile_*.pt
+results/_tmp_full_layer_profile_*.pt
+cuda_extensions/*_backup_*.cu.bak
