@@ -165,6 +165,7 @@ def _should_rebuild_ext(prebuilt_ext: Path | None) -> bool:
     return any(path.stat().st_mtime_ns > ext_mtime_ns for path in _ext_source_files())
 
 
+@lru_cache(maxsize=1)
 def _load_ext():
     os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.0")
     prebuilt_ext = _find_prebuilt_ext()

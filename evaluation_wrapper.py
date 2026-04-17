@@ -20,6 +20,10 @@ except ImportError:
     class Image:
         pass
 import os
+# Force CUDA to eagerly load all kernel code when modules are registered,
+# eliminating "Runtime Triggered Module Loading" / "Lazy Function Loading"
+# overhead during benchmark execution.  Must be set before any CUDA context.
+os.environ.setdefault("CUDA_MODULE_LOADING", "EAGER")
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForImageTextToText, AutoProcessor
@@ -1130,6 +1134,25 @@ class VLMModel:
         torch.backends.cuda.enable_flash_sdp(True)
         torch.backends.cuda.enable_mem_efficient_sdp(True)
         torch.set_float32_matmul_precision('high')
+
+        # Eagerly load all CUDA extension .so files so that CUDA_MODULE_LOADING=EAGER
+        # can register their kernels immediately, eliminating runtime lazy loading.
+        try:
+            from cuda_decode_gemv_ops.runtime import _load_ext as _gemv_load
+            _gemv_load()
+        except Exception:
+            pass
+        try:
+            from cuda_decode_small_ops import _load_ext as _small_ops_load
+            _small_ops_load()
+        except Exception:
+            pass
+        try:
+            from cuda_decode_attention import _load_ext as _attn_load
+            _attn_load()
+        except Exception:
+            pass
+
         self._optimizations_applied.append("cuda_config")
 
     def _optimize_kv_cache(self):
