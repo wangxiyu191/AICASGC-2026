@@ -996,7 +996,8 @@ torch::Tensor fused_post_attn_mlp_softsync_half(
     const torch::Tensor& out,
     double eps,
     bool has_bias,
-    int64_t threads_per_block) {
+    int64_t threads_per_block,
+    int64_t launch_blocks) {
     return fused_post_attn_mlp_softsync_half_cuda(
         residual,
         attn_output,
