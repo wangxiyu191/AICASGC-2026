@@ -802,8 +802,24 @@ class DecodeCudaGraphRunner:
                 f"prompt_length={prompt_length} exceeds graph bucket max_cache_len={self._max_cache_len}"
             )
 
-        self._static_cache.reset()
-        self._attention_mask_buf.zero_()
+        # Skip full _static_cache.reset() (56 × zero_() calls, ~694µs) — stale
+        # KV data is safe because all decode attention paths are bounded by
+        # cache_position (reads only 0..pos) or by the 4D causal mask from
+        # create_causal_mask() (kv_idx <= cache_position blocks stale positions).
+        # Prefill overwrites 0..prompt_len-1 via index_copy_, and decode advances
+        # from prompt_len onward.
+        #
+        # However, HF's compute_3d_position_ids() calls
+        # past_key_values.get_seq_length() which checks layer-0 keys[0,0] for
+        # non-zero entries.  We must zero that single sentinel slice so
+        # get_seq_length() returns 0 and the correct prefill branch is taken.
+        layer0 = self._static_cache.layers[0]
+        if layer0.is_initialized:
+            layer0.keys[0, 0].zero_()
+        #
+        # Skip attention_mask_buf.zero_() — stale True values beyond prompt_len
+        # are harmless: the causal component of create_causal_mask() blocks them,
+        # and cache_position-based kernels ignore the mask entirely.
         self._attention_mask_buf[:, :prompt_length].copy_(prompt_attention_mask)
         self._rope_delta_buf.zero_()
         self._next_stage_slot = 0
