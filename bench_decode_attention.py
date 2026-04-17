@@ -10,6 +10,12 @@ This tool:
 The capture path is eager for observability, but it reuses the same model, sample
 preparation, StaticCache layout, and optional graph-style bucketed cache length.
 
+Timing profiles:
+- realistic: one op per replay, no explicit L2 flush; closest to benchmark-path
+  steady-state cache locality
+- cold_cache: one op per replay, explicit L2 flush before each replay
+- idealized: batch repeated identical ops inside one replay to isolate kernel time
+
 Usage:
     TQDM_DISABLE=1 ./venv/bin/python bench_decode_attention.py
     TQDM_DISABLE=1 ./venv/bin/python bench_decode_attention.py --sample-idx 0 --layer-idx 0 --decode-step 0
@@ -409,6 +415,169 @@ def _cuda_v4_splitkv(q, k, v, attention_mask, scaling, num_key_value_groups, cac
     return out
 
 
+def _cuda_v4_fused(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position):
+    out = cuda_decode_attention.decode_attn_v4_fused(
+        q, k, v, scaling, num_key_value_groups, cache_position,
+    )
+    if out is None:
+        raise RuntimeError("CUDA v4 fused attention returned None")
+    return out
+
+
+def _cuda_v4_cta_local(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position):
+    out = cuda_decode_attention.decode_attn_v4_cta_local(
+        q, k, v, scaling, num_key_value_groups, cache_position,
+    )
+    if out is None:
+        raise RuntimeError("CUDA v4 CTA-local attention returned None")
+    return out
+
+
+def _cuda_v4_cta_qhead(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position):
+    out = cuda_decode_attention.decode_attn_v4_cta_qhead(
+        q, k, v, scaling, num_key_value_groups, cache_position,
+    )
+    if out is None:
+        raise RuntimeError("CUDA v4 CTA-qhead attention returned None")
+    return out
+
+
+def _cuda_v4_cta_qhead_w8(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position):
+    out = cuda_decode_attention.decode_attn_v4_cta_qhead(
+        q, k, v, scaling, num_key_value_groups, cache_position, warps_per_cta=8,
+    )
+    if out is None:
+        raise RuntimeError("CUDA v4 CTA-qhead-w8 attention returned None")
+    return out
+
+
+def _cuda_v4_cta_qhead_w8_contig(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position):
+    out = cuda_decode_attention.decode_attn_v4_cta_qhead(
+        q,
+        k,
+        v,
+        scaling,
+        num_key_value_groups,
+        cache_position,
+        warps_per_cta=8,
+        lane_layout=1,
+    )
+    if out is None:
+        raise RuntimeError("CUDA v4 CTA-qhead-w8-contig attention returned None")
+    return out
+
+
+def _cuda_v4_cta_qhead_w8_g8(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position):
+    out = cuda_decode_attention.decode_attn_v4_cta_qhead(
+        q,
+        k,
+        v,
+        scaling,
+        num_key_value_groups,
+        cache_position,
+        warps_per_cta=8,
+        lane_layout=2,
+    )
+    if out is None:
+        raise RuntimeError("CUDA v4 CTA-qhead-w8-g8 attention returned None")
+    return out
+
+
+def _cuda_v4_cta_qhead_w16(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position):
+    out = cuda_decode_attention.decode_attn_v4_cta_qhead(
+        q,
+        k,
+        v,
+        scaling,
+        num_key_value_groups,
+        cache_position,
+        warps_per_cta=16,
+    )
+    if out is None:
+        raise RuntimeError("CUDA v4 CTA-qhead-w16 attention returned None")
+    return out
+
+
+def _cuda_v4_cta_qhead_w8_vpf(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position):
+    out = cuda_decode_attention.decode_attn_v4_cta_qhead(
+        q,
+        k,
+        v,
+        scaling,
+        num_key_value_groups,
+        cache_position,
+        warps_per_cta=8,
+        prefetch_mode=1,
+    )
+    if out is None:
+        raise RuntimeError("CUDA v4 CTA-qhead-w8-vpf attention returned None")
+    return out
+
+
+def _cuda_v4_cta_qhead_w8_kpf(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position):
+    out = cuda_decode_attention.decode_attn_v4_cta_qhead(
+        q,
+        k,
+        v,
+        scaling,
+        num_key_value_groups,
+        cache_position,
+        warps_per_cta=8,
+        prefetch_mode=2,
+    )
+    if out is None:
+        raise RuntimeError("CUDA v4 CTA-qhead-w8-kpf attention returned None")
+    return out
+
+
+def _cuda_v4_cta_qhead_w8_cpak(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position):
+    out = cuda_decode_attention.decode_attn_v4_cta_qhead(
+        q,
+        k,
+        v,
+        scaling,
+        num_key_value_groups,
+        cache_position,
+        warps_per_cta=8,
+        prefetch_mode=3,
+    )
+    if out is None:
+        raise RuntimeError("CUDA v4 CTA-qhead-w8-cpak attention returned None")
+    return out
+
+
+def _cuda_v4_cta_qhead_w8_mw4(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position):
+    out = cuda_decode_attention.decode_attn_v4_cta_qhead(
+        q,
+        k,
+        v,
+        scaling,
+        num_key_value_groups,
+        cache_position,
+        warps_per_cta=8,
+        merge_mode=1,
+    )
+    if out is None:
+        raise RuntimeError("CUDA v4 CTA-qhead-w8-mw4 attention returned None")
+    return out
+
+
+def _cuda_v4_cta_qhead_w8_mw2(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position):
+    out = cuda_decode_attention.decode_attn_v4_cta_qhead(
+        q,
+        k,
+        v,
+        scaling,
+        num_key_value_groups,
+        cache_position,
+        warps_per_cta=8,
+        merge_mode=2,
+    )
+    if out is None:
+        raise RuntimeError("CUDA v4 CTA-qhead-w8-mw2 attention returned None")
+    return out
+
+
 def _cuda_persistent(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position):
     import cuda_decode_gemv
     out = cuda_decode_gemv.decode_attn_persistent_half(
@@ -517,6 +686,7 @@ def _run_benchmarks(
     iters: int,
     graph_capture_repeats: int = 1,
     l2_flush_mb: int = DEFAULT_BENCHMARK_L2_FLUSH_MB,
+    selected_variants: list[str] | None = None,
 ):
     q = payload["q"]
     k = payload["k"]
@@ -536,11 +706,29 @@ def _run_benchmarks(
         "cuda_grouped_cachepos_splitkv": _cuda_grouped_cachepos_splitkv,
         "cuda_qhead_grouped_cachepos_splitkv": _cuda_qhead_grouped_cachepos_splitkv,
         "cuda_v4_splitkv": _cuda_v4_splitkv,
+        "cuda_v4_fused": _cuda_v4_fused,
+        "cuda_v4_cta_local": _cuda_v4_cta_local,
+        "cuda_v4_cta_qhead": _cuda_v4_cta_qhead,
+        "cuda_v4_cta_qhead_w8": _cuda_v4_cta_qhead_w8,
+        "cuda_v4_cta_qhead_w8_contig": _cuda_v4_cta_qhead_w8_contig,
+        "cuda_v4_cta_qhead_w8_g8": _cuda_v4_cta_qhead_w8_g8,
+        "cuda_v4_cta_qhead_w16": _cuda_v4_cta_qhead_w16,
+        "cuda_v4_cta_qhead_w8_vpf": _cuda_v4_cta_qhead_w8_vpf,
+        "cuda_v4_cta_qhead_w8_kpf": _cuda_v4_cta_qhead_w8_kpf,
+        "cuda_v4_cta_qhead_w8_cpak": _cuda_v4_cta_qhead_w8_cpak,
+        "cuda_v4_cta_qhead_w8_mw2": _cuda_v4_cta_qhead_w8_mw2,
+        "cuda_v4_cta_qhead_w8_mw4": _cuda_v4_cta_qhead_w8_mw4,
         "cuda_persistent": _cuda_persistent,
         "triton_current": _triton_current,
         "sdpa_enable_gqa_mask": lambda q, k, v, attention_mask, scaling, num_key_value_groups, _cache_position: _sdpa_gqa_mask(q, k, v, attention_mask, scaling, num_key_value_groups),
         "sdpa_enable_gqa_valid_prefix": lambda q, k, v, attention_mask, scaling, num_key_value_groups, _cache_position: _sdpa_gqa_valid_only(q, k, v, attention_mask, scaling, num_key_value_groups),
     }
+    if selected_variants is not None:
+        unknown = [name for name in selected_variants if name not in variants]
+        if unknown:
+            raise ValueError(f"Unknown variants: {', '.join(unknown)}")
+        requested = {"hf_repeat_kv_sdpa", *selected_variants}
+        variants = {name: fn for name, fn in variants.items() if name in requested}
 
     pre_replay = make_l2_flush_runner(payload["q"].device, l2_flush_mb)
     bench_fn = lambda fn, q, k, v, attention_mask, scaling, num_key_value_groups, cache_position, warmup, iters: _bench_impl_graph(
@@ -597,6 +785,42 @@ def _run_benchmarks(
     return results
 
 
+def _override_payload_valid_len(payload, valid_len: int):
+    max_seq_len = payload["k"].shape[2]
+    if valid_len <= 0 or valid_len > max_seq_len:
+        raise ValueError(f"valid_len must be in [1, {max_seq_len}], got {valid_len}")
+
+    attention_mask = torch.zeros_like(payload["attention_mask"], dtype=torch.bool)
+    attention_mask[..., :valid_len] = True
+    overridden = dict(payload)
+    overridden["attention_mask"] = attention_mask
+    overridden["cache_position"] = torch.tensor(
+        [valid_len - 1],
+        dtype=payload["cache_position"].dtype,
+        device=payload["cache_position"].device,
+    )
+    return overridden
+
+
+def _resolve_profile_defaults(args) -> tuple[int, int]:
+    if args.timing_profile == "realistic":
+        default_repeats = 1
+        default_l2_flush_mb = 0
+    elif args.timing_profile == "cold_cache":
+        default_repeats = 1
+        default_l2_flush_mb = DEFAULT_BENCHMARK_L2_FLUSH_MB
+    else:
+        default_repeats = 64
+        default_l2_flush_mb = 0
+
+    if args.graph_capture_repeats is None:
+        args.graph_capture_repeats = default_repeats
+    if args.l2_flush_mb is None:
+        args.l2_flush_mb = default_l2_flush_mb
+
+    return default_repeats, default_l2_flush_mb
+
+
 def main():
     parser = argparse.ArgumentParser(description="Benchmark decode attention implementations on real captured tensors")
     parser.add_argument("--model-path", type=str, default="./Qwen3-VL-2B-Instruct")
@@ -611,10 +835,11 @@ def main():
     parser.add_argument("--no-bucketed", dest="bucketed", action="store_false")
     parser.add_argument(
         "--timing-profile",
-        choices=("realistic", "idealized"),
+        choices=("realistic", "cold_cache", "idealized"),
         default="realistic",
         help=(
-            "realistic: one op per graph replay, closer to actual benchmark decode; "
+            "realistic: one op per graph replay, benchmark-like cache locality; "
+            "cold_cache: one op per replay with explicit L2 eviction before each replay; "
             "idealized: batch repeated identical ops inside one replay to isolate kernel time"
         ),
     )
@@ -627,7 +852,27 @@ def main():
             "Default: 1 for realistic, 64 for idealized"
         ),
     )
-    parser.add_argument("--l2-flush-mb", type=int, default=DEFAULT_BENCHMARK_L2_FLUSH_MB)
+    parser.add_argument(
+        "--l2-flush-mb",
+        type=int,
+        default=None,
+        help=(
+            "L2 eviction working set in MiB before each replay. "
+            "Default depends on timing profile: realistic=0, cold_cache=64, idealized=0."
+        ),
+    )
+    parser.add_argument(
+        "--variants",
+        type=str,
+        default=None,
+        help="Comma-separated benchmark variants to run. Reference hf_repeat_kv_sdpa is always included.",
+    )
+    parser.add_argument(
+        "--valid-lens",
+        type=str,
+        default=None,
+        help="Comma-separated valid lengths to benchmark on the captured payload. Default: use captured valid length only.",
+    )
     parser.add_argument("--output", type=str, default=None, help="Output JSON path (default: results/...)")
     args = parser.parse_args()
 
@@ -636,14 +881,23 @@ def main():
             f"results/attention_microbench_sample{args.sample_idx}_"
             f"layer{args.layer_idx}_step{args.decode_step}.json"
         )
-    if args.graph_capture_repeats is None:
-        args.graph_capture_repeats = 1 if args.timing_profile == "realistic" else 64
+    _default_repeats, _default_l2_flush_mb = _resolve_profile_defaults(args)
     if args.l2_flush_mb > 0 and args.graph_capture_repeats != 1:
         print(
             f"[AttentionBench] l2 flush enabled ({args.l2_flush_mb} MiB); "
             f"forcing graph_capture_repeats from {args.graph_capture_repeats} to 1 so every replay runs cold."
         )
         args.graph_capture_repeats = 1
+    selected_variants = None
+    if args.variants:
+        selected_variants = [name.strip() for name in args.variants.split(",") if name.strip()]
+        if not selected_variants:
+            selected_variants = None
+    valid_lens = None
+    if args.valid_lens:
+        valid_lens = [int(x.strip()) for x in args.valid_lens.split(",") if x.strip()]
+        if not valid_lens:
+            valid_lens = None
 
     print("[AttentionBench] Loading model...")
     vlm = VLMModel(args.model_path)
@@ -689,8 +943,12 @@ def main():
         "bench_mode": "graph",
         "timer": "cuda_event",
         "timing_profile": args.timing_profile,
+        "cache_state": "cold_l2" if args.l2_flush_mb > 0 else "hot_l2",
+        "benchmark_aligned": bool(args.timing_profile == "realistic" and args.l2_flush_mb == 0),
         "graph_capture_repeats": int(args.graph_capture_repeats),
         "l2_flush_mb": int(args.l2_flush_mb),
+        "selected_variants": selected_variants,
+        "valid_lens": valid_lens,
     }
 
     print(
@@ -698,33 +956,43 @@ def main():
         f"valid_len={metadata['valid_len']}, max_cache_len={metadata['max_cache_len']}, "
         f"q={tuple(metadata['q_shape'])}, k={tuple(metadata['k_shape'])}"
     )
-    print(
-        f"[AttentionBench] Benchmarking implementations (mode=graph, "
-        f"profile={args.timing_profile}, capture_repeats={args.graph_capture_repeats})..."
+    benchmark_payloads = (
+        [(metadata["valid_len"], payload)]
+        if valid_lens is None
+        else [(valid_len, _override_payload_valid_len(payload, valid_len)) for valid_len in valid_lens]
     )
-    benchmarks = _run_benchmarks(
-        payload,
-        warmup=args.warmup,
-        iters=args.iters,
-        graph_capture_repeats=args.graph_capture_repeats,
-        l2_flush_mb=args.l2_flush_mb,
-    )
+    benchmarks_by_valid_len = {}
+    for valid_len, bench_payload in benchmark_payloads:
+        print(
+            f"[AttentionBench] Benchmarking implementations (mode=graph, "
+            f"profile={args.timing_profile}, capture_repeats={args.graph_capture_repeats}, valid_len={valid_len})..."
+        )
+        benchmarks = _run_benchmarks(
+            bench_payload,
+            warmup=args.warmup,
+            iters=args.iters,
+            graph_capture_repeats=args.graph_capture_repeats,
+            l2_flush_mb=args.l2_flush_mb,
+            selected_variants=selected_variants,
+        )
+        benchmarks_by_valid_len[str(valid_len)] = benchmarks
 
-    print("\n[AttentionBench] Summary")
-    print(f"{'Implementation':<28} {'Time(ms)':>10} {'Speedup':>10} {'Status':>10}")
-    print(f"{'-'*28} {'-'*10} {'-'*10} {'-'*10}")
-    for name, info in benchmarks.items():
-        if info["status"] == "ok":
-            speedup = info.get("speedup_vs_hf")
-            speedup_text = "-" if speedup is None else f"{speedup:.2f}x"
-            print(f"{name:<28} {info['time_ms']:>10.4f} {speedup_text:>10} {'ok':>10}")
-        else:
-            print(f"{name:<28} {'-':>10} {'-':>10} {'error':>10}")
+        print(f"\n[AttentionBench] Summary (valid_len={valid_len})")
+        print(f"{'Implementation':<28} {'Time(ms)':>10} {'Speedup':>10} {'Status':>10}")
+        print(f"{'-'*28} {'-'*10} {'-'*10} {'-'*10}")
+        for name, info in benchmarks.items():
+            if info["status"] == "ok":
+                speedup = info.get("speedup_vs_hf")
+                speedup_text = "-" if speedup is None else f"{speedup:.2f}x"
+                print(f"{name:<28} {info['time_ms']:>10.4f} {speedup_text:>10} {'ok':>10}")
+            else:
+                print(f"{name:<28} {'-':>10} {'-':>10} {'error':>10}")
 
     output = {
         "system_info": get_system_info(),
         "metadata": metadata,
-        "benchmarks": benchmarks,
+        "benchmarks": benchmarks_by_valid_len[str(metadata["valid_len"])] if valid_lens is None else None,
+        "benchmarks_by_valid_len": benchmarks_by_valid_len if valid_lens is not None else None,
     }
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)

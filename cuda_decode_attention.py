@@ -384,3 +384,103 @@ def decode_attn_v4_fused(
         int(prefetch_blocks if valid_prefetch else 0),
     )
     return out.unsqueeze(2).transpose(1, 2)
+
+
+def decode_attn_v4_cta_local(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scaling: float,
+    num_key_value_groups: int,
+    cache_position: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    if (
+        num_key_value_groups != 2
+        or q.device.type != "cuda"
+        or k.device.type != "cuda"
+        or v.device.type != "cuda"
+        or cache_position.device.type != "cuda"
+        or q.shape[0] != 1
+        or q.shape[2] != 1
+        or q.shape[-1] != 128
+        or q.dtype != torch.float16
+        or k.dtype != torch.float16
+        or v.dtype != torch.float16
+        or k.shape[1] * num_key_value_groups != q.shape[1]
+    ):
+        return None
+
+    if (
+        out is None
+        or tuple(out.shape) != (1, q.shape[1], q.shape[-1])
+        or out.dtype != q.dtype
+        or out.device != q.device
+    ):
+        out = torch.empty((1, q.shape[1], q.shape[-1]), dtype=q.dtype, device=q.device)
+
+    ext = _load_ext()
+    ext.decode_attn_v4_cta_local(
+        q,
+        k,
+        v,
+        cache_position,
+        float(scaling),
+        out,
+        int(num_key_value_groups),
+    )
+    return out.unsqueeze(2).transpose(1, 2)
+
+
+def decode_attn_v4_cta_qhead(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scaling: float,
+    num_key_value_groups: int,
+    cache_position: torch.Tensor,
+    warps_per_cta: int = 4,
+    lane_layout: int = 0,
+    prefetch_mode: int = 0,
+    merge_mode: int = 0,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    if (
+        num_key_value_groups != 2
+        or q.device.type != "cuda"
+        or k.device.type != "cuda"
+        or v.device.type != "cuda"
+        or cache_position.device.type != "cuda"
+        or q.shape[0] != 1
+        or q.shape[2] != 1
+        or q.shape[-1] != 128
+        or q.dtype != torch.float16
+        or k.dtype != torch.float16
+        or v.dtype != torch.float16
+        or k.shape[1] * num_key_value_groups != q.shape[1]
+    ):
+        return None
+
+    if (
+        out is None
+        or tuple(out.shape) != (1, q.shape[1], q.shape[-1])
+        or out.dtype != q.dtype
+        or out.device != q.device
+    ):
+        out = torch.empty((1, q.shape[1], q.shape[-1]), dtype=q.dtype, device=q.device)
+
+    ext = _load_ext()
+    ext.decode_attn_v4_cta_qhead(
+        q,
+        k,
+        v,
+        cache_position,
+        float(scaling),
+        out,
+        int(num_key_value_groups),
+        int(warps_per_cta),
+        int(lane_layout),
+        int(prefetch_mode),
+        int(merge_mode),
+    )
+    return out.unsqueeze(2).transpose(1, 2)

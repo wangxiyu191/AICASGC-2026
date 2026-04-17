@@ -587,6 +587,9 @@ _ENABLE_TRITON_SMALL_DECODE_ATTENTION_DOT = os.environ.get("ENABLE_TRITON_SMALL_
 _ENABLE_TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV = os.environ.get("ENABLE_TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV", "1") == "1"
 _ENABLE_CUDA_SMALL_DECODE_ATTENTION_V4 = os.environ.get("ENABLE_CUDA_SMALL_DECODE_ATTENTION_V4", "1") == "1"
 _ENABLE_CUDA_SMALL_DECODE_ATTENTION_V4_FUSED = os.environ.get("ENABLE_CUDA_SMALL_DECODE_ATTENTION_V4_FUSED", "1") == "1"
+_CUDA_SMALL_DECODE_ATTENTION_V4_CTA_QHEAD_MAX_SEQ_LEN = int(
+    os.environ.get("CUDA_SMALL_DECODE_ATTENTION_V4_CTA_QHEAD_MAX_SEQ_LEN", "704")
+)
 _ENABLE_CUDA_PERSISTENT_ATTENTION = os.environ.get("ENABLE_CUDA_PERSISTENT_ATTENTION", "0") == "1"
 _TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_SPLIT_K = int(os.environ.get("TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_SPLIT_K", "0"))
 _TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_BLOCK_N = int(os.environ.get("TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_BLOCK_N", "0"))
@@ -1968,6 +1971,23 @@ def _small_decode_attention(
         and num_key_value_groups == 2
     ):
         import cuda_decode_attention
+        seq_len = k.shape[2]
+        if (
+            # Keep the kernel choice static per CUDAGraph bucket.
+            _CUDA_SMALL_DECODE_ATTENTION_V4_CTA_QHEAD_MAX_SEQ_LEN > 0
+            and seq_len <= _CUDA_SMALL_DECODE_ATTENTION_V4_CTA_QHEAD_MAX_SEQ_LEN
+        ):
+            out = cuda_decode_attention.decode_attn_v4_cta_qhead(
+                q,
+                k,
+                v,
+                scaling,
+                num_key_value_groups,
+                cache_position,
+                warps_per_cta=8,
+            )
+            if out is not None:
+                return out
         if _ENABLE_CUDA_SMALL_DECODE_ATTENTION_V4_FUSED:
             out = cuda_decode_attention.decode_attn_v4_fused(
                 q,
