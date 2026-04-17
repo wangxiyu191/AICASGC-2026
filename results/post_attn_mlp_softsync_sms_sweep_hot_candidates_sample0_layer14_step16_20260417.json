@@ -1,0 +1,96 @@
+{
+  "system": {
+    "python_version": "3.12.3",
+    "torch_version": "2.8.0+cu128",
+    "cuda_version": "12.8",
+    "cudnn_version": "91002",
+    "gpu_name": "NVIDIA A800 80GB PCIe",
+    "gpu_compute_capability": "8.0"
+  },
+  "benchmark": {
+    "script": "bench_post_attn_mlp_softsync_sms_sweep.py",
+    "sample_idx": 0,
+    "layer_idx": 14,
+    "decode_step": 16,
+    "max_new_tokens": 64,
+    "bucketed": true,
+    "warmup": 50,
+    "iters": 5000,
+    "l2_flush_mb": 0,
+    "num_sms": 108,
+    "launch_blocks_list": [
+      64,
+      96,
+      99,
+      108
+    ]
+  },
+  "capture_meta": {
+    "prompt_length": 690,
+    "max_cache_len": 768,
+    "captured_decode_step": 16,
+    "layer_idx": 14,
+    "bucketed": true
+  },
+  "payload_meta": {
+    "residual_shape": [
+      1,
+      1,
+      2048
+    ],
+    "attn_output_shape": [
+      1,
+      1,
+      2048
+    ],
+    "norm_weight_shape": [
+      2048
+    ],
+    "gate_up_weight_shape": [
+      12288,
+      2048
+    ],
+    "down_proj_weight_shape": [
+      2048,
+      6144
+    ],
+    "down_proj_bias_shape": null,
+    "eps": 1e-06,
+    "threads_per_block": 1024
+  },
+  "best": {
+    "launch_blocks": 99,
+    "elapsed_ms": 0.05872496761530638,
+    "speedup_vs_default": 1.003937324321282
+  },
+  "default": {
+    "launch_blocks": 108,
+    "elapsed_ms": 0.058956186858564616
+  },
+  "results": [
+    {
+      "launch_blocks": 64,
+      "elapsed_ms": 0.059902157881110904,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 96,
+      "elapsed_ms": 0.058748724427819254,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 99,
+      "elapsed_ms": 0.05872496761530638,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 108,
+      "elapsed_ms": 0.058956186858564616,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    }
+  ]
+}

@@ -268,6 +268,7 @@ def fused_post_attn_mlp_softsync_half(
     eps: float,
     workspace: dict | None = None,
     threads_per_block: int = 1024,
+    launch_blocks: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if (
         residual.device.type != "cuda"
@@ -331,6 +332,7 @@ def fused_post_attn_mlp_softsync_half(
         eps,
         bias is not None,
         threads_per_block,
+        0 if launch_blocks is None else int(launch_blocks),
     )
     return hidden_out.view(*residual.shape[:-1], 6144), out_vec.view(*residual.shape[:-1], n)
 

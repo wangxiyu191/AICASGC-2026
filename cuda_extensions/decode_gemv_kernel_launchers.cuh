@@ -1965,7 +1965,8 @@ torch::Tensor fused_post_attn_mlp_softsync_half_cuda(
     const torch::Tensor& out,
     double eps,
     bool has_bias,
-    int64_t threads_per_block) {
+    int64_t threads_per_block,
+    int64_t launch_blocks) {
     TORCH_CHECK(
         residual.is_cuda() && attn_output.is_cuda() && norm_weight.is_cuda()
             && gate_up_weight.is_cuda() && down_proj_weight.is_cuda(),
@@ -2003,6 +2004,10 @@ torch::Tensor fused_post_attn_mlp_softsync_half_cuda(
     int device_idx = static_cast<int>(residual.device().index());
     int num_sms = 0;
     C10_CUDA_CHECK(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device_idx));
+    const int grid_blocks = launch_blocks > 0 ? static_cast<int>(launch_blocks) : num_sms;
+    TORCH_CHECK(
+        grid_blocks >= 1 && grid_blocks <= num_sms,
+        "launch_blocks must be in [1, ", num_sms, "], got ", grid_blocks);
 
     c10::cuda::CUDAGuard device_guard(residual.device());
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -2012,10 +2017,10 @@ torch::Tensor fused_post_attn_mlp_softsync_half_cuda(
         C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
             &max_blocks_per_sm, kernel_fn, tpb, 0));
         TORCH_CHECK(
-            max_blocks_per_sm * num_sms >= num_sms,
+            max_blocks_per_sm * num_sms >= grid_blocks,
             "fused_post_attn_mlp_softsync launch would deadlock: resident blocks ",
-            max_blocks_per_sm * num_sms, " < required grid blocks ", num_sms);
-        kernel_fn<<<num_sms, tpb, 0, stream>>>(
+            max_blocks_per_sm * num_sms, " < required grid blocks ", grid_blocks);
+        kernel_fn<<<grid_blocks, tpb, 0, stream>>>(
             residual.data_ptr<at::Half>(),
             attn_output.data_ptr<at::Half>(),
             norm_weight.data_ptr<at::Half>(),

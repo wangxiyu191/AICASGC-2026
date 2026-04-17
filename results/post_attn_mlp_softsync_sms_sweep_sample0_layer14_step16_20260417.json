@@ -1,0 +1,824 @@
+{
+  "system": {
+    "python_version": "3.12.3",
+    "torch_version": "2.8.0+cu128",
+    "cuda_version": "12.8",
+    "cudnn_version": "91002",
+    "gpu_name": "NVIDIA A800 80GB PCIe",
+    "gpu_compute_capability": "8.0"
+  },
+  "benchmark": {
+    "script": "bench_post_attn_mlp_softsync_sms_sweep.py",
+    "sample_idx": 0,
+    "layer_idx": 14,
+    "decode_step": 16,
+    "max_new_tokens": 64,
+    "bucketed": true,
+    "warmup": 10,
+    "iters": 200,
+    "l2_flush_mb": 64,
+    "num_sms": 108,
+    "launch_blocks_list": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36,
+      37,
+      38,
+      39,
+      40,
+      41,
+      42,
+      43,
+      44,
+      45,
+      46,
+      47,
+      48,
+      49,
+      50,
+      51,
+      52,
+      53,
+      54,
+      55,
+      56,
+      57,
+      58,
+      59,
+      60,
+      61,
+      62,
+      63,
+      64,
+      65,
+      66,
+      67,
+      68,
+      69,
+      70,
+      71,
+      72,
+      73,
+      74,
+      75,
+      76,
+      77,
+      78,
+      79,
+      80,
+      81,
+      82,
+      83,
+      84,
+      85,
+      86,
+      87,
+      88,
+      89,
+      90,
+      91,
+      92,
+      93,
+      94,
+      95,
+      96,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      107,
+      108
+    ]
+  },
+  "capture_meta": {
+    "prompt_length": 690,
+    "max_cache_len": 768,
+    "captured_decode_step": 16,
+    "layer_idx": 14,
+    "bucketed": true
+  },
+  "payload_meta": {
+    "residual_shape": [
+      1,
+      1,
+      2048
+    ],
+    "attn_output_shape": [
+      1,
+      1,
+      2048
+    ],
+    "norm_weight_shape": [
+      2048
+    ],
+    "gate_up_weight_shape": [
+      12288,
+      2048
+    ],
+    "down_proj_weight_shape": [
+      2048,
+      6144
+    ],
+    "down_proj_bias_shape": null,
+    "eps": 1e-06,
+    "threads_per_block": 1024
+  },
+  "best": {
+    "launch_blocks": 99,
+    "elapsed_ms": 0.07230976212769746,
+    "speedup_vs_default": 1.0043191969734315
+  },
+  "default": {
+    "launch_blocks": 108,
+    "elapsed_ms": 0.07262208223342896
+  },
+  "results": [
+    {
+      "launch_blocks": 1,
+      "elapsed_ms": 1.901240342259407,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 2,
+      "elapsed_ms": 0.9578700953722,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 3,
+      "elapsed_ms": 0.6481151878833771,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 4,
+      "elapsed_ms": 0.4864614397287369,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 5,
+      "elapsed_ms": 0.3979724723100662,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 6,
+      "elapsed_ms": 0.33206271544098853,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 7,
+      "elapsed_ms": 0.29485568299889564,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 8,
+      "elapsed_ms": 0.25064960181713103,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 9,
+      "elapsed_ms": 0.2355968014895916,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 10,
+      "elapsed_ms": 0.21401088163256646,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 11,
+      "elapsed_ms": 0.19164672151207923,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 12,
+      "elapsed_ms": 0.177879036962986,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 13,
+      "elapsed_ms": 0.16263167895376682,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 14,
+      "elapsed_ms": 0.15550975657999516,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 15,
+      "elapsed_ms": 0.14867968186736108,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 16,
+      "elapsed_ms": 0.13382655672729016,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 17,
+      "elapsed_ms": 0.13342719726264476,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 18,
+      "elapsed_ms": 0.1272576017677784,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 19,
+      "elapsed_ms": 0.12627456165850162,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 20,
+      "elapsed_ms": 0.12073984209448099,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 21,
+      "elapsed_ms": 0.11992576267570257,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 22,
+      "elapsed_ms": 0.10684927891939879,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 23,
+      "elapsed_ms": 0.10686463892459869,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 24,
+      "elapsed_ms": 0.1011916770040989,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 25,
+      "elapsed_ms": 0.10160127714276314,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 26,
+      "elapsed_ms": 0.10193919725716113,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 27,
+      "elapsed_ms": 0.10201599728316069,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 28,
+      "elapsed_ms": 0.0970752027630806,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 29,
+      "elapsed_ms": 0.09767424251884221,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 30,
+      "elapsed_ms": 0.0978790420666337,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 31,
+      "elapsed_ms": 0.0979046418145299,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 32,
+      "elapsed_ms": 0.08457215882837772,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 33,
+      "elapsed_ms": 0.08494079895317555,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 34,
+      "elapsed_ms": 0.08571903921663761,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 35,
+      "elapsed_ms": 0.0860415993258357,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 36,
+      "elapsed_ms": 0.08673791956156492,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 37,
+      "elapsed_ms": 0.08712191969156265,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 38,
+      "elapsed_ms": 0.0876902398839593,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 39,
+      "elapsed_ms": 0.0826982381939888,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 40,
+      "elapsed_ms": 0.08325631838291883,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 41,
+      "elapsed_ms": 0.08379903856664896,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 42,
+      "elapsed_ms": 0.08425471872091293,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 43,
+      "elapsed_ms": 0.08498175896704196,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 44,
+      "elapsed_ms": 0.08526847906410694,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 45,
+      "elapsed_ms": 0.08567807920277119,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 46,
+      "elapsed_ms": 0.08627199940383434,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 47,
+      "elapsed_ms": 0.08659455951303244,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 48,
+      "elapsed_ms": 0.08140799775719643,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 49,
+      "elapsed_ms": 0.0815308777987957,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 50,
+      "elapsed_ms": 0.08166911784559489,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 51,
+      "elapsed_ms": 0.08181759789586067,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 52,
+      "elapsed_ms": 0.0821862380206585,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 53,
+      "elapsed_ms": 0.08240639809519053,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 54,
+      "elapsed_ms": 0.08262143816798925,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 55,
+      "elapsed_ms": 0.08309759832918644,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 56,
+      "elapsed_ms": 0.08355327848345041,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 57,
+      "elapsed_ms": 0.08361983850598335,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 58,
+      "elapsed_ms": 0.08418815869837999,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 59,
+      "elapsed_ms": 0.08478719890117645,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 60,
+      "elapsed_ms": 0.08528383906930685,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 61,
+      "elapsed_ms": 0.0855347191542387,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 62,
+      "elapsed_ms": 0.085539839155972,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 63,
+      "elapsed_ms": 0.08494079895317555,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 64,
+      "elapsed_ms": 0.07326720245182514,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 65,
+      "elapsed_ms": 0.07329280246049166,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 66,
+      "elapsed_ms": 0.0732006424292922,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 67,
+      "elapsed_ms": 0.07323648244142532,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 68,
+      "elapsed_ms": 0.07349760249257088,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 69,
+      "elapsed_ms": 0.07342080250382424,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 70,
+      "elapsed_ms": 0.0735129625350237,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 71,
+      "elapsed_ms": 0.07341056250035763,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 72,
+      "elapsed_ms": 0.07348736252635718,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 73,
+      "elapsed_ms": 0.07371776256710291,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 74,
+      "elapsed_ms": 0.07375872261822224,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 75,
+      "elapsed_ms": 0.07373824261128903,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 76,
+      "elapsed_ms": 0.07371776260435581,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 77,
+      "elapsed_ms": 0.07374848261475563,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 78,
+      "elapsed_ms": 0.07376896262168885,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 79,
+      "elapsed_ms": 0.07410176269710064,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 80,
+      "elapsed_ms": 0.0740300826728344,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 81,
+      "elapsed_ms": 0.07428608272224664,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 82,
+      "elapsed_ms": 0.07430656280368567,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 83,
+      "elapsed_ms": 0.07448064286261796,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 84,
+      "elapsed_ms": 0.07467520292848348,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 85,
+      "elapsed_ms": 0.07485440295189619,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 86,
+      "elapsed_ms": 0.07524864297360181,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 87,
+      "elapsed_ms": 0.07553536303341389,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 88,
+      "elapsed_ms": 0.07577600318938493,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 89,
+      "elapsed_ms": 0.07610368270426988,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 90,
+      "elapsed_ms": 0.07636992238461972,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 91,
+      "elapsed_ms": 0.07673856168985367,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 92,
+      "elapsed_ms": 0.07688704151660204,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 93,
+      "elapsed_ms": 0.07724032007157802,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 94,
+      "elapsed_ms": 0.07709696091711521,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 95,
+      "elapsed_ms": 0.07729152001440526,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 96,
+      "elapsed_ms": 0.07246336217969657,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 97,
+      "elapsed_ms": 0.07247360218316316,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 98,
+      "elapsed_ms": 0.07246336217969657,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 99,
+      "elapsed_ms": 0.07230976212769746,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 100,
+      "elapsed_ms": 0.07246336217969657,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 101,
+      "elapsed_ms": 0.07250432219356298,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 102,
+      "elapsed_ms": 0.07268864225596189,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 103,
+      "elapsed_ms": 0.07258112221956253,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 104,
+      "elapsed_ms": 0.07257088221609592,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 105,
+      "elapsed_ms": 0.07259136222302914,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 106,
+      "elapsed_ms": 0.0726988822594285,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 107,
+      "elapsed_ms": 0.0726835222542286,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    },
+    {
+      "launch_blocks": 108,
+      "elapsed_ms": 0.07262208223342896,
+      "max_abs_diff_vs_default": 0.0,
+      "hidden_max_abs_diff_vs_default": 0.0
+    }
+  ]
+}

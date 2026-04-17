@@ -349,6 +349,7 @@ class OptimizedDecoderLayer(nn.Module):
                 prefer_small_triton=prefer_small_decode_triton,
                 workspace=self._ensure_post_attn_mlp_softsync_workspace(),
                 threads_per_block=_FUSED_POST_ATTN_MLP_THREADS,
+                launch_blocks=_FUSED_POST_ATTN_MLP_BLOCKS if _FUSED_POST_ATTN_MLP_BLOCKS > 0 else None,
             )
             if fused_post_attn_mlp_out is not None:
                 return fused_post_attn_mlp_out
@@ -615,6 +616,7 @@ _ENABLE_CUDA_FUSED_ADD_RMSNORM_GATEUP = os.environ.get("ENABLE_CUDA_FUSED_ADD_RM
 _ENABLE_CUDA_FUSED_RMSNORM_QKV = os.environ.get("ENABLE_CUDA_FUSED_RMSNORM_QKV", "0") == "1"
 _ENABLE_CUDA_FUSED_POST_ATTN_MLP_PERSISTENT = os.environ.get("ENABLE_CUDA_FUSED_POST_ATTN_MLP_PERSISTENT", "0") == "1"
 _FUSED_POST_ATTN_MLP_THREADS = int(os.environ.get("FUSED_POST_ATTN_MLP_THREADS", "1024"))
+_FUSED_POST_ATTN_MLP_BLOCKS = int(os.environ.get("FUSED_POST_ATTN_MLP_BLOCKS", "0"))
 _ENABLE_CUDA_FUSED_FULL_LAYER_SOFTSYNC = os.environ.get("ENABLE_CUDA_FUSED_FULL_LAYER_SOFTSYNC", "0") == "1"
 _ENABLE_CUDA_FUSED_O_PROJ_POST_ATTN_MLP_PERSISTENT = os.environ.get(
     "ENABLE_CUDA_FUSED_O_PROJ_POST_ATTN_MLP_PERSISTENT", "0"
@@ -1375,6 +1377,7 @@ def _fused_post_attn_mlp_persistent(
     prefer_small_triton: bool = False,
     workspace: dict | None = None,
     threads_per_block: int = 1024,
+    launch_blocks: int | None = None,
 ) -> torch.Tensor | None:
     if (
         not prefer_small_triton
@@ -1416,6 +1419,7 @@ def _fused_post_attn_mlp_persistent(
         eps,
         workspace=workspace,
         threads_per_block=threads_per_block,
+        launch_blocks=launch_blocks,
     )
     return out
 

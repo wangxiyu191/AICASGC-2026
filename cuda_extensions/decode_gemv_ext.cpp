@@ -322,7 +322,8 @@ torch::Tensor fused_post_attn_mlp_softsync_half_cuda(
     const torch::Tensor& out,
     double eps,
     bool has_bias,
-    int64_t threads_per_block);
+    int64_t threads_per_block,
+    int64_t launch_blocks);
 
 torch::Tensor fused_o_proj_post_attn_mlp_persistent_half_cuda(
     const torch::Tensor& residual,
@@ -1009,7 +1010,8 @@ torch::Tensor fused_post_attn_mlp_softsync_half(
         out,
         eps,
         has_bias,
-        threads_per_block);
+        threads_per_block,
+        launch_blocks);
 }
 
 torch::Tensor fused_o_proj_post_attn_mlp_persistent_half(
