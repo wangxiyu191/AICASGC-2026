@@ -87,11 +87,14 @@ class OptimizedDecoderLayer(nn.Module):
         )
         self._prefer_small_decode_triton = False
         self._splitkv_workspace = None
+        self._qhead_splitkv_workspace = None
         self._full_layer_softsync_workspace = None
         self._o_proj_post_attn_mlp_workspaces: dict[str, dict] = {}
         self._post_attn_mlp_softsync_workspace: dict | None = None
         if _decode_attention_needs_splitkv_workspace():
             self._ensure_splitkv_workspace()
+        if _decode_attention_needs_qhead_splitkv_workspace():
+            self._ensure_qhead_splitkv_workspace()
 
     def forward(
         self,
@@ -285,6 +288,7 @@ class OptimizedDecoderLayer(nn.Module):
                 prefer_small_triton=prefer_small_decode_triton,
                 cache_position=cache_position,
                 splitkv_workspace=self._splitkv_workspace,
+                qhead_splitkv_workspace=self._qhead_splitkv_workspace,
                 prefetch_weight=attention_prefetch_weight,
                 prefetch_blocks=attention_prefetch_blocks,
             )
@@ -609,6 +613,39 @@ class OptimizedDecoderLayer(nn.Module):
             "done_count": torch.zeros(self.num_kv_heads, dtype=torch.int32, device=self.qkv_weight.device),
         }
 
+    def _ensure_qhead_splitkv_workspace(self, split_k: int | None = None):
+        if split_k is None:
+            split_k = _CUDA_SMALL_DECODE_ATTENTION_V4_QHEAD_SPLITKV_SPLIT_K
+        if self.qkv_weight.device.type != "cuda":
+            self._qhead_splitkv_workspace = None
+            return
+        workspace = self._qhead_splitkv_workspace
+        if (
+            workspace is not None
+            and workspace.get("split_k") == split_k
+            and workspace["partial_acc"].device == self.qkv_weight.device
+        ):
+            return
+        self._qhead_splitkv_workspace = {
+            "split_k": split_k,
+            "partial_acc": torch.empty(
+                (self.num_heads, split_k, self.head_dim),
+                dtype=torch.float32,
+                device=self.qkv_weight.device,
+            ),
+            "partial_stats": torch.empty(
+                (self.num_heads, split_k, 2),
+                dtype=torch.float32,
+                device=self.qkv_weight.device,
+            ),
+            "out": torch.empty(
+                (1, self.num_heads, self.head_dim),
+                dtype=self.qkv_weight.dtype,
+                device=self.qkv_weight.device,
+            ),
+            "done_count": torch.zeros(self.num_heads, dtype=torch.int32, device=self.qkv_weight.device),
+        }
+
     def _ensure_full_layer_softsync_workspace(self):
         device = self.qkv_weight.device
         dtype = self.qkv_weight.dtype
@@ -778,8 +815,17 @@ _ENABLE_TRITON_SMALL_DECODE_ATTENTION_DOT = os.environ.get("ENABLE_TRITON_SMALL_
 _ENABLE_TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV = os.environ.get("ENABLE_TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV", "1") == "1"
 _ENABLE_CUDA_SMALL_DECODE_ATTENTION_V4 = os.environ.get("ENABLE_CUDA_SMALL_DECODE_ATTENTION_V4", "1") == "1"
 _ENABLE_CUDA_SMALL_DECODE_ATTENTION_V4_FUSED = os.environ.get("ENABLE_CUDA_SMALL_DECODE_ATTENTION_V4_FUSED", "1") == "1"
+_ENABLE_CUDA_SMALL_DECODE_ATTENTION_V4_QHEAD_SPLITKV = os.environ.get(
+    "ENABLE_CUDA_SMALL_DECODE_ATTENTION_V4_QHEAD_SPLITKV", "0"
+) == "1"
 _CUDA_SMALL_DECODE_ATTENTION_V4_CTA_QHEAD_MAX_SEQ_LEN = int(
     os.environ.get("CUDA_SMALL_DECODE_ATTENTION_V4_CTA_QHEAD_MAX_SEQ_LEN", "704")
+)
+_CUDA_SMALL_DECODE_ATTENTION_V4_QHEAD_SPLITKV_MIN_SEQ_LEN = int(
+    os.environ.get("CUDA_SMALL_DECODE_ATTENTION_V4_QHEAD_SPLITKV_MIN_SEQ_LEN", "705")
+)
+_CUDA_SMALL_DECODE_ATTENTION_V4_QHEAD_SPLITKV_SPLIT_K = max(
+    2, int(os.environ.get("CUDA_SMALL_DECODE_ATTENTION_V4_QHEAD_SPLITKV_SPLIT_K", "4"))
 )
 _ENABLE_CUDA_PERSISTENT_ATTENTION = os.environ.get("ENABLE_CUDA_PERSISTENT_ATTENTION", "0") == "1"
 _TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_SPLIT_K = int(os.environ.get("TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV_SPLIT_K", "0"))
@@ -827,6 +873,10 @@ def _nvtx_range(name: str, enabled: bool):
 
 def _decode_attention_needs_splitkv_workspace() -> bool:
     return _ENABLE_TRITON_SMALL_DECODE_ATTENTION_SPLIT_KV or _ENABLE_CUDA_SMALL_DECODE_ATTENTION_V4
+
+
+def _decode_attention_needs_qhead_splitkv_workspace() -> bool:
+    return _ENABLE_CUDA_SMALL_DECODE_ATTENTION_V4_QHEAD_SPLITKV
 
 
 def _should_enable_decode_nvtx(hidden_states: torch.Tensor, past_key_values) -> bool:
@@ -2214,6 +2264,7 @@ def _small_decode_attention(
     prefer_small_triton: bool = False,
     cache_position: torch.Tensor | None = None,
     splitkv_workspace: dict | None = None,
+    qhead_splitkv_workspace: dict | None = None,
     prefetch_weight: torch.Tensor | None = None,
     prefetch_blocks: int = 0,
 ) -> torch.Tensor | None:
@@ -2267,6 +2318,22 @@ def _small_decode_attention(
     ):
         import cuda_decode_attention
         seq_len = k.shape[2]
+        if (
+            _ENABLE_CUDA_SMALL_DECODE_ATTENTION_V4_QHEAD_SPLITKV
+            and seq_len >= _CUDA_SMALL_DECODE_ATTENTION_V4_QHEAD_SPLITKV_MIN_SEQ_LEN
+        ):
+            out = cuda_decode_attention.decode_attn_v4_cta_qhead_splitkv_fused(
+                q,
+                k,
+                v,
+                scaling,
+                num_key_value_groups,
+                cache_position,
+                split_k=_CUDA_SMALL_DECODE_ATTENTION_V4_QHEAD_SPLITKV_SPLIT_K,
+                workspace=qhead_splitkv_workspace,
+            )
+            if out is not None:
+                return out
         if (
             # Keep the kernel choice static per CUDAGraph bucket.
             _CUDA_SMALL_DECODE_ATTENTION_V4_CTA_QHEAD_MAX_SEQ_LEN > 0
@@ -3722,6 +3789,8 @@ def set_small_decode_triton_enabled(model, enabled: bool) -> bool:
             layer._prefer_small_decode_triton = enabled
             if enabled and _decode_attention_needs_splitkv_workspace():
                 layer._ensure_splitkv_workspace()
+            if enabled and _decode_attention_needs_qhead_splitkv_workspace():
+                layer._ensure_qhead_splitkv_workspace()
     return previous
 
 

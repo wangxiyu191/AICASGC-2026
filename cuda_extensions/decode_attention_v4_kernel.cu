@@ -133,8 +133,12 @@ __device__ __forceinline__ void load_half4_vec(
 __device__ __forceinline__ float4 regroup_acc_to_float4(
     const float* acc,
     int lane) {
-    const int src_lane = lane >> 3;
-    const int src_base = (lane & 7) * 4;
+    // Destination lanes 0..31 write contiguous 4-float chunks of the 128-d output.
+    // After the cross-group reductions, lanes {0,4,8,...,28} hold dims 0..31,
+    // {1,5,9,...,29} hold dims 32..63, etc. We therefore fetch chunk `lane & 7`
+    // from the lane whose group-lane is `lane >> 3`.
+    const int src_lane = ((lane & 7) << 2) | (lane >> 3);
+    const int src_base = (lane >> 2) * 4;
     float4 packed;
     packed.x = __shfl_sync(0xffffffff, acc[src_base + 0], src_lane);
     packed.y = __shfl_sync(0xffffffff, acc[src_base + 1], src_lane);
@@ -439,13 +443,13 @@ decode_attn_v4_fused_kernel(
 
     if (chunk_start >= chunk_end) {
         // Empty chunk: write zero partials
-        if (group_id == 0) {
+        {
+            const int packed_dim = lane * 4;
             float* pa = partial_acc + kv_head_idx * pa_stride_kh
                       + split_idx * pa_stride_split
-                      + warp_id * pa_stride_head + dim_offset;
-            #pragma unroll
-            for (int i = 0; i < kDimsPerThread; ++i) pa[i] = 0.0f;
-            if (group_lane == 0) {
+                      + warp_id * pa_stride_head + packed_dim;
+            *reinterpret_cast<float4*>(pa) = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (lane == 0) {
                 float* ps = partial_stats + kv_head_idx * ps_stride_kh
                           + split_idx * ps_stride_split
                           + warp_id * ps_stride_head;
@@ -556,13 +560,13 @@ decode_attn_v4_fused_kernel(
         }
 
         // Write partial results
-        if (group_id == 0) {
+        {
+            const int packed_dim = lane * 4;
             float* pa = partial_acc + kv_head_idx * pa_stride_kh
                       + split_idx * pa_stride_split
-                      + warp_id * pa_stride_head + dim_offset;
-            #pragma unroll
-            for (int i = 0; i < kDimsPerThread; ++i) pa[i] = acc[i];
-            if (group_lane == 0) {
+                      + warp_id * pa_stride_head + packed_dim;
+            *reinterpret_cast<float4*>(pa) = regroup_acc_to_float4(acc, lane);
+            if (lane == 0) {
                 float* ps = partial_stats + kv_head_idx * ps_stride_kh
                           + split_idx * ps_stride_split
                           + warp_id * ps_stride_head;
@@ -674,10 +678,9 @@ decode_attn_v4_cta_qhead_splitkv_fused_kernel(
     const int dim_offset = group_lane * kDimsPerThread;
     const int valid_len = min(static_cast<int>(cache_position[0] + 1), max_seq_len);
 
-    __shared__ float s_partial_acc[WarpsPerCTA][kHeadDim];
+    __shared__ __align__(16) float s_partial_acc[WarpsPerCTA][kHeadDim];
     __shared__ float s_partial_l[WarpsPerCTA];
     __shared__ float s_partial_m[WarpsPerCTA];
-    __shared__ int s_is_last;
 
     const int chunk_size = (valid_len + split_k - 1) / split_k;
     const int chunk_start = split_idx * chunk_size;
@@ -798,13 +801,11 @@ decode_attn_v4_cta_qhead_splitkv_fused_kernel(
         }
     }
 
-    if (group_id == 0) {
-        float* sm_acc = &s_partial_acc[shard_idx][dim_offset];
-        #pragma unroll
-        for (int i = 0; i < kDimsPerThread; ++i) {
-            sm_acc[i] = acc[i];
-        }
-        if (group_lane == 0) {
+    {
+        const int packed_dim = lane * 4;
+        float* sm_acc = &s_partial_acc[shard_idx][packed_dim];
+        *reinterpret_cast<float4*>(sm_acc) = regroup_acc_to_float4(acc, lane);
+        if (lane == 0) {
             s_partial_l[shard_idx] = l_val;
             s_partial_m[shard_idx] = m_val;
         }
@@ -847,25 +848,24 @@ decode_attn_v4_cta_qhead_splitkv_fused_kernel(
         }
     }
 
-    __threadfence();
-    __syncthreads();
-
-    if (tid == 0) {
-        const int arrived = atomicAdd(&done_count[q_head_idx], 1);
-        s_is_last = (arrived == split_k - 1) ? 1 : 0;
-    }
-    __syncthreads();
-
-    if (!s_is_last) {
+    if (warp_id != 0) {
         return;
     }
 
-    if (tid == 0) {
-        done_count[q_head_idx] = 0;
-    }
+    // Only warp0 participates in the global completion protocol and final merge.
+    __syncwarp();
     __threadfence();
 
-    if (warp_id != 0) {
+    int is_last = 0;
+    if (lane == 0) {
+        const int arrived = atomicAdd(&done_count[q_head_idx], 1);
+        is_last = (arrived == split_k - 1) ? 1 : 0;
+        if (is_last) {
+            done_count[q_head_idx] = 0;
+        }
+    }
+    is_last = __shfl_sync(0xffffffff, is_last, 0);
+    if (!is_last) {
         return;
     }
 
