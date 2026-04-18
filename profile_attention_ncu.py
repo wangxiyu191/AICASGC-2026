@@ -18,6 +18,14 @@ from datasets import load_from_disk
 
 import optimized_layer
 from bench_decode_attention import (
+    _cuda_v4_cta_qhead,
+    _cuda_v4_cta_qhead_w12,
+    _cuda_v4_cta_qhead_w12_contig,
+    _cuda_v4_cta_qhead_w12_g8,
+    _cuda_v4_cta_qhead_splitkv4,
+    _cuda_v4_cta_qhead_w8,
+    _cuda_v4_fused,
+    _cuda_v4_splitkv,
     _hf_repeat_kv_attention,
     _prepare_inputs,
     _run_capture,
@@ -48,6 +56,14 @@ def _build_variant(name: str):
         "triton_grouped_cachepos_splitkv": _triton_grouped_cachepos_splitkv,
         "triton_grouped_cachepos_prefix_dot": _triton_grouped_cachepos_prefix_dot,
         "triton_current": _triton_current,
+        "cuda_v4_cta_qhead": _cuda_v4_cta_qhead,
+        "cuda_v4_cta_qhead_w8": _cuda_v4_cta_qhead_w8,
+        "cuda_v4_cta_qhead_w12": _cuda_v4_cta_qhead_w12,
+        "cuda_v4_cta_qhead_w12_contig": _cuda_v4_cta_qhead_w12_contig,
+        "cuda_v4_cta_qhead_w12_g8": _cuda_v4_cta_qhead_w12_g8,
+        "cuda_v4_cta_qhead_splitkv4": _cuda_v4_cta_qhead_splitkv4,
+        "cuda_v4_splitkv": _cuda_v4_splitkv,
+        "cuda_v4_fused": _cuda_v4_fused,
         "sdpa_enable_gqa_mask": lambda q, k, v, attention_mask, scaling, num_key_value_groups, _cache_position: _sdpa_gqa_mask(
             q, k, v, attention_mask, scaling, num_key_value_groups
         ),

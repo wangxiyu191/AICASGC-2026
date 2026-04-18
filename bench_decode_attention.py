@@ -451,6 +451,71 @@ def _cuda_v4_cta_qhead_w8(q, k, v, attention_mask, scaling, num_key_value_groups
     return out
 
 
+def _cuda_v4_cta_qhead_w6(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position):
+    out = cuda_decode_attention.decode_attn_v4_cta_qhead(
+        q, k, v, scaling, num_key_value_groups, cache_position, warps_per_cta=6,
+    )
+    if out is None:
+        raise RuntimeError("CUDA v4 CTA-qhead-w6 attention returned None")
+    return out
+
+
+def _cuda_v4_cta_qhead_w12(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position):
+    out = cuda_decode_attention.decode_attn_v4_cta_qhead(
+        q, k, v, scaling, num_key_value_groups, cache_position, warps_per_cta=12,
+    )
+    if out is None:
+        raise RuntimeError("CUDA v4 CTA-qhead-w12 attention returned None")
+    return out
+
+
+def _cuda_v4_cta_qhead_w12_contig(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position):
+    out = cuda_decode_attention.decode_attn_v4_cta_qhead(
+        q,
+        k,
+        v,
+        scaling,
+        num_key_value_groups,
+        cache_position,
+        warps_per_cta=12,
+        lane_layout=1,
+    )
+    if out is None:
+        raise RuntimeError("CUDA v4 CTA-qhead-w12-contig attention returned None")
+    return out
+
+
+def _cuda_v4_cta_qhead_w12_g8(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position):
+    out = cuda_decode_attention.decode_attn_v4_cta_qhead(
+        q,
+        k,
+        v,
+        scaling,
+        num_key_value_groups,
+        cache_position,
+        warps_per_cta=12,
+        lane_layout=2,
+    )
+    if out is None:
+        raise RuntimeError("CUDA v4 CTA-qhead-w12-g8 attention returned None")
+    return out
+
+
+def _cuda_v4_cta_qhead_splitkv4(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position):
+    out = cuda_decode_attention.decode_attn_v4_cta_qhead_splitkv_fused(
+        q,
+        k,
+        v,
+        scaling,
+        num_key_value_groups,
+        cache_position,
+        split_k=4,
+    )
+    if out is None:
+        raise RuntimeError("CUDA v4 CTA-qhead-splitkv4-fused attention returned None")
+    return out
+
+
 def _cuda_v4_cta_qhead_w8_contig(q, k, v, attention_mask, scaling, num_key_value_groups, cache_position):
     out = cuda_decode_attention.decode_attn_v4_cta_qhead(
         q,
@@ -709,7 +774,12 @@ def _run_benchmarks(
         "cuda_v4_fused": _cuda_v4_fused,
         "cuda_v4_cta_local": _cuda_v4_cta_local,
         "cuda_v4_cta_qhead": _cuda_v4_cta_qhead,
+        "cuda_v4_cta_qhead_w6": _cuda_v4_cta_qhead_w6,
         "cuda_v4_cta_qhead_w8": _cuda_v4_cta_qhead_w8,
+        "cuda_v4_cta_qhead_w12": _cuda_v4_cta_qhead_w12,
+        "cuda_v4_cta_qhead_w12_contig": _cuda_v4_cta_qhead_w12_contig,
+        "cuda_v4_cta_qhead_w12_g8": _cuda_v4_cta_qhead_w12_g8,
+        "cuda_v4_cta_qhead_splitkv4": _cuda_v4_cta_qhead_splitkv4,
         "cuda_v4_cta_qhead_w8_contig": _cuda_v4_cta_qhead_w8_contig,
         "cuda_v4_cta_qhead_w8_g8": _cuda_v4_cta_qhead_w8_g8,
         "cuda_v4_cta_qhead_w16": _cuda_v4_cta_qhead_w16,

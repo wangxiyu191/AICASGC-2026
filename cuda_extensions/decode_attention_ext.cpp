@@ -121,6 +121,19 @@ torch::Tensor decode_attn_v4_cta_qhead_cuda(
     int64_t prefetch_mode,
     int64_t merge_mode);
 
+torch::Tensor decode_attn_v4_cta_qhead_splitkv_fused_cuda(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const torch::Tensor& cache_position,
+    double scale,
+    const torch::Tensor& partial_acc,
+    const torch::Tensor& partial_stats,
+    const torch::Tensor& out,
+    const torch::Tensor& done_count,
+    int64_t num_kv_groups,
+    int64_t split_k);
+
 torch::Tensor decode_attn_v4_splitkv(
     const torch::Tensor& q,
     const torch::Tensor& k,
@@ -188,6 +201,23 @@ torch::Tensor decode_attn_v4_cta_qhead(
         q, k, v, cache_position, scale, out, num_kv_groups, warps_per_cta, lane_layout, prefetch_mode, merge_mode);
 }
 
+torch::Tensor decode_attn_v4_cta_qhead_splitkv_fused(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const torch::Tensor& cache_position,
+    double scale,
+    const torch::Tensor& partial_acc,
+    const torch::Tensor& partial_stats,
+    const torch::Tensor& out,
+    const torch::Tensor& done_count,
+    int64_t num_kv_groups,
+    int64_t split_k) {
+    return decode_attn_v4_cta_qhead_splitkv_fused_cuda(
+        q, k, v, cache_position, scale,
+        partial_acc, partial_stats, out, done_count, num_kv_groups, split_k);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("grouped_prefix_cachepos_splitkv", &grouped_prefix_cachepos_splitkv);
     m.def("grouped_prefix_cachepos_splitkv_qhead", &grouped_prefix_cachepos_splitkv_qhead);
@@ -195,4 +225,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("decode_attn_v4_fused", &decode_attn_v4_fused);
     m.def("decode_attn_v4_cta_local", &decode_attn_v4_cta_local);
     m.def("decode_attn_v4_cta_qhead", &decode_attn_v4_cta_qhead);
+    m.def("decode_attn_v4_cta_qhead_splitkv_fused", &decode_attn_v4_cta_qhead_splitkv_fused);
 }

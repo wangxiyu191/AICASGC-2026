@@ -484,3 +484,75 @@ def decode_attn_v4_cta_qhead(
         int(merge_mode),
     )
     return out.unsqueeze(2).transpose(1, 2)
+
+
+def decode_attn_v4_cta_qhead_splitkv_fused(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scaling: float,
+    num_key_value_groups: int,
+    cache_position: torch.Tensor,
+    split_k: int = 4,
+    workspace: dict | None = None,
+) -> torch.Tensor | None:
+    if (
+        num_key_value_groups != 2
+        or split_k <= 1
+        or q.device.type != "cuda"
+        or k.device.type != "cuda"
+        or v.device.type != "cuda"
+        or cache_position.device.type != "cuda"
+        or q.shape[0] != 1
+        or q.shape[2] != 1
+        or q.shape[-1] != 128
+        or q.dtype != torch.float16
+        or k.dtype != torch.float16
+        or v.dtype != torch.float16
+        or k.shape[1] * num_key_value_groups != q.shape[1]
+    ):
+        return None
+
+    layout = _qhead_workspace_layout(
+        num_heads=q.shape[1],
+        head_dim=q.shape[-1],
+        split_k=split_k,
+    )
+    if (
+        workspace is not None
+        and workspace.get("split_k", 0) >= split_k
+        and workspace["partial_acc"].shape[0] == layout["partial_acc_shape"][0]
+        and workspace["partial_acc"].shape[2:] == layout["partial_acc_shape"][2:]
+        and workspace["partial_stats"].shape[0] == layout["partial_stats_shape"][0]
+        and workspace["partial_stats"].shape[2:] == layout["partial_stats_shape"][2:]
+        and tuple(workspace["out"].shape) == layout["out_shape"]
+        and workspace["out"].dtype == q.dtype
+        and workspace["partial_acc"].device == q.device
+        and "done_count" in workspace
+        and workspace["done_count"].shape[0] >= q.shape[1]
+    ):
+        partial_acc = workspace["partial_acc"]
+        partial_stats = workspace["partial_stats"]
+        out = workspace["out"]
+        done_count = workspace["done_count"]
+    else:
+        partial_acc = torch.empty(layout["partial_acc_shape"], dtype=torch.float32, device=q.device)
+        partial_stats = torch.empty(layout["partial_stats_shape"], dtype=torch.float32, device=q.device)
+        out = torch.empty(layout["out_shape"], dtype=q.dtype, device=q.device)
+        done_count = torch.zeros(q.shape[1], dtype=torch.int32, device=q.device)
+
+    ext = _load_ext()
+    ext.decode_attn_v4_cta_qhead_splitkv_fused(
+        q,
+        k,
+        v,
+        cache_position,
+        float(scaling),
+        partial_acc,
+        partial_stats,
+        out,
+        done_count,
+        int(num_key_value_groups),
+        int(split_k),
+    )
+    return out.unsqueeze(2).transpose(1, 2)

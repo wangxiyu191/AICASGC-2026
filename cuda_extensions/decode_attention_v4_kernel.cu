@@ -30,7 +30,9 @@ constexpr int kQHeadsPerKV  = 2;
 constexpr int kCTALocalWarpsPerQHead = 4;
 constexpr int kCTALocalWarps = kQHeadsPerKV * kCTALocalWarpsPerQHead;
 constexpr int kCTAQHeadWarpsDefault = 4;
+constexpr int kCTAQHeadWarpsMid = 6;
 constexpr int kCTAQHeadWarpsWide = 8;
+constexpr int kCTAQHeadWarpsTall = 12;
 constexpr int kCTAQHeadWarpsXL = 16;
 constexpr int kThreadGroupWide  = 8;
 constexpr int kGroupsPerWarpWide = kWarpSize / kThreadGroupWide; // 4
@@ -126,6 +128,19 @@ __device__ __forceinline__ void load_half4_vec(
     x1 = __half2float(h[1]);
     x2 = __half2float(h[2]);
     x3 = __half2float(h[3]);
+}
+
+__device__ __forceinline__ float4 regroup_acc_to_float4(
+    const float* acc,
+    int lane) {
+    const int src_lane = lane >> 3;
+    const int src_base = (lane & 7) * 4;
+    float4 packed;
+    packed.x = __shfl_sync(0xffffffff, acc[src_base + 0], src_lane);
+    packed.y = __shfl_sync(0xffffffff, acc[src_base + 1], src_lane);
+    packed.z = __shfl_sync(0xffffffff, acc[src_base + 2], src_lane);
+    packed.w = __shfl_sync(0xffffffff, acc[src_base + 3], src_lane);
+    return packed;
 }
 
 // ---------------------------------------------------------------------------
@@ -622,6 +637,277 @@ decode_attn_v4_fused_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// CTA-qhead split-K fused prototype: deeper grid over q-head * split_k
+// ---------------------------------------------------------------------------
+template <int WarpsPerCTA>
+__global__ void __launch_bounds__(WarpsPerCTA * kWarpSize)
+decode_attn_v4_cta_qhead_splitkv_fused_kernel(
+    const __half* __restrict__ q,
+    const __half* __restrict__ k,
+    const __half* __restrict__ v,
+    const int64_t* __restrict__ cache_position,
+    float* __restrict__ partial_acc,
+    float* __restrict__ partial_stats,
+    __half* __restrict__ out,
+    int* __restrict__ done_count,
+    int64_t q_stride_h,
+    int64_t k_stride_h, int64_t k_stride_s,
+    int64_t v_stride_h, int64_t v_stride_s,
+    int64_t pa_stride_h, int64_t pa_stride_split,
+    int64_t ps_stride_h, int64_t ps_stride_split, int64_t ps_stride_stat,
+    int64_t out_stride_h,
+    float scale,
+    int max_seq_len,
+    int num_kv_groups,
+    int split_k) {
+
+    const int linear_block_idx = blockIdx.x;
+    const int q_head_idx = linear_block_idx / split_k;
+    const int split_idx = linear_block_idx - q_head_idx * split_k;
+    const int kv_head_idx = q_head_idx / num_kv_groups;
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+    const int shard_idx = warp_id;
+    const int group_id = lane / kThreadGroup;
+    const int group_lane = lane % kThreadGroup;
+    const int dim_offset = group_lane * kDimsPerThread;
+    const int valid_len = min(static_cast<int>(cache_position[0] + 1), max_seq_len);
+
+    __shared__ float s_partial_acc[WarpsPerCTA][kHeadDim];
+    __shared__ float s_partial_l[WarpsPerCTA];
+    __shared__ float s_partial_m[WarpsPerCTA];
+    __shared__ int s_is_last;
+
+    const int chunk_size = (valid_len + split_k - 1) / split_k;
+    const int chunk_start = split_idx * chunk_size;
+    const int chunk_end = min(chunk_start + chunk_size, valid_len);
+
+    float m_val = kNegLarge;
+    float l_val = 0.0f;
+    float acc[kDimsPerThread];
+    #pragma unroll
+    for (int i = 0; i < kDimsPerThread; ++i) {
+        acc[i] = 0.0f;
+    }
+
+    if (chunk_start < chunk_end) {
+        const int chunk_len = chunk_end - chunk_start;
+        const int shard_size = (chunk_len + WarpsPerCTA - 1) / WarpsPerCTA;
+        const int shard_start = chunk_start + shard_idx * shard_size;
+        const int shard_end = min(shard_start + shard_size, chunk_end);
+
+        if (shard_start < shard_end) {
+            float q_reg[kDimsPerThread];
+            const __half* qp = q + q_head_idx * q_stride_h + dim_offset;
+            #pragma unroll
+            for (int i = 0; i < kDimsPerThread; i += 8) {
+                uint4 d = __ldg(reinterpret_cast<const uint4*>(qp + i));
+                const __half* h = reinterpret_cast<const __half*>(&d);
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    q_reg[i + j] = __half2float(h[j]);
+                }
+            }
+
+            const __half* k_base = k + kv_head_idx * k_stride_h;
+            const __half* v_base = v + kv_head_idx * v_stride_h;
+
+            for (int tile_start = shard_start; tile_start < shard_end; tile_start += kTileN) {
+                const int tile_end = min(tile_start + kTileN, shard_end);
+                float local_scores[kTileSteps];
+                float tile_max = kNegLarge;
+
+                #pragma unroll
+                for (int step = 0; step < kTileSteps; ++step) {
+                    const int t_global = tile_start + step * kGroupsPerWarp + group_id;
+                    const bool valid = (t_global < tile_end);
+
+                    float dot = 0.0f;
+                    if (valid) {
+                        const __half* kp = k_base + t_global * k_stride_s + dim_offset;
+                        #pragma unroll
+                        for (int i = 0; i < kDimsPerThread; i += 8) {
+                            uint4 d = __ldg(reinterpret_cast<const uint4*>(kp + i));
+                            const __half* h = reinterpret_cast<const __half*>(&d);
+                            #pragma unroll
+                            for (int j = 0; j < 8; ++j) {
+                                dot += q_reg[i + j] * __half2float(h[j]);
+                            }
+                        }
+                    }
+                    dot += __shfl_xor_sync(0xffffffff, dot, 1);
+                    dot += __shfl_xor_sync(0xffffffff, dot, 2);
+
+                    const float score = valid ? (dot * scale) : kNegLarge;
+                    local_scores[step] = score;
+                    tile_max = fmaxf(tile_max, score);
+                }
+
+                tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 4));
+                tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 8));
+                tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 16));
+
+                const float new_m = fmaxf(m_val, tile_max);
+                const float alpha = expf(m_val - new_m);
+                #pragma unroll
+                for (int i = 0; i < kDimsPerThread; ++i) {
+                    acc[i] *= alpha;
+                }
+                l_val *= alpha;
+                m_val = new_m;
+
+                #pragma unroll
+                for (int step = 0; step < kTileSteps; ++step) {
+                    const int t_global = tile_start + step * kGroupsPerWarp + group_id;
+                    const bool valid = (t_global < tile_end);
+                    if (!valid) {
+                        continue;
+                    }
+
+                    const float p = expf(local_scores[step] - m_val);
+                    l_val += p;
+                    const __half* vp = v_base + t_global * v_stride_s + dim_offset;
+                    #pragma unroll
+                    for (int i = 0; i < kDimsPerThread; i += 8) {
+                        uint4 d = __ldg(reinterpret_cast<const uint4*>(vp + i));
+                        const __half* h = reinterpret_cast<const __half*>(&d);
+                        #pragma unroll
+                        for (int j = 0; j < 8; ++j) {
+                            acc[i + j] += p * __half2float(h[j]);
+                        }
+                    }
+                }
+            }
+
+            #pragma unroll
+            for (int xor_mask = kThreadGroup; xor_mask < kWarpSize; xor_mask <<= 1) {
+                const float pm = __shfl_xor_sync(0xffffffff, m_val, xor_mask);
+                const float pl = __shfl_xor_sync(0xffffffff, l_val, xor_mask);
+                const float nm = fmaxf(m_val, pm);
+                const float s_me = expf(m_val - nm);
+                const float s_pa = expf(pm - nm);
+                #pragma unroll
+                for (int i = 0; i < kDimsPerThread; ++i) {
+                    const float pa = __shfl_xor_sync(0xffffffff, acc[i], xor_mask);
+                    acc[i] = acc[i] * s_me + pa * s_pa;
+                }
+                l_val = l_val * s_me + pl * s_pa;
+                m_val = nm;
+            }
+        }
+    }
+
+    if (group_id == 0) {
+        float* sm_acc = &s_partial_acc[shard_idx][dim_offset];
+        #pragma unroll
+        for (int i = 0; i < kDimsPerThread; ++i) {
+            sm_acc[i] = acc[i];
+        }
+        if (group_lane == 0) {
+            s_partial_l[shard_idx] = l_val;
+            s_partial_m[shard_idx] = m_val;
+        }
+    }
+
+    __syncthreads();
+
+    if (warp_id == 0) {
+        const int merge_dim = lane * 4;
+        float m_merge = kNegLarge;
+        float l_merge = 0.0f;
+        float a0 = 0.0f;
+        float a1 = 0.0f;
+        float a2 = 0.0f;
+        float a3 = 0.0f;
+
+        #pragma unroll
+        for (int s = 0; s < WarpsPerCTA; ++s) {
+            const float lv = s_partial_l[s];
+            const float mv = s_partial_m[s];
+            const float nm = fmaxf(m_merge, mv);
+            const float s_old = expf(m_merge - nm);
+            const float s_new = expf(mv - nm);
+
+            const float* pv = &s_partial_acc[s][merge_dim];
+            a0 = a0 * s_old + pv[0] * s_new;
+            a1 = a1 * s_old + pv[1] * s_new;
+            a2 = a2 * s_old + pv[2] * s_new;
+            a3 = a3 * s_old + pv[3] * s_new;
+            l_merge = l_merge * s_old + lv * s_new;
+            m_merge = nm;
+        }
+
+        float* pa = partial_acc + q_head_idx * pa_stride_h + split_idx * pa_stride_split + merge_dim;
+        *reinterpret_cast<float4*>(pa) = make_float4(a0, a1, a2, a3);
+        if (lane == 0) {
+            float* ps = partial_stats + q_head_idx * ps_stride_h + split_idx * ps_stride_split;
+            ps[0] = l_merge;
+            ps[ps_stride_stat] = m_merge;
+        }
+    }
+
+    __threadfence();
+    __syncthreads();
+
+    if (tid == 0) {
+        const int arrived = atomicAdd(&done_count[q_head_idx], 1);
+        s_is_last = (arrived == split_k - 1) ? 1 : 0;
+    }
+    __syncthreads();
+
+    if (!s_is_last) {
+        return;
+    }
+
+    if (tid == 0) {
+        done_count[q_head_idx] = 0;
+    }
+    __threadfence();
+
+    if (warp_id != 0) {
+        return;
+    }
+
+    const int merge_dim = lane * 4;
+    float m_merge = kNegLarge;
+    float l_merge = 0.0f;
+    float a0 = 0.0f;
+    float a1 = 0.0f;
+    float a2 = 0.0f;
+    float a3 = 0.0f;
+
+    for (int s = 0; s < split_k; ++s) {
+        const int64_t ps_base = q_head_idx * ps_stride_h + s * ps_stride_split;
+        const int64_t pa_base = q_head_idx * pa_stride_h + s * pa_stride_split;
+
+        const float lv = partial_stats[ps_base];
+        const float mv = partial_stats[ps_base + ps_stride_stat];
+        const float nm = fmaxf(m_merge, mv);
+        const float s_old = expf(m_merge - nm);
+        const float s_new = expf(mv - nm);
+        const float4 pv = *reinterpret_cast<const float4*>(partial_acc + pa_base + merge_dim);
+
+        a0 = a0 * s_old + pv.x * s_new;
+        a1 = a1 * s_old + pv.y * s_new;
+        a2 = a2 * s_old + pv.z * s_new;
+        a3 = a3 * s_old + pv.w * s_new;
+        l_merge = l_merge * s_old + lv * s_new;
+        m_merge = nm;
+    }
+
+    __half* out_ptr = out + q_head_idx * out_stride_h + merge_dim;
+    if (l_merge > 0.0f) {
+        const float inv_l = __fdividef(1.0f, l_merge);
+        *reinterpret_cast<__half2*>(out_ptr) = __floats2half2_rn(a0 * inv_l, a1 * inv_l);
+        *reinterpret_cast<__half2*>(out_ptr + 2) = __floats2half2_rn(a2 * inv_l, a3 * inv_l);
+    } else {
+        *reinterpret_cast<__half2*>(out_ptr) = __float2half2_rn(0.0f);
+        *reinterpret_cast<__half2*>(out_ptr + 2) = __float2half2_rn(0.0f);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CTA-local experiment: one CTA owns one KV head, does intra-CTA shard merge
 // ---------------------------------------------------------------------------
 __global__ void __launch_bounds__(kCTALocalWarps * kWarpSize)
@@ -852,7 +1138,7 @@ decode_attn_v4_cta_qhead_kernel(
     const int dim_offset = group_lane * kDimsPerThread;
     const int valid_len = min(static_cast<int>(cache_position[0] + 1), max_seq_len);
 
-    __shared__ float s_partial_acc[WarpsPerCTA][kHeadDim];
+    __shared__ __align__(16) float s_partial_acc[WarpsPerCTA][kHeadDim];
     __shared__ float s_partial_l[WarpsPerCTA];
     __shared__ float s_partial_m[WarpsPerCTA];
 
@@ -989,13 +1275,11 @@ decode_attn_v4_cta_qhead_kernel(
         }
     }
 
-    if (group_id == 0) {
-        float* sm_acc = &s_partial_acc[shard_idx][dim_offset];
-        #pragma unroll
-        for (int i = 0; i < kDimsPerThread; ++i) {
-            sm_acc[i] = acc[i];
-        }
-        if (group_lane == 0) {
+    {
+        const int packed_dim = lane * 4;
+        float* sm_acc = &s_partial_acc[shard_idx][packed_dim];
+        *reinterpret_cast<float4*>(sm_acc) = regroup_acc_to_float4(acc, lane);
+        if (lane == 0) {
             s_partial_l[shard_idx] = l_val;
             s_partial_m[shard_idx] = m_val;
         }
@@ -1143,7 +1427,7 @@ decode_attn_v4_cta_qhead_cpasync_k_kernel(
     const int valid_len = min(static_cast<int>(cache_position[0] + 1), max_seq_len);
 
     __shared__ __align__(16) __half s_k_stage[WarpsPerCTA][2][kStepElems];
-    __shared__ float s_partial_acc[WarpsPerCTA][kHeadDim];
+    __shared__ __align__(16) float s_partial_acc[WarpsPerCTA][kHeadDim];
     __shared__ float s_partial_l[WarpsPerCTA];
     __shared__ float s_partial_m[WarpsPerCTA];
 
@@ -1307,13 +1591,11 @@ decode_attn_v4_cta_qhead_cpasync_k_kernel(
         }
     }
 
-    if (group_id == 0) {
-        float* sm_acc = &s_partial_acc[shard_idx][dim_offset];
-        #pragma unroll
-        for (int i = 0; i < kDimsPerThread; ++i) {
-            sm_acc[i] = acc[i];
-        }
-        if (group_lane == 0) {
+    {
+        const int packed_dim = lane * 4;
+        float* sm_acc = &s_partial_acc[shard_idx][packed_dim];
+        *reinterpret_cast<float4*>(sm_acc) = regroup_acc_to_float4(acc, lane);
+        if (lane == 0) {
             s_partial_l[shard_idx] = l_val;
             s_partial_m[shard_idx] = m_val;
         }
@@ -1966,9 +2248,11 @@ torch::Tensor decode_attn_v4_cta_qhead_cuda(
     TORCH_CHECK(num_kv_groups == kQHeadsPerKV, "CTA-qhead kernel currently requires num_kv_groups == 2");
     TORCH_CHECK(
         warps_per_cta == kCTAQHeadWarpsDefault
+            || warps_per_cta == kCTAQHeadWarpsMid
             || warps_per_cta == kCTAQHeadWarpsWide
+            || warps_per_cta == kCTAQHeadWarpsTall
             || warps_per_cta == kCTAQHeadWarpsXL,
-        "CTA-qhead kernel currently supports warps_per_cta in {4, 8, 16}");
+        "CTA-qhead kernel currently supports warps_per_cta in {4, 6, 8, 12, 16}");
     TORCH_CHECK(lane_layout == 0 || lane_layout == 1 || lane_layout == 2,
         "CTA-qhead kernel currently supports lane_layout in {0=grouped, 1=contig, 2=group8}");
     TORCH_CHECK(prefetch_mode == 0 || prefetch_mode == 1 || prefetch_mode == 2 || prefetch_mode == 3,
@@ -1981,6 +2265,12 @@ torch::Tensor decode_attn_v4_cta_qhead_cuda(
         "CTA-qhead kernel currently supports merge_mode in {0=warp0-serial, 1=4warp-parallel, 2=2warp-parallel}");
     TORCH_CHECK(merge_mode == 0 || (lane_layout == 0 && prefetch_mode == 0),
         "CTA-qhead merge_mode!=0 is currently only supported for lane_layout=0 and prefetch_mode=0");
+    TORCH_CHECK(
+        warps_per_cta != kCTAQHeadWarpsMid || (lane_layout == 0 && prefetch_mode == 0 && merge_mode == 0),
+        "CTA-qhead warps_per_cta=6 currently only supports lane_layout=0, prefetch_mode=0, merge_mode=0");
+    TORCH_CHECK(
+        warps_per_cta != kCTAQHeadWarpsTall || (prefetch_mode == 0 && merge_mode == 0),
+        "CTA-qhead warps_per_cta=12 currently only supports prefetch_mode=0 and merge_mode=0");
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && out.is_cuda(), "inputs must be CUDA");
     TORCH_CHECK(cache_position.is_cuda() && cache_position.scalar_type() == torch::kLong,
                 "cache_position must be CUDA int64");
@@ -2087,6 +2377,22 @@ torch::Tensor decode_attn_v4_cta_qhead_cuda(
                 static_cast<int>(max_seq_len),
                 static_cast<int>(num_kv_groups));
         }
+    } else if (warps_per_cta == kCTAQHeadWarpsMid) {
+        decode_attn_v4_cta_qhead_kernel<kCTAQHeadWarpsMid, 0><<<
+            num_q_heads, kCTAQHeadWarpsMid * kWarpSize, 0, stream>>>(
+            reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
+            reinterpret_cast<const __half*>(k.data_ptr<at::Half>()),
+            reinterpret_cast<const __half*>(v.data_ptr<at::Half>()),
+            cache_position.data_ptr<int64_t>(),
+            reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+            q.stride(1),
+            k.stride(1), k.stride(2),
+            v.stride(1), v.stride(2),
+            out.stride(1),
+            static_cast<float>(scale),
+            static_cast<int>(max_seq_len),
+            static_cast<int>(num_kv_groups),
+            0);
     } else if (warps_per_cta == kCTAQHeadWarpsWide) {
         if (lane_layout == 0) {
             if (prefetch_mode == 0) {
@@ -2171,6 +2477,54 @@ torch::Tensor decode_attn_v4_cta_qhead_cuda(
         } else {
             decode_attn_v4_cta_qhead_group8_kernel<kCTAQHeadWarpsWide><<<
                 num_q_heads, kCTAQHeadWarpsWide * kWarpSize, 0, stream>>>(
+                reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
+                reinterpret_cast<const __half*>(k.data_ptr<at::Half>()),
+                reinterpret_cast<const __half*>(v.data_ptr<at::Half>()),
+                cache_position.data_ptr<int64_t>(),
+                reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+                q.stride(1),
+                k.stride(1), k.stride(2),
+                v.stride(1), v.stride(2),
+                out.stride(1),
+                static_cast<float>(scale),
+                static_cast<int>(max_seq_len),
+                static_cast<int>(num_kv_groups));
+        }
+    } else if (warps_per_cta == kCTAQHeadWarpsTall) {
+        if (lane_layout == 0) {
+            decode_attn_v4_cta_qhead_kernel<kCTAQHeadWarpsTall, 0><<<
+                num_q_heads, kCTAQHeadWarpsTall * kWarpSize, 0, stream>>>(
+                reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
+                reinterpret_cast<const __half*>(k.data_ptr<at::Half>()),
+                reinterpret_cast<const __half*>(v.data_ptr<at::Half>()),
+                cache_position.data_ptr<int64_t>(),
+                reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+                q.stride(1),
+                k.stride(1), k.stride(2),
+                v.stride(1), v.stride(2),
+                out.stride(1),
+                static_cast<float>(scale),
+                static_cast<int>(max_seq_len),
+                static_cast<int>(num_kv_groups),
+                0);
+        } else if (lane_layout == 1) {
+            decode_attn_v4_cta_qhead_contig_kernel<kCTAQHeadWarpsTall><<<
+                num_q_heads, kCTAQHeadWarpsTall * kWarpSize, 0, stream>>>(
+                reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
+                reinterpret_cast<const __half*>(k.data_ptr<at::Half>()),
+                reinterpret_cast<const __half*>(v.data_ptr<at::Half>()),
+                cache_position.data_ptr<int64_t>(),
+                reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+                q.stride(1),
+                k.stride(1), k.stride(2),
+                v.stride(1), v.stride(2),
+                out.stride(1),
+                static_cast<float>(scale),
+                static_cast<int>(max_seq_len),
+                static_cast<int>(num_kv_groups));
+        } else {
+            decode_attn_v4_cta_qhead_group8_kernel<kCTAQHeadWarpsTall><<<
+                num_q_heads, kCTAQHeadWarpsTall * kWarpSize, 0, stream>>>(
                 reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
                 reinterpret_cast<const __half*>(k.data_ptr<at::Half>()),
                 reinterpret_cast<const __half*>(v.data_ptr<at::Half>()),
@@ -2271,5 +2625,81 @@ torch::Tensor decode_attn_v4_cta_qhead_cuda(
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
+    return out;
+}
+
+torch::Tensor decode_attn_v4_cta_qhead_splitkv_fused_cuda(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const torch::Tensor& cache_position,
+    double scale,
+    const torch::Tensor& partial_acc,
+    const torch::Tensor& partial_stats,
+    const torch::Tensor& out,
+    const torch::Tensor& done_count,
+    int64_t num_kv_groups,
+    int64_t split_k) {
+
+    TORCH_CHECK(num_kv_groups == kQHeadsPerKV, "CTA-qhead splitkv kernel currently requires num_kv_groups == 2");
+    TORCH_CHECK(split_k > 1, "split_k must be > 1");
+    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && out.is_cuda(), "inputs must be CUDA");
+    TORCH_CHECK(cache_position.is_cuda() && cache_position.scalar_type() == torch::kLong,
+                "cache_position must be CUDA int64");
+    TORCH_CHECK(q.scalar_type() == torch::kHalf, "only float16");
+    TORCH_CHECK(k.scalar_type() == torch::kHalf && v.scalar_type() == torch::kHalf, "k/v must be float16");
+    TORCH_CHECK(out.scalar_type() == torch::kHalf, "out must be float16");
+    TORCH_CHECK(partial_acc.is_cuda() && partial_acc.scalar_type() == torch::kFloat,
+                "partial_acc must be CUDA float32");
+    TORCH_CHECK(partial_stats.is_cuda() && partial_stats.scalar_type() == torch::kFloat,
+                "partial_stats must be CUDA float32");
+    TORCH_CHECK(done_count.is_cuda() && done_count.scalar_type() == torch::kInt32,
+                "done_count must be CUDA int32");
+    TORCH_CHECK(q.size(0) == 1 && q.size(2) == 1, "q must be [1, H, 1, D]");
+    TORCH_CHECK(q.size(3) == kHeadDim, "head_dim must be 128");
+    TORCH_CHECK(k.size(0) == 1 && v.size(0) == 1, "k/v batch must be 1");
+    TORCH_CHECK(k.size(1) == v.size(1), "k/v head mismatch");
+    TORCH_CHECK(k.size(2) == v.size(2), "k/v seq mismatch");
+    TORCH_CHECK(k.size(3) == kHeadDim && v.size(3) == kHeadDim, "k/v head_dim must be 128");
+    TORCH_CHECK(q.size(1) == k.size(1) * num_kv_groups, "q heads must equal kv_heads * num_kv_groups");
+    TORCH_CHECK(out.dim() == 3 && out.size(0) == 1, "out must be [1, H, D]");
+    TORCH_CHECK(out.size(1) == q.size(1) && out.size(2) == kHeadDim, "out shape mismatch");
+    TORCH_CHECK(partial_acc.dim() == 3, "partial_acc must be [H, split_k, D]");
+    TORCH_CHECK(partial_stats.dim() == 3, "partial_stats must be [H, split_k, 2]");
+    TORCH_CHECK(partial_acc.size(0) == q.size(1) && partial_acc.size(2) == kHeadDim,
+                "partial_acc shape mismatch");
+    TORCH_CHECK(partial_stats.size(0) == q.size(1) && partial_stats.size(2) == 2,
+                "partial_stats shape mismatch");
+    TORCH_CHECK(split_k <= partial_acc.size(1), "split_k exceeds partial_acc capacity");
+    TORCH_CHECK(split_k <= partial_stats.size(1), "split_k exceeds partial_stats capacity");
+    TORCH_CHECK(done_count.numel() >= q.size(1), "done_count too small");
+
+    const int64_t num_q_heads = q.size(1);
+    const int64_t max_seq_len = k.size(2);
+
+    c10::cuda::CUDAGuard device_guard(q.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    decode_attn_v4_cta_qhead_splitkv_fused_kernel<kCTAQHeadWarpsTall><<<
+        num_q_heads * split_k, kCTAQHeadWarpsTall * kWarpSize, 0, stream>>>(
+        reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(k.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(v.data_ptr<at::Half>()),
+        cache_position.data_ptr<int64_t>(),
+        partial_acc.data_ptr<float>(),
+        partial_stats.data_ptr<float>(),
+        reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+        done_count.data_ptr<int>(),
+        q.stride(1),
+        k.stride(1), k.stride(2),
+        v.stride(1), v.stride(2),
+        partial_acc.stride(0), partial_acc.stride(1),
+        partial_stats.stride(0), partial_stats.stride(1), partial_stats.stride(2),
+        out.stride(1),
+        static_cast<float>(scale),
+        static_cast<int>(max_seq_len),
+        static_cast<int>(num_kv_groups),
+        static_cast<int>(split_k));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
