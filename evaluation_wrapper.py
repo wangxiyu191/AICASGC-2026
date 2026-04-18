@@ -37,7 +37,12 @@ os.environ.setdefault("ENABLE_CUDA_FUSED_RMSNORM_QKV", "1")
 os.environ.setdefault("ENABLE_CUDA_FUSED_GATEUP_SILU_DOWNPROJ", "1")
 os.environ.setdefault("CUDA_FUSED_GATEUP_SILU_DOWNPROJ_VARIANT", "persistent")
 
-from optimized_layer import replace_decoder_layers, set_small_decode_triton_enabled, fused_vision_rope
+from optimized_layer import (
+    PrefillFastpathContext,
+    replace_decoder_layers,
+    set_small_decode_triton_enabled,
+    fused_vision_rope,
+)
 
 
 _ENABLE_PREFILL_VISION_GRID_CACHE = os.environ.get("ENABLE_PREFILL_VISION_GRID_CACHE", "1") == "1"
@@ -1894,16 +1899,28 @@ class VLMModel:
                     layer_fastpaths = getattr(this_text_model, "_prefill_layer_fastpaths", None)
                     deepstack_process = this_text_model._deepstack_process
                     deepstack_count = 0 if deepstack_visual_embeds is None else len(deepstack_visual_embeds)
+                    fastpath_ctx = None
+                    if layer_fastpaths is not None:
+                        cos, sin = position_embeddings
+                        fastpath_ctx = PrefillFastpathContext(
+                            position_embeddings=position_embeddings,
+                            past_key_values=past_key_values,
+                            cache_position=cache_position,
+                            cache_kwargs=(
+                                None
+                                if past_key_values is None
+                                else {
+                                    "sin": sin.unsqueeze(1),
+                                    "cos": cos.unsqueeze(1),
+                                    "cache_position": cache_position,
+                                }
+                            ),
+                        )
 
                     with attn_ctx:
                         if layer_fastpaths is not None:
                             for layer_idx, fast_forward in enumerate(layer_fastpaths):
-                                hidden_states = fast_forward(
-                                    hidden_states,
-                                    position_embeddings,
-                                    past_key_values,
-                                    cache_position,
-                                )
+                                hidden_states = fast_forward(hidden_states, fastpath_ctx)
                                 if layer_idx < deepstack_count:
                                     hidden_states = deepstack_process(
                                         hidden_states,

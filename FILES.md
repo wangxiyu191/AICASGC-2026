@@ -39,6 +39,8 @@ AICAS 2026 竞赛项目 — Qwen3-VL-2B-Instruct 推理优化。
 | [summarize_sequential_stride_mapping_findings.py](./summarize_sequential_stride_mapping_findings.py) | 从现有 sequential-stride 结果 JSON 自动生成 Markdown 结论文档，汇总 `1MiB` / `128MiB` / chunk-regime 三层发现 |
 | [bench_decode_layer_chain.py](./bench_decode_layer_chain.py) | 单层 decode chain CUDAGraph microbenchmark（含 viztrace 集成） |
 | [bench_prefill.py](./bench_prefill.py) | 真实路径 prefill forward benchmark（host/GPU 双计时，支持 bucketed cache 与 viztrace） |
+| [bench_prefill_attention.py](./bench_prefill_attention.py) | 真实路径 text prefill attention backend microbenchmark（抓取单层 q/k/v，对比 current/SDPA auto/forced backend） |
+| [bench_prefill_vision_attention.py](./bench_prefill_vision_attention.py) | 真实路径 vision prefill attention backend microbenchmark（抓取单个 vision block 的 q/k/v，对比 current/SDPA auto/forced backend） |
 | [bench_prefill_text_subgraphs.py](./bench_prefill_text_subgraphs.py) | 固定 `seq_len` prefill text 子图 benchmark（attention 保持 eager，仅捕获每层 pre/post 非 attention 段的 CUDAGraph 原型） |
 | [bench_rmsnorm.py](./bench_rmsnorm.py) | RMSNorm microbenchmark |
 | [run_nsys_prefill.py](./run_nsys_prefill.py) | nsys prefill profiler（CUPTI+NVTX，低开销替代 VizTracer） |

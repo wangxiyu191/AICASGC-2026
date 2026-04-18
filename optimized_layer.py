@@ -9,6 +9,7 @@ Replaces HF's Qwen3VLTextDecoderLayer:
 - CUDA Graph-only small-shape Triton fusion: residual+RMSNorm and SiLU*up
 """
 from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 import os
 import torch
 import torch.nn as nn
@@ -16,6 +17,14 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 from transformers.cache_utils import StaticCache, StaticLayer
+
+
+@dataclass(slots=True)
+class PrefillFastpathContext:
+    position_embeddings: tuple[torch.Tensor, torch.Tensor]
+    past_key_values: object
+    cache_position: torch.Tensor
+    cache_kwargs: dict | None
 
 
 class OptimizedDecoderLayer(nn.Module):
@@ -462,28 +471,56 @@ class OptimizedDecoderLayer(nn.Module):
     def prefill_forward_no_mask(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        past_key_values,
-        cache_position: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | PrefillFastpathContext,
+        past_key_values=None,
+        cache_position: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Specialized full-prompt prefill path with fixed calling convention.
 
         This reuses the existing prefill operators but bypasses `nn.Module.__call__`,
         decode-only branches, and dynamic kwargs handling inside `forward()`.
         """
+        cache_kwargs = None
+        if isinstance(position_embeddings, PrefillFastpathContext):
+            fastpath_ctx = position_embeddings
+            position_embeddings = fastpath_ctx.position_embeddings
+            past_key_values = fastpath_ctx.past_key_values
+            cache_position = fastpath_ctx.cache_position
+            cache_kwargs = fastpath_ctx.cache_kwargs
+
+        num_heads = self.num_heads
+        num_kv_heads = self.num_kv_heads
+        head_dim = self.head_dim
+        q_size = self.q_size
+        kv_size = self.kv_size
+        rms_norm_eps = self.rms_norm_eps
+        input_layernorm_weight = self.input_layernorm_weight
+        q_norm_weight = self.q_norm_weight
+        k_norm_weight = self.k_norm_weight
+        qkv_weight = self.qkv_weight
+        attention_interface = self._attention_interface
+        scaling = self.scaling
+        layer_idx = self.layer_idx
+        o_proj_weight = self.o_proj_weight
+        o_proj_bias = self.o_proj_bias
+        post_attn_layernorm_weight = self.post_attn_layernorm_weight
+        gate_up_weight = self.gate_up_weight
+        down_proj_weight = self.down_proj_weight
+        down_proj_bias = self.down_proj_bias
+
         input_shape = hidden_states.shape[:-1]
-        hidden_shape_q = (*input_shape, self.num_heads, self.head_dim)
-        hidden_shape_kv = (*input_shape, self.num_kv_heads, self.head_dim)
+        hidden_shape_q = (*input_shape, num_heads, head_dim)
+        hidden_shape_kv = (*input_shape, num_kv_heads, head_dim)
         residual = hidden_states
 
         hidden_states = _rms_norm(
             hidden_states,
-            self.input_layernorm_weight,
-            self.rms_norm_eps,
+            input_layernorm_weight,
+            rms_norm_eps,
             prefer_small_triton=False,
         )
-        qkv = F.linear(hidden_states, self.qkv_weight)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        qkv = F.linear(hidden_states, qkv_weight)
+        q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
 
         cos, sin = position_embeddings
         q_view = q.view(hidden_shape_q)
@@ -491,9 +528,9 @@ class OptimizedDecoderLayer(nn.Module):
         fused_qk = _fused_qk_rms_norm_rope(
             q_view,
             k_view,
-            self.q_norm_weight,
-            self.k_norm_weight,
-            self.rms_norm_eps,
+            q_norm_weight,
+            k_norm_weight,
+            rms_norm_eps,
             cos,
             sin,
             prefer_small_triton=False,
@@ -501,16 +538,16 @@ class OptimizedDecoderLayer(nn.Module):
         if fused_qk is None:
             q_view = _fused_rms_norm_rope(
                 q_view,
-                self.q_norm_weight,
-                self.rms_norm_eps,
+                q_norm_weight,
+                rms_norm_eps,
                 cos,
                 sin,
                 prefer_small_triton=False,
             )
             k_view = _fused_rms_norm_rope(
                 k_view,
-                self.k_norm_weight,
-                self.rms_norm_eps,
+                k_norm_weight,
+                rms_norm_eps,
                 cos,
                 sin,
                 prefer_small_triton=False,
@@ -522,50 +559,51 @@ class OptimizedDecoderLayer(nn.Module):
         k = k_view.transpose(1, 2)
         v = v.view(hidden_shape_kv).transpose(1, 2)
 
-        attn_output = self._attention_interface(
+        attn_output = attention_interface(
             self,
             q,
             k,
             v,
             None,
             dropout=0.0,
-            scaling=self.scaling,
+            scaling=scaling,
         )
         if isinstance(attn_output, tuple):
             attn_output = attn_output[0]
 
         if past_key_values is not None:
-            cache_kwargs = {
-                "sin": sin.unsqueeze(1),
-                "cos": cos.unsqueeze(1),
-                "cache_position": cache_position,
-            }
+            if cache_kwargs is None:
+                cache_kwargs = {
+                    "sin": sin.unsqueeze(1),
+                    "cos": cos.unsqueeze(1),
+                    "cache_position": cache_position,
+                }
             if _ENABLE_PREFILL_CONTIGUOUS_STATIC_KV:
                 updated_kv = _static_cache_prefill_prefix_update(
                     past_key_values,
-                    self.layer_idx,
+                    layer_idx,
                     k,
                     v,
                     cache_position,
                 )
                 if updated_kv is None:
-                    past_key_values.update(k, v, self.layer_idx, cache_kwargs)
+                    past_key_values.update(k, v, layer_idx, cache_kwargs)
             else:
-                past_key_values.update(k, v, self.layer_idx, cache_kwargs)
+                past_key_values.update(k, v, layer_idx, cache_kwargs)
 
         attn_output = attn_output.reshape(*input_shape, -1)
         if not attn_output.is_contiguous():
             attn_output = attn_output.contiguous()
 
-        attn_output = F.linear(attn_output, self.o_proj_weight, self.o_proj_bias)
+        attn_output = F.linear(attn_output, o_proj_weight, o_proj_bias)
         residual, hidden_states = _fused_add_rms_norm(
             residual,
             attn_output,
-            self.post_attn_layernorm_weight,
-            self.rms_norm_eps,
+            post_attn_layernorm_weight,
+            rms_norm_eps,
             prefer_small_triton=False,
         )
-        gate_up = F.linear(hidden_states, self.gate_up_weight)
+        gate_up = F.linear(hidden_states, gate_up_weight)
         hidden_states = _fused_silu_mul_packed(
             gate_up,
             prefer_small_triton=False,
@@ -577,7 +615,7 @@ class OptimizedDecoderLayer(nn.Module):
                 up,
                 prefer_small_triton=False,
             )
-        hidden_states = F.linear(hidden_states, self.down_proj_weight, self.down_proj_bias)
+        hidden_states = F.linear(hidden_states, down_proj_weight, down_proj_bias)
         return hidden_states + residual
 
     def _ensure_splitkv_workspace(self, split_k: int | None = None):
