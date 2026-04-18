@@ -45,6 +45,8 @@ _ENABLE_PREFILL_ROPE_FASTPATH = os.environ.get("ENABLE_PREFILL_ROPE_FASTPATH", "
 _ENABLE_PREFILL_PATCH_EMBED_LINEAR = os.environ.get("ENABLE_PREFILL_PATCH_EMBED_LINEAR", "1") == "1"
 _ENABLE_PREFILL_MM_SLICE_FASTPATH = os.environ.get("ENABLE_PREFILL_MM_SLICE_FASTPATH", "1") == "1"
 _ENABLE_PREFILL_TEXT_FASTPATH = os.environ.get("ENABLE_PREFILL_TEXT_FASTPATH", "1") == "1"
+_ENABLE_PREFILL_TEXT_CUDNN_SDPA = os.environ.get("ENABLE_PREFILL_TEXT_CUDNN_SDPA", "0") == "1"
+_ENABLE_PREFILL_LAYER_FASTCALL = os.environ.get("ENABLE_PREFILL_LAYER_FASTCALL", "1") == "1"
 _ENABLE_TRITON_PREFILL_FUSED_ADD_RMSNORM = os.environ.get("ENABLE_TRITON_PREFILL_FUSED_ADD_RMSNORM", "1") == "1"
 _ENABLE_TRITON_PREFILL_FUSED_SILU_MUL = os.environ.get("ENABLE_TRITON_PREFILL_FUSED_SILU_MUL", "1") == "1"
 _PREFILL_CACHE_MAX_ITEMS = max(1, int(os.environ.get("PREFILL_CACHE_MAX_ITEMS", "64")))
@@ -1765,6 +1767,7 @@ class VLMModel:
                     BaseModelOutputWithPast,
                     Qwen3VLModelOutputWithPast,
                 )
+                from contextlib import nullcontext
 
                 orig_model_forward = model_core.forward
                 orig_deepstack_process = language_model._deepstack_process
@@ -1879,24 +1882,49 @@ class VLMModel:
                         rotary_position_ids,
                     )
 
-                    for layer_idx, decoder_layer in enumerate(this_text_model.layers):
-                        hidden_states = decoder_layer(
-                            hidden_states,
-                            attention_mask=None,
-                            position_ids=text_position_ids,
-                            past_key_values=past_key_values,
-                            cache_position=cache_position,
-                            position_embeddings=position_embeddings,
-                            prefill_static_cache_no_mask=True,
-                            **kwargs,
-                        )
+                    attn_ctx = nullcontext()
+                    if _ENABLE_PREFILL_TEXT_CUDNN_SDPA:
+                        from torch.nn.attention import SDPBackend, sdpa_kernel
+                        attn_ctx = sdpa_kernel([SDPBackend.CUDNN_ATTENTION])
 
-                        if deepstack_visual_embeds is not None and layer_idx in range(len(deepstack_visual_embeds)):
-                            hidden_states = this_text_model._deepstack_process(
-                                hidden_states,
-                                visual_pos_masks,
-                                deepstack_visual_embeds[layer_idx],
-                            )
+                    layer_fastpaths = getattr(this_text_model, "_prefill_layer_fastpaths", None)
+                    deepstack_process = this_text_model._deepstack_process
+                    deepstack_count = 0 if deepstack_visual_embeds is None else len(deepstack_visual_embeds)
+
+                    with attn_ctx:
+                        if layer_fastpaths is not None:
+                            for layer_idx, fast_forward in enumerate(layer_fastpaths):
+                                hidden_states = fast_forward(
+                                    hidden_states,
+                                    position_embeddings,
+                                    past_key_values,
+                                    cache_position,
+                                )
+                                if layer_idx < deepstack_count:
+                                    hidden_states = deepstack_process(
+                                        hidden_states,
+                                        visual_pos_masks,
+                                        deepstack_visual_embeds[layer_idx],
+                                    )
+                        else:
+                            for layer_idx, decoder_layer in enumerate(this_text_model.layers):
+                                hidden_states = decoder_layer(
+                                    hidden_states,
+                                    attention_mask=None,
+                                    position_ids=text_position_ids,
+                                    past_key_values=past_key_values,
+                                    cache_position=cache_position,
+                                    position_embeddings=position_embeddings,
+                                    prefill_static_cache_no_mask=True,
+                                    **kwargs,
+                                )
+
+                                if layer_idx < deepstack_count:
+                                    hidden_states = deepstack_process(
+                                        hidden_states,
+                                        visual_pos_masks,
+                                        deepstack_visual_embeds[layer_idx],
+                                    )
 
                     hidden_states = this_text_model.norm(hidden_states)
                     return BaseModelOutputWithPast(
@@ -2059,6 +2087,19 @@ class VLMModel:
                     language_model._prefill_cache_position_cache = prefill_text_cache_position_cache
                     language_model._prefill_rotary_cache = prefill_text_rotary_cache
                     self._optimizations_applied.append("prefill:text_fastpath")
+                    if _ENABLE_PREFILL_LAYER_FASTCALL:
+                        layer_fastpaths = []
+                        for decoder_layer in language_model.layers:
+                            fast_forward = getattr(decoder_layer, "prefill_forward_no_mask", None)
+                            if fast_forward is None:
+                                layer_fastpaths = None
+                                break
+                            layer_fastpaths.append(fast_forward)
+                        if layer_fastpaths is not None:
+                            language_model._prefill_layer_fastpaths = tuple(layer_fastpaths)
+                            self._optimizations_applied.append("prefill:layer_fastcall")
+                if _ENABLE_PREFILL_TEXT_CUDNN_SDPA:
+                    self._optimizations_applied.append("prefill:text_cudnn_sdpa")
                 if _ENABLE_TRITON_PREFILL_FUSED_ADD_RMSNORM:
                     self._optimizations_applied.append("prefill:fused_add_rmsnorm")
                 if _ENABLE_TRITON_PREFILL_FUSED_SILU_MUL:

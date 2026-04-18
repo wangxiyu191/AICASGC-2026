@@ -294,7 +294,18 @@ class OptimizedDecoderLayer(nn.Module):
                     dropout=0.0, scaling=self.scaling, **kwargs,
                 )
         if past_key_values is not None and prefill_static_cache_no_mask:
-            past_key_values.update(k, v, self.layer_idx, cache_kwargs)
+            if _ENABLE_PREFILL_CONTIGUOUS_STATIC_KV:
+                updated_kv = _static_cache_prefill_prefix_update(
+                    past_key_values,
+                    self.layer_idx,
+                    k,
+                    v,
+                    cache_position,
+                )
+                if updated_kv is None:
+                    past_key_values.update(k, v, self.layer_idx, cache_kwargs)
+            else:
+                past_key_values.update(k, v, self.layer_idx, cache_kwargs)
         attn_output = attn_output.reshape(*input_shape, -1)
         if not attn_output.is_contiguous():
             attn_output = attn_output.contiguous()
@@ -443,6 +454,127 @@ class OptimizedDecoderLayer(nn.Module):
             if residual_epilogue_bias is None:
                 hidden_states = _add(hidden_states, residual, prefer_small_triton=prefer_small_decode_triton)
         return hidden_states
+
+    def prefill_forward_no_mask(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        past_key_values,
+        cache_position: torch.Tensor,
+    ) -> torch.Tensor:
+        """Specialized full-prompt prefill path with fixed calling convention.
+
+        This reuses the existing prefill operators but bypasses `nn.Module.__call__`,
+        decode-only branches, and dynamic kwargs handling inside `forward()`.
+        """
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape_q = (*input_shape, self.num_heads, self.head_dim)
+        hidden_shape_kv = (*input_shape, self.num_kv_heads, self.head_dim)
+        residual = hidden_states
+
+        hidden_states = _rms_norm(
+            hidden_states,
+            self.input_layernorm_weight,
+            self.rms_norm_eps,
+            prefer_small_triton=False,
+        )
+        qkv = F.linear(hidden_states, self.qkv_weight)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        cos, sin = position_embeddings
+        q_view = q.view(hidden_shape_q)
+        k_view = k.view(hidden_shape_kv)
+        fused_qk = _fused_qk_rms_norm_rope(
+            q_view,
+            k_view,
+            self.q_norm_weight,
+            self.k_norm_weight,
+            self.rms_norm_eps,
+            cos,
+            sin,
+            prefer_small_triton=False,
+        )
+        if fused_qk is None:
+            q_view = _fused_rms_norm_rope(
+                q_view,
+                self.q_norm_weight,
+                self.rms_norm_eps,
+                cos,
+                sin,
+                prefer_small_triton=False,
+            )
+            k_view = _fused_rms_norm_rope(
+                k_view,
+                self.k_norm_weight,
+                self.rms_norm_eps,
+                cos,
+                sin,
+                prefer_small_triton=False,
+            )
+        else:
+            q_view, k_view = fused_qk
+
+        q = q_view.transpose(1, 2)
+        k = k_view.transpose(1, 2)
+        v = v.view(hidden_shape_kv).transpose(1, 2)
+
+        attn_output = self._attention_interface(
+            self,
+            q,
+            k,
+            v,
+            None,
+            dropout=0.0,
+            scaling=self.scaling,
+        )
+        if isinstance(attn_output, tuple):
+            attn_output = attn_output[0]
+
+        if past_key_values is not None:
+            cache_kwargs = {
+                "sin": sin.unsqueeze(1),
+                "cos": cos.unsqueeze(1),
+                "cache_position": cache_position,
+            }
+            if _ENABLE_PREFILL_CONTIGUOUS_STATIC_KV:
+                updated_kv = _static_cache_prefill_prefix_update(
+                    past_key_values,
+                    self.layer_idx,
+                    k,
+                    v,
+                    cache_position,
+                )
+                if updated_kv is None:
+                    past_key_values.update(k, v, self.layer_idx, cache_kwargs)
+            else:
+                past_key_values.update(k, v, self.layer_idx, cache_kwargs)
+
+        attn_output = attn_output.reshape(*input_shape, -1)
+        if not attn_output.is_contiguous():
+            attn_output = attn_output.contiguous()
+
+        attn_output = F.linear(attn_output, self.o_proj_weight, self.o_proj_bias)
+        residual, hidden_states = _fused_add_rms_norm(
+            residual,
+            attn_output,
+            self.post_attn_layernorm_weight,
+            self.rms_norm_eps,
+            prefer_small_triton=False,
+        )
+        gate_up = F.linear(hidden_states, self.gate_up_weight)
+        hidden_states = _fused_silu_mul_packed(
+            gate_up,
+            prefer_small_triton=False,
+        )
+        if hidden_states is None:
+            gate, up = gate_up.chunk(2, dim=-1)
+            hidden_states = _fused_silu_mul(
+                gate,
+                up,
+                prefer_small_triton=False,
+            )
+        hidden_states = F.linear(hidden_states, self.down_proj_weight, self.down_proj_bias)
+        return hidden_states + residual
 
     def _ensure_splitkv_workspace(self, split_k: int | None = None):
         if split_k is None:
@@ -661,6 +793,7 @@ _CUDA_SMALL_DECODE_ATTENTION_O_PROJ_PREFETCH_BLOCKS = max(
     0, int(os.environ.get("CUDA_SMALL_DECODE_ATTENTION_O_PROJ_PREFETCH_BLOCKS", "16"))
 )
 _ENABLE_TRITON_SMALL_DECODE_STATIC_KV = os.environ.get("ENABLE_TRITON_SMALL_DECODE_STATIC_KV", "1") == "1"
+_ENABLE_PREFILL_CONTIGUOUS_STATIC_KV = os.environ.get("ENABLE_PREFILL_CONTIGUOUS_STATIC_KV", "0") == "1"
 _ENABLE_CUDA_FUSED_Q_ROPE_KV_CACHE = os.environ.get("ENABLE_CUDA_FUSED_Q_ROPE_KV_CACHE", "1") == "1"
 _ENABLE_TRITON_SMALL_DECODE_Q_ROPE_KV_CACHE = os.environ.get("ENABLE_TRITON_SMALL_DECODE_Q_ROPE_KV_CACHE", "0") == "1"
 _ENABLE_TRITON_SMALL_DECODE_GEMV = os.environ.get("ENABLE_TRITON_SMALL_DECODE_GEMV", "1") == "1"
@@ -2008,6 +2141,66 @@ def _static_cache_single_token_update(
         num_warps=1,
         num_stages=1,
     )
+    return layer.keys, layer.values
+
+
+def _static_cache_prefill_prefix_update(
+    past_key_values,
+    layer_idx: int,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    cache_position: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Contiguous prefix StaticCache update specialized for prefill fastpath.
+
+    The text prefill fastpath always builds `cache_position = arange(seq_len)` and
+    only uses this helper under `prefill_static_cache_no_mask=True`, so we can
+    bypass `StaticLayer.update()`'s generic `index_copy_` path and directly copy
+    the contiguous `[0:seq_len]` prefix into the cache.
+    """
+    if (
+        not isinstance(past_key_values, StaticCache)
+        or cache_position is None
+        or cache_position.device.type != "cuda"
+        or cache_position.ndim != 1
+        or key_states.device.type != "cuda"
+        or value_states.device.type != "cuda"
+        or key_states.ndim != 4
+        or value_states.ndim != 4
+        or key_states.shape != value_states.shape
+        or key_states.shape[2] != cache_position.numel()
+        or key_states.shape[0] != 1
+        or key_states.stride(-1) != 1
+        or value_states.stride(-1) != 1
+    ):
+        return None
+
+    layer = past_key_values.layers[layer_idx]
+    if not isinstance(layer, StaticLayer):
+        return None
+
+    if not layer.is_initialized:
+        layer.lazy_initialization(key_states, value_states)
+
+    if (
+        layer.keys is None
+        or layer.values is None
+        or layer.keys.device.type != "cuda"
+        or layer.values.device.type != "cuda"
+        or layer.keys.shape[:2] != key_states.shape[:2]
+        or layer.values.shape[:2] != value_states.shape[:2]
+        or layer.keys.shape[-1] != key_states.shape[-1]
+        or layer.values.shape[-1] != value_states.shape[-1]
+        or layer.keys.shape[2] < key_states.shape[2]
+        or layer.values.shape[2] < value_states.shape[2]
+        or layer.keys.stride(-1) != 1
+        or layer.values.stride(-1) != 1
+    ):
+        return None
+
+    seq_len = key_states.shape[2]
+    layer.keys.narrow(2, 0, seq_len).copy_(key_states)
+    layer.values.narrow(2, 0, seq_len).copy_(value_states)
     return layer.keys, layer.values
 
 
