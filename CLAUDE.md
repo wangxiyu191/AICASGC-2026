@@ -82,11 +82,11 @@ Setup scripts explicitly disable `ninja` and use `TORCH_CUDA_ARCH_LIST=8.0` (A80
 ```bash
 ./create_submission.sh            # emits submission_<short-sha>.zip
 ```
-This script builds both CUDA extensions, then packs `evaluation_wrapper.py`, `optimized_layer.py`, the CUDA loaders, `cuda_extensions/` (sources + prebuilt `.so`), `requirements.txt`, and `docs/{code_reading_guide.md,optimization_report.md}`. The ZIP must NOT contain `benchmark.py` (the eval worker ignores it anyway). Precompile `.so` files against CUDA 12.8 to match the eval machine ABI.
+This script builds both CUDA extensions, then packs `evaluation_wrapper.py`, `optimized_layer.py`, the CUDA loaders, `cuda_extensions/` (sources + prebuilt `.so`), `requirements.txt`, and `docs/optimization_report.md`. The ZIP must NOT contain `benchmark.py` (the eval worker ignores it anyway). Precompile `.so` files against CUDA 12.8 to match the eval machine ABI.
 
 ## Architecture
 
-The hot path is a single file chain; all optimizations land in **`evaluation_wrapper.py`** and **`optimized_layer.py`**. For the full tour, read [`docs/code_reading_guide.md`](docs/code_reading_guide.md) — it is the authoritative walkthrough with line numbers.
+The hot path is a single file chain; all optimizations land in **`evaluation_wrapper.py`** and **`optimized_layer.py`**. For the final implementation summary, read [`docs/optimization_report.md`](docs/optimization_report.md), especially Sections 3 and 4.
 
 ### High-level call graph
 ```
@@ -119,7 +119,7 @@ input_rmsnorm → qkv (1 fused GEMM/GEMV) → fused q_norm+k_norm+RoPE
  → single-token KV cache update (1 Triton kernel) → decode attention
  → o_proj → post_attn add+rmsnorm → fused gate_up → silu_mul → down_proj → residual_add
 ```
-Key fusions and when they fire are listed in `docs/code_reading_guide.md §4`. The single biggest wins layered in over time (see `result.csv`): fused QKV/gate_up, Triton small-shape RMSNorm/QK-norm+RoPE/decode-attention, split-KV attention with persistent workspace + online merge, Triton single-token StaticCache writer, CUDA nosplit GEMV (replacing cuBLAS M=1 WMMA GEMM), and persistent cooperative CUDA kernels that fuse `post_attn add+rmsnorm → gate_up → silu_mul → down_proj → residual_add` into a single launch, with an experimental variant that also absorbs `o_proj` upstream. The prefill path also has Triton kernels: fused QK-norm+RoPE with separate output strides (eliminates DirectCopy), packed SiLU*mul (eliminates chunk copies), fused add+RMSNorm, and fused vision RoPE (replaces 14 PyTorch ops per ViT block).
+Key fusions and when they fire are summarized in `docs/optimization_report.md` Sections 3.1, 3.2, and 4.2. The single biggest wins layered in over time (see `result.csv`): fused QKV/gate_up, Triton small-shape RMSNorm/QK-norm+RoPE/decode-attention, split-KV attention with persistent workspace + online merge, Triton single-token StaticCache writer, CUDA nosplit GEMV (replacing cuBLAS M=1 WMMA GEMM), and persistent cooperative CUDA kernels that fuse `post_attn add+rmsnorm → gate_up → silu_mul → down_proj → residual_add` into a single launch, with an experimental variant that also absorbs `o_proj` upstream. The prefill path also has Triton kernels: fused QK-norm+RoPE with separate output strides (eliminates DirectCopy), packed SiLU*mul (eliminates chunk copies), fused add+RMSNorm, and fused vision RoPE (replaces 14 PyTorch ops per ViT block).
 
 ### Decode attention dispatch (`_small_decode_attention`)
 Tried in order; each can be individually toggled via env var:
@@ -140,7 +140,7 @@ Two PyTorch `BuildExtension` modules, each with Python loaders at repo root:
   - Experimental split-KV decode attention with 32-warp tree reduction. Works but currently still slower than the Triton split-KV path on A800 — keep as reference implementation.
 
 ### Environment variable toggles
-The decode-path flags are enabled by default via `os.environ.setdefault` at the top of `evaluation_wrapper.py` and inside `optimized_layer.py`. Full table in `docs/code_reading_guide.md §7`. The currently-default ones you will likely touch:
+The decode-path flags are enabled by default via `os.environ.setdefault` at the top of `evaluation_wrapper.py` and inside `optimized_layer.py`. Full table in `docs/optimization_report.md §4.3`. The currently-default ones you will likely touch:
 - `ENABLE_CUSTOM_DECODE`, `ENABLE_CUDAGRAPH`
 - `ENABLE_CUDA_NOSPLIT_GEMV`
 - `ENABLE_CUDA_FUSED_GATEUP_SILU_DOWNPROJ` + `CUDA_FUSED_GATEUP_SILU_DOWNPROJ_VARIANT=persistent`
@@ -170,7 +170,6 @@ The decode-path flags are enabled by default via `os.environ.setdefault` at the 
 ## Key docs
 
 - [`docs/README.md`](docs/README.md) — index of active and stale design / analysis docs
-- [`docs/code_reading_guide.md`](docs/code_reading_guide.md) — full evaluation_wrapper + optimized_layer walkthrough with line numbers
 - [`docs/decode_fusion_plan.md`](docs/decode_fusion_plan.md) — in-flight fusion priorities
 - [`docs/decode_attention_optimization.md`](docs/decode_attention_optimization.md) — attention / split-KV route, NCU findings, failed experiments
 - [`docs/decode_gemv_analysis.md`](docs/decode_gemv_analysis.md) — GEMV analysis and CUDA/fusion verdicts

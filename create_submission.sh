@@ -127,9 +127,9 @@ if [ -d "$SCRIPT_DIR/cuda_extensions" ]; then
     done
 fi
 
-# Include documentation (code reading guide + optimization report)
+# Include documentation (final optimization report)
 mkdir -p "$TEMP_DIR/docs"
-for doc_file in code_reading_guide.md optimization_report.md; do
+for doc_file in optimization_report.md; do
     if [ -f "$SCRIPT_DIR/docs/$doc_file" ]; then
         cp "$SCRIPT_DIR/docs/$doc_file" "$TEMP_DIR/docs/"
         echo "Including docs/$doc_file"

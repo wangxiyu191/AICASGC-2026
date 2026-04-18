@@ -8,7 +8,6 @@ Qwen3-VL-2B-Instruct 推理优化过程中的分析报告与记录文档。
 
 | 文档 | 说明 |
 |------|------|
-| [code_reading_guide.md](./code_reading_guide.md) | 提交包中的辅助索引，指向技术报告中“主要执行路径与核心模块”等章节 |
 | [decode_fusion_plan.md](./decode_fusion_plan.md) | decode 深融合计划：优先级、实施顺序、改动文件、验证口径与止损条件 |
 | [decode_attention_optimization.md](./decode_attention_optimization.md) | decode attention / split-KV 路线的优化过程、`ncu` 结论、保留实现与已证伪实验汇总 |
 | [decode_gemv_analysis.md](./decode_gemv_analysis.md) | decode 阶段 `o_proj / down_proj / lm_head` 的 GEMV 性能分析、失败尝试与后续 CUDA/fusion 判断 |
