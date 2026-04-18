@@ -8,13 +8,13 @@ Qwen3-VL-2B-Instruct 推理优化过程中的分析报告与记录文档。
 
 | 文档 | 说明 |
 |------|------|
-| [code_reading_guide.md](./code_reading_guide.md) | 提交包中的辅助索引，指向技术报告中“评测入口与代码阅读路线”等章节 |
+| [code_reading_guide.md](./code_reading_guide.md) | 提交包中的辅助索引，指向技术报告中“主要执行路径与核心模块”等章节 |
 | [decode_fusion_plan.md](./decode_fusion_plan.md) | decode 深融合计划：优先级、实施顺序、改动文件、验证口径与止损条件 |
 | [decode_attention_optimization.md](./decode_attention_optimization.md) | decode attention / split-KV 路线的优化过程、`ncu` 结论、保留实现与已证伪实验汇总 |
 | [decode_gemv_analysis.md](./decode_gemv_analysis.md) | decode 阶段 `o_proj / down_proj / lm_head` 的 GEMV 性能分析、失败尝试与后续 CUDA/fusion 判断 |
 | [cuda_decode_attention_exploration.md](./cuda_decode_attention_exploration.md) | CUDA decode attention kernel 完整探索记录，Triton split-KV 仍为默认的决策依据 |
 | [optimization_attempts.md](./optimization_attempts.md) | 优化尝试与踩坑总结，含失败经验、已验证无效方向与未尝试方向 |
-| [optimization_report.md](./optimization_report.md) | 竞赛提交用最终技术报告，包含执行路径、代码阅读路线、最终启用 kernel 与实验结果说明 |
+| [optimization_report.md](./optimization_report.md) | 竞赛提交用最终技术报告，包含主要执行路径、核心模块、最终启用 kernel 与实验结果说明 |
 | [nsys_profiling_guide.md](./nsys_profiling_guide.md) | nsys 采集与分析流程: 命令、SQLite 分析模板、已有 trace 索引 |
 | [a800_splitkv_validation.md](./a800_splitkv_validation.md) | A800 split-KV decode attention 验证计划与结论 |
 | [a800_gemv_validation.md](./a800_gemv_validation.md) | A800 GEMV 验证计划与结论 |
