@@ -556,6 +556,11 @@ def fused_decode_full_layer_softsync_half(
     cos_vec = cos.reshape(-1).contiguous()
     sin_vec = sin.reshape(-1).contiguous()
     n = hidden_states.shape[-1]
+    attn_split_k = max(
+        2,
+        int(os.environ.get("CUDA_FUSED_FULL_LAYER_SOFTSYNC_ATTN_QHEAD_SPLITKV_SPLIT_K", "4")),
+    )
+    num_q_heads = k_cache.shape[1] * 2
     if (
         workspace is not None
         and workspace.get("type") == "fused_decode_full_layer_softsync"
@@ -563,6 +568,9 @@ def fused_decode_full_layer_softsync_half(
         and tuple(workspace["barrier_generation"].shape) == (1,)
         and tuple(workspace["kv_ready_count"].shape) == (1,)
         and tuple(workspace["attn_done_count"].shape) == (1,)
+        and tuple(workspace["attn_partial_acc"].shape) == (num_q_heads, attn_split_k, 128)
+        and tuple(workspace["attn_partial_stats"].shape) == (num_q_heads, attn_split_k, 2)
+        and tuple(workspace["attn_split_done_count"].shape) == (num_q_heads,)
         and tuple(workspace["qkv_out"].shape) == (4096,)
         and tuple(workspace["hidden_out"].shape) == (6144,)
         and tuple(workspace["out"].shape) == (n,)
@@ -570,6 +578,9 @@ def fused_decode_full_layer_softsync_half(
         and workspace["barrier_generation"].device == hidden_states.device
         and workspace["kv_ready_count"].device == hidden_states.device
         and workspace["attn_done_count"].device == hidden_states.device
+        and workspace["attn_partial_acc"].device == hidden_states.device
+        and workspace["attn_partial_stats"].device == hidden_states.device
+        and workspace["attn_split_done_count"].device == hidden_states.device
         and workspace["qkv_out"].device == hidden_states.device
         and workspace["hidden_out"].device == hidden_states.device
         and workspace["out"].device == hidden_states.device
@@ -577,6 +588,9 @@ def fused_decode_full_layer_softsync_half(
         and workspace["barrier_generation"].dtype == torch.int32
         and workspace["kv_ready_count"].dtype == torch.int32
         and workspace["attn_done_count"].dtype == torch.int32
+        and workspace["attn_partial_acc"].dtype == torch.float32
+        and workspace["attn_partial_stats"].dtype == torch.float32
+        and workspace["attn_split_done_count"].dtype == torch.int32
         and workspace["qkv_out"].dtype == hidden_states.dtype
         and workspace["hidden_out"].dtype == hidden_states.dtype
         and workspace["out"].dtype == hidden_states.dtype
@@ -585,6 +599,9 @@ def fused_decode_full_layer_softsync_half(
         barrier_generation = workspace["barrier_generation"]
         kv_ready_count = workspace["kv_ready_count"]
         attn_done_count = workspace["attn_done_count"]
+        attn_partial_acc = workspace["attn_partial_acc"]
+        attn_partial_stats = workspace["attn_partial_stats"]
+        attn_split_done_count = workspace["attn_split_done_count"]
         qkv_out = workspace["qkv_out"]
         hidden_out = workspace["hidden_out"]
         out_vec = workspace["out"]
@@ -593,6 +610,17 @@ def fused_decode_full_layer_softsync_half(
         barrier_generation = torch.zeros((1,), dtype=torch.int32, device=hidden_states.device)
         kv_ready_count = torch.zeros((1,), dtype=torch.int32, device=hidden_states.device)
         attn_done_count = torch.zeros((1,), dtype=torch.int32, device=hidden_states.device)
+        attn_partial_acc = torch.empty(
+            (num_q_heads, attn_split_k, 128),
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
+        attn_partial_stats = torch.empty(
+            (num_q_heads, attn_split_k, 2),
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
+        attn_split_done_count = torch.zeros((num_q_heads,), dtype=torch.int32, device=hidden_states.device)
         qkv_out = torch.empty((4096,), dtype=hidden_states.dtype, device=hidden_states.device)
         hidden_out = torch.empty((6144,), dtype=hidden_states.dtype, device=hidden_states.device)
         out_vec = torch.empty((n,), dtype=hidden_states.dtype, device=hidden_states.device)
@@ -622,6 +650,9 @@ def fused_decode_full_layer_softsync_half(
         barrier_generation,
         kv_ready_count,
         attn_done_count,
+        attn_partial_acc,
+        attn_partial_stats,
+        attn_split_done_count,
         qkv_out,
         hidden_out,
         out_vec,

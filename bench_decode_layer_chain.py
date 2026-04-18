@@ -159,6 +159,7 @@ def _run_layer_chain_capture(
         prefer_small_triton=False,
         cache_position=None,
         splitkv_workspace=None,
+        qhead_splitkv_workspace=None,
         prefetch_weight=None,
         prefetch_blocks=0,
     ):
@@ -173,6 +174,7 @@ def _run_layer_chain_capture(
             prefer_small_triton=prefer_small_triton,
             cache_position=cache_position,
             splitkv_workspace=splitkv_workspace,
+            qhead_splitkv_workspace=qhead_splitkv_workspace,
             prefetch_weight=prefetch_weight,
             prefetch_blocks=prefetch_blocks,
         )

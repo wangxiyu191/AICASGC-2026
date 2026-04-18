@@ -81,12 +81,19 @@ def _grid_blocks(device: torch.device, launch_blocks: int) -> int:
 
 
 def _make_profile_workspace(device: torch.device, dtype: torch.dtype, out_dim: int, grid_blocks: int) -> dict:
+    attn_split_k = max(
+        2,
+        int(os.environ.get("CUDA_FUSED_FULL_LAYER_SOFTSYNC_ATTN_QHEAD_SPLITKV_SPLIT_K", "4")),
+    )
     return {
         "type": "fused_decode_full_layer_softsync_profile",
         "barrier_count": torch.zeros((1,), dtype=torch.int32, device=device),
         "barrier_generation": torch.zeros((1,), dtype=torch.int32, device=device),
         "kv_ready_count": torch.zeros((1,), dtype=torch.int32, device=device),
         "attn_done_count": torch.zeros((1,), dtype=torch.int32, device=device),
+        "attn_partial_acc": torch.empty((16, attn_split_k, 128), dtype=torch.float32, device=device),
+        "attn_partial_stats": torch.empty((16, attn_split_k, 2), dtype=torch.float32, device=device),
+        "attn_split_done_count": torch.zeros((16,), dtype=torch.int32, device=device),
         "qkv_out": torch.empty((4096,), dtype=dtype, device=device),
         "hidden_out": torch.empty((6144,), dtype=dtype, device=device),
         "out": torch.empty((out_dim,), dtype=dtype, device=device),
@@ -99,12 +106,19 @@ def _make_profile_workspace(device: torch.device, dtype: torch.dtype, out_dim: i
 
 
 def _make_runtime_workspace(device: torch.device, dtype: torch.dtype, out_dim: int) -> dict:
+    attn_split_k = max(
+        2,
+        int(os.environ.get("CUDA_FUSED_FULL_LAYER_SOFTSYNC_ATTN_QHEAD_SPLITKV_SPLIT_K", "4")),
+    )
     return {
         "type": "fused_decode_full_layer_softsync",
         "barrier_count": torch.zeros((1,), dtype=torch.int32, device=device),
         "barrier_generation": torch.zeros((1,), dtype=torch.int32, device=device),
         "kv_ready_count": torch.zeros((1,), dtype=torch.int32, device=device),
         "attn_done_count": torch.zeros((1,), dtype=torch.int32, device=device),
+        "attn_partial_acc": torch.empty((16, attn_split_k, 128), dtype=torch.float32, device=device),
+        "attn_partial_stats": torch.empty((16, attn_split_k, 2), dtype=torch.float32, device=device),
+        "attn_split_done_count": torch.zeros((16,), dtype=torch.int32, device=device),
         "qkv_out": torch.empty((4096,), dtype=dtype, device=device),
         "hidden_out": torch.empty((6144,), dtype=dtype, device=device),
         "out": torch.empty((out_dim,), dtype=dtype, device=device),
@@ -303,8 +317,10 @@ def compute_summary(
     all_profiles: list[torch.Tensor],
     valid_len: int,
     grid_blocks: int,
+    attn_active_blocks: int | None = None,
     o_proj_active_blocks: int | None = None,
 ):
+    attn_blocks = attn_active_blocks if attn_active_blocks is not None else min(grid_blocks, 16)
     oproj_blocks = o_proj_active_blocks if o_proj_active_blocks is not None else grid_blocks
     summaries = {
         "input_rmsnorm": {"wall_us": [], "active_blocks": grid_blocks, "data_mb": 0.0},
@@ -312,7 +328,7 @@ def compute_summary(
         "sync1": {"wall_us": [], "active_blocks": grid_blocks, "data_mb": 0.0},
         "qkvcache": {"wall_us": [], "active_blocks": 8, "data_mb": 0.0},
         "sync2": {"wall_us": [], "active_blocks": grid_blocks, "data_mb": 0.0},
-        "attention": {"wall_us": [], "active_blocks": min(grid_blocks, 16), "data_mb": 0.0},
+        "attention": {"wall_us": [], "active_blocks": attn_blocks, "data_mb": 0.0},
         "sync3": {"wall_us": [], "active_blocks": grid_blocks, "data_mb": 0.0},
         "oproj": {"wall_us": [], "active_blocks": oproj_blocks, "data_mb": (2048 * 2048 * 2) / 1e6},
         "sync4": {"wall_us": [], "active_blocks": grid_blocks, "data_mb": 0.0},
@@ -410,6 +426,54 @@ def compute_summary(
     }
 
 
+def _block_role(block_idx: int, metadata: dict) -> str:
+    attn_active_blocks = int(metadata.get("attn_active_blocks", min(int(metadata["grid_blocks"]), 16)))
+    num_q_heads = int(metadata.get("num_q_heads", 0))
+    attn_qhead_splitkv = bool(metadata.get("attn_qhead_splitkv", False))
+    attn_split_k = int(metadata.get("attn_split_k", 1))
+    if block_idx < attn_active_blocks:
+        if attn_qhead_splitkv and attn_split_k > 1 and num_q_heads > 0:
+            q_head_idx = block_idx // attn_split_k
+            split_idx = block_idx % attn_split_k
+            return f"attn_q{q_head_idx:02d}_s{split_idx}"
+        if num_q_heads > 0:
+            return f"attn_q{block_idx:02d}"
+        return "attn"
+    return "idle"
+
+
+def _block_role_group(block_idx: int, metadata: dict) -> str:
+    attn_active_blocks = int(metadata.get("attn_active_blocks", min(int(metadata["grid_blocks"]), 16)))
+    attn_qhead_splitkv = bool(metadata.get("attn_qhead_splitkv", False))
+    if block_idx < attn_active_blocks:
+        return "attn_split" if attn_qhead_splitkv else "attn"
+    return "idle"
+
+
+def _role_summary(blocks: list[dict], metadata: dict) -> list[dict]:
+    grouped: dict[str, list[dict]] = {}
+    for block in blocks:
+        role = _block_role_group(int(block["block"]), metadata)
+        grouped.setdefault(role, []).append(block)
+
+    summary = []
+    for role, items in grouped.items():
+        totals = sorted(float(item["total"]) for item in items)
+        summary.append(
+            {
+                "role": role,
+                "count": len(items),
+                "median_total_us": totals[len(totals) // 2],
+                "max_total_us": max(totals),
+                "median_attention_us": sorted(float(item["attention"]) for item in items)[len(items) // 2],
+                "median_sync3_us": sorted(float(item["sync3"]) for item in items)[len(items) // 2],
+                "median_oproj_us": sorted(float(item["oproj"]) for item in items)[len(items) // 2],
+            }
+        )
+    summary.sort(key=lambda row: row["max_total_us"], reverse=True)
+    return summary
+
+
 def generate_html(phase_summary: dict, block_data_runs: list[list[dict]], effective_ghz_runs: list[float], validation: dict, metadata: dict) -> str:
     run_totals = [(max(block["total"] for block in blocks), idx) for idx, blocks in enumerate(block_data_runs)]
     run_totals.sort()
@@ -418,6 +482,7 @@ def generate_html(phase_summary: dict, block_data_runs: list[list[dict]], effect
     representative_total = run_totals[len(run_totals) // 2][0]
     max_total = max(block["total"] for block in representative_blocks) if representative_blocks else 1.0
     effective_ghz = effective_ghz_runs[representative_idx]
+    role_summary = _role_summary(representative_blocks, metadata)
     phase_color = {phase: color for phase, _label, color in PHASES}
     phase_label = {phase: label for phase, label, _color in PHASES}
 
@@ -434,8 +499,23 @@ def generate_html(phase_summary: dict, block_data_runs: list[list[dict]], effect
             "</tr>"
         )
 
+    role_rows = []
+    for row in role_summary:
+        role_rows.append(
+            "<tr>"
+            f"<td>{html.escape(row['role'])}</td>"
+            f"<td>{row['count']}</td>"
+            f"<td>{row['median_total_us']:.3f}</td>"
+            f"<td>{row['max_total_us']:.3f}</td>"
+            f"<td>{row['median_attention_us']:.3f}</td>"
+            f"<td>{row['median_sync3_us']:.3f}</td>"
+            f"<td>{row['median_oproj_us']:.3f}</td>"
+            "</tr>"
+        )
+
     timeline_rows = []
     for block in representative_blocks:
+        role = _block_role(int(block["block"]), metadata)
         segments = []
         offset = 0.0
         for phase, _label, _color in PHASES:
@@ -451,7 +531,7 @@ def generate_html(phase_summary: dict, block_data_runs: list[list[dict]], effect
             offset += dur
         timeline_rows.append(
             "<div class=\"row\">"
-            f"<div class=\"label\">B{block['block']:02d} / SM{block['sm_id']:02d}</div>"
+            f"<div class=\"label\">B{block['block']:02d} / SM{block['sm_id']:02d} / {html.escape(role)}</div>"
             f"<div class=\"bar\">{''.join(segments)}</div>"
             f"<div class=\"tail\">{block['total']:.3f} us</div>"
             "</div>"
@@ -460,10 +540,12 @@ def generate_html(phase_summary: dict, block_data_runs: list[list[dict]], effect
     detail_header = "".join(f"<th>{html.escape(phase)}</th>" for phase, _label, _color in PHASES)
     detail_rows = []
     for block in representative_blocks:
+        role = _block_role(int(block["block"]), metadata)
         detail_rows.append(
             "<tr>"
             f"<td>{block['block']}</td>"
             f"<td>{block['sm_id']}</td>"
+            f"<td>{html.escape(role)}</td>"
             + "".join(f"<td>{float(block[phase]):.3f}</td>" for phase, _label, _color in PHASES)
             + f"<td>{block['total']:.3f}</td>"
             "</tr>"
@@ -518,6 +600,9 @@ th:nth-child(2), td:nth-child(2) {{ text-align: left; }}
   <div>launch_blocks={metadata["launch_blocks"]}</div>
   <div>grid_blocks={metadata["grid_blocks"]}</div>
   <div>num_q_heads={metadata.get("num_q_heads", "NA")}</div>
+  <div>attn_qhead_splitkv={int(metadata.get("attn_qhead_splitkv", False))}</div>
+  <div>attn_split_k={metadata.get("attn_split_k", 1)}</div>
+  <div>attn_active_blocks={metadata.get("attn_active_blocks", "NA")}</div>
   <div>idle_blocks={metadata.get("idle_blocks", "NA")}</div>
   <div>partial_attn_flags={int(metadata.get("partial_attn_flags", False))}</div>
   <div>o_proj_idle_only={int(metadata.get("o_proj_idle_only", False))}</div>
@@ -547,6 +632,16 @@ th:nth-child(2), td:nth-child(2) {{ text-align: left; }}
 </table>
 <div class="note">`equiv_weight_GBps = weight_data_mb / median_wall_us * 1000`，按本表统计的权重字节量折算，仅作相对比较，不等同于真实 DRAM 带宽。</div>
 
+<h2>Representative Role Summary</h2>
+<table>
+  <thead>
+    <tr><th>role</th><th>count</th><th>median_total_us</th><th>max_total_us</th><th>median_attention_us</th><th>median_sync3_us</th><th>median_oproj_us</th></tr>
+  </thead>
+  <tbody>
+    {''.join(role_rows)}
+  </tbody>
+</table>
+
 <h2>Representative Timeline</h2>
 <div class="legend">{legend}</div>
 {''.join(timeline_rows)}
@@ -555,7 +650,7 @@ th:nth-child(2), td:nth-child(2) {{ text-align: left; }}
 <h2>Representative Block Table</h2>
 <table>
   <thead>
-    <tr><th>block</th><th>sm_id</th>{detail_header}<th>total</th></tr>
+    <tr><th>block</th><th>sm_id</th><th>role</th>{detail_header}<th>total</th></tr>
   </thead>
   <tbody>
     {''.join(detail_rows)}
@@ -611,6 +706,7 @@ def main():
         all_profiles,
         valid_len=valid_len,
         grid_blocks=grid_blocks,
+        attn_active_blocks=result["meta"].get("attn_active_blocks"),
         o_proj_active_blocks=result["meta"].get("o_proj_active_blocks"),
     )
 
@@ -637,6 +733,9 @@ def main():
         "launch_blocks": int(launch_blocks),
         "grid_blocks": int(grid_blocks),
         "num_q_heads": int(result["meta"].get("num_q_heads", 0)),
+        "attn_qhead_splitkv": bool(result["meta"].get("attn_qhead_splitkv", False)),
+        "attn_split_k": int(result["meta"].get("attn_split_k", 1)),
+        "attn_active_blocks": int(result["meta"].get("attn_active_blocks", min(grid_blocks, 16))),
         "idle_blocks": int(result["meta"].get("idle_blocks", 0)),
         "partial_attn_flags": bool(result["meta"].get("partial_attn_flags", False)),
         "o_proj_idle_only": bool(result["meta"].get("o_proj_idle_only", False)),

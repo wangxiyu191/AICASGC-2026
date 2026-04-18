@@ -2450,6 +2450,7 @@ constexpr int kAttnInternalSplits = kPersistentWarps;  // 32 (all warps)
 constexpr int kFullLayerThreads = 512;
 constexpr int kFullLayerWarps = kFullLayerThreads / kWarpSize;  // 16
 constexpr int kFullLayerInternalSplits = kFullLayerWarps;
+constexpr int kFullLayerQHeadSplitWarps = 12;
 
 __device__ __forceinline__ __half rope_out_half(
     __half a,
@@ -2733,6 +2734,9 @@ __global__ void fused_decode_full_layer_softsync_k2048_fwd_kernel(
     unsigned int* __restrict__ barrier_generation,
     unsigned int* __restrict__ kv_ready_count,
     unsigned int* __restrict__ attn_done_count,
+    float* __restrict__ attn_partial_acc,
+    float* __restrict__ attn_partial_stats,
+    int* __restrict__ attn_split_done_count,
     at::Half* __restrict__ qkv_out,
     at::Half* __restrict__ hidden_out,
     at::Half* __restrict__ out,
@@ -2755,7 +2759,9 @@ __global__ void fused_decode_full_layer_softsync_k2048_fwd_kernel(
     uint64_t o_proj_prefetch_start_delay_ns,
     uint64_t o_proj_prefetch_budget_ns,
     int max_seq_len,
-    int num_kv_heads) {
+    int num_kv_heads,
+    bool use_attn_qhead_splitkv,
+    int attn_qhead_split_k) {
     __shared__ __align__(16) __half residual_sh[kNosplitSpecializedK2048];
     __shared__ __align__(16) __half x_small_sh[kNosplitSpecializedK2048];
     __shared__ float warp_sums[kFullLayerWarps];
@@ -2803,7 +2809,10 @@ __global__ void fused_decode_full_layer_softsync_k2048_fwd_kernel(
     constexpr int kVOffset = kQRows + kKRows;
     const int num_q_heads = num_kv_heads * kAttnGqaRatio;
     const int kv_ready_blocks = min(static_cast<int>(gridDim.x), num_kv_heads);
-    const int attn_blocks = min(static_cast<int>(gridDim.x), num_q_heads);
+    const int attn_block_limit = use_attn_qhead_splitkv
+        ? num_q_heads * attn_qhead_split_k
+        : num_q_heads;
+    const int attn_blocks = min(static_cast<int>(gridDim.x), attn_block_limit);
 
     if (tid == 0) {
         local_gen_sh = barrier_generation[0];
@@ -2985,9 +2994,9 @@ __global__ void fused_decode_full_layer_softsync_k2048_fwd_kernel(
     const int group_id = lane / kAttnThreadGroup;
     const int group_lane = lane % kAttnThreadGroup;
     const int dim_offset = group_lane * kAttnDimsPerThread;
-    const int idle_block_idx = static_cast<int>(blockIdx.x) - num_q_heads;
+    const int idle_block_idx = static_cast<int>(blockIdx.x) - attn_blocks;
     const int o_proj_grid_blocks = o_proj_idle_only
-        ? max(0, static_cast<int>(gridDim.x) - num_q_heads)
+        ? max(0, static_cast<int>(gridDim.x) - attn_blocks)
         : static_cast<int>(gridDim.x);
     const int o_proj_block_idx = o_proj_idle_only
         ? idle_block_idx
@@ -3033,169 +3042,407 @@ __global__ void fused_decode_full_layer_softsync_k2048_fwd_kernel(
         }
     }
 
-    for (int q_head_idx = blockIdx.x; q_head_idx < num_q_heads; q_head_idx += gridDim.x) {
-        const int kv_head_idx = q_head_idx / kAttnGqaRatio;
-        const int chunk_size =
-            (valid_len + kFullLayerInternalSplits - 1) / kFullLayerInternalSplits;
-        const int chunk_start = warp * chunk_size;
-        const int chunk_end = min(chunk_start + chunk_size, valid_len);
+    if (use_attn_qhead_splitkv) {
+        if (static_cast<int>(blockIdx.x) < attn_blocks) {
+            const int q_head_idx = static_cast<int>(blockIdx.x) / attn_qhead_split_k;
+            const int split_idx = static_cast<int>(blockIdx.x) - q_head_idx * attn_qhead_split_k;
+            const int kv_head_idx = q_head_idx / kAttnGqaRatio;
+            const int merge_dim = lane * 4;
 
-        float q_reg[kAttnDimsPerThread];
-        {
-            const __half* qp = qkv_half + q_head_idx * kAttnHeadDim + dim_offset;
+            float m_val = kAttnNegLarge;
+            float l_val = 0.0f;
+            float acc[kAttnDimsPerThread];
             #pragma unroll
-            for (int i = 0; i < kAttnDimsPerThread; i += 8) {
-                uint4 d = __ldg(reinterpret_cast<const uint4*>(qp + i));
-                const __half* h = reinterpret_cast<const __half*>(&d);
-                #pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    q_reg[i + j] = __half2float(h[j]);
-                }
+            for (int i = 0; i < kAttnDimsPerThread; ++i) {
+                acc[i] = 0.0f;
             }
-        }
 
-        float m_val = kAttnNegLarge;
-        float l_val = 0.0f;
-        float acc[kAttnDimsPerThread];
-        #pragma unroll
-        for (int i = 0; i < kAttnDimsPerThread; ++i) {
-            acc[i] = 0.0f;
-        }
+            if (warp < kFullLayerQHeadSplitWarps) {
+                const int chunk_size =
+                    (valid_len + attn_qhead_split_k - 1) / attn_qhead_split_k;
+                const int chunk_start = split_idx * chunk_size;
+                const int chunk_end = min(chunk_start + chunk_size, valid_len);
 
-        const __half* k_base = k_cache_half + kv_head_idx * k_cache_stride_h;
-        const __half* v_base = v_cache_half + kv_head_idx * v_cache_stride_h;
+                if (chunk_start < chunk_end) {
+                    const int chunk_len = chunk_end - chunk_start;
+                    const int shard_size =
+                        (chunk_len + kFullLayerQHeadSplitWarps - 1) / kFullLayerQHeadSplitWarps;
+                    const int shard_start = chunk_start + warp * shard_size;
+                    const int shard_end = min(shard_start + shard_size, chunk_end);
 
-        if (chunk_start < chunk_end) {
-            for (int tile_start = chunk_start; tile_start < chunk_end;
-                 tile_start += kAttnTileN) {
-                const int tile_end = min(tile_start + kAttnTileN, chunk_end);
-                float local_scores[kAttnTileSteps];
-                float tile_max = kAttnNegLarge;
-
-                #pragma unroll
-                for (int step = 0; step < kAttnTileSteps; ++step) {
-                    const int t = tile_start + step * kAttnGroupsPerWarp + group_id;
-                    const bool valid = (t < tile_end);
-                    float dot = 0.0f;
-                    if (valid) {
-                        const __half* kp = k_base + t * k_cache_stride_s + dim_offset;
+                    if (shard_start < shard_end) {
+                        float q_reg[kAttnDimsPerThread];
+                        const __half* qp = qkv_half + q_head_idx * kAttnHeadDim + dim_offset;
                         #pragma unroll
                         for (int i = 0; i < kAttnDimsPerThread; i += 8) {
-                            uint4 d = __ldg(reinterpret_cast<const uint4*>(kp + i));
+                            uint4 d = __ldg(reinterpret_cast<const uint4*>(qp + i));
                             const __half* h = reinterpret_cast<const __half*>(&d);
                             #pragma unroll
                             for (int j = 0; j < 8; ++j) {
-                                dot += q_reg[i + j] * __half2float(h[j]);
+                                q_reg[i + j] = __half2float(h[j]);
                             }
                         }
+
+                        const __half* k_base = k_cache_half + kv_head_idx * k_cache_stride_h;
+                        const __half* v_base = v_cache_half + kv_head_idx * v_cache_stride_h;
+
+                        for (int tile_start = shard_start; tile_start < shard_end;
+                             tile_start += kAttnTileN) {
+                            const int tile_end = min(tile_start + kAttnTileN, shard_end);
+                            float local_scores[kAttnTileSteps];
+                            float tile_max = kAttnNegLarge;
+
+                            #pragma unroll
+                            for (int step = 0; step < kAttnTileSteps; ++step) {
+                                const int t = tile_start + step * kAttnGroupsPerWarp + group_id;
+                                const bool valid = (t < tile_end);
+                                float dot = 0.0f;
+                                if (valid) {
+                                    const __half* kp = k_base + t * k_cache_stride_s + dim_offset;
+                                    #pragma unroll
+                                    for (int i = 0; i < kAttnDimsPerThread; i += 8) {
+                                        uint4 d = __ldg(reinterpret_cast<const uint4*>(kp + i));
+                                        const __half* h = reinterpret_cast<const __half*>(&d);
+                                        #pragma unroll
+                                        for (int j = 0; j < 8; ++j) {
+                                            dot += q_reg[i + j] * __half2float(h[j]);
+                                        }
+                                    }
+                                }
+                                dot += __shfl_xor_sync(0xffffffff, dot, 1);
+                                dot += __shfl_xor_sync(0xffffffff, dot, 2);
+                                const float score = valid ? (dot * attn_scale) : kAttnNegLarge;
+                                local_scores[step] = score;
+                                tile_max = fmaxf(tile_max, score);
+                            }
+
+                            tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 4));
+                            tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 8));
+                            tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 16));
+
+                            const float new_m = fmaxf(m_val, tile_max);
+                            const float alpha = expf(m_val - new_m);
+                            #pragma unroll
+                            for (int i = 0; i < kAttnDimsPerThread; ++i) {
+                                acc[i] *= alpha;
+                            }
+                            l_val *= alpha;
+                            m_val = new_m;
+
+                            #pragma unroll
+                            for (int step = 0; step < kAttnTileSteps; ++step) {
+                                const int t = tile_start + step * kAttnGroupsPerWarp + group_id;
+                                const bool valid = (t < tile_end);
+                                if (!valid) {
+                                    continue;
+                                }
+                                const float p = expf(local_scores[step] - m_val);
+                                l_val += p;
+                                const __half* vp = v_base + t * v_cache_stride_s + dim_offset;
+                                #pragma unroll
+                                for (int i = 0; i < kAttnDimsPerThread; i += 8) {
+                                    uint4 d = __ldg(reinterpret_cast<const uint4*>(vp + i));
+                                    const __half* h = reinterpret_cast<const __half*>(&d);
+                                    #pragma unroll
+                                    for (int j = 0; j < 8; ++j) {
+                                        acc[i + j] += p * __half2float(h[j]);
+                                    }
+                                }
+                            }
+                        }
+
+                        #pragma unroll
+                        for (int xor_mask = kAttnThreadGroup; xor_mask < kAttnWarpSize;
+                             xor_mask <<= 1) {
+                            const float pm = __shfl_xor_sync(0xffffffff, m_val, xor_mask);
+                            const float pl = __shfl_xor_sync(0xffffffff, l_val, xor_mask);
+                            const float nm = fmaxf(m_val, pm);
+                            const float s_me = expf(m_val - nm);
+                            const float s_pa = expf(pm - nm);
+                            #pragma unroll
+                            for (int i = 0; i < kAttnDimsPerThread; ++i) {
+                                const float pa_v = __shfl_xor_sync(0xffffffff, acc[i], xor_mask);
+                                acc[i] = acc[i] * s_me + pa_v * s_pa;
+                            }
+                            l_val = l_val * s_me + pl * s_pa;
+                            m_val = nm;
+                        }
                     }
-                    dot += __shfl_xor_sync(0xffffffff, dot, 1);
-                    dot += __shfl_xor_sync(0xffffffff, dot, 2);
-                    const float score = valid ? (dot * attn_scale) : kAttnNegLarge;
-                    local_scores[step] = score;
-                    tile_max = fmaxf(tile_max, score);
                 }
+            }
 
-                tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 4));
-                tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 8));
-                tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 16));
-
-                const float new_m = fmaxf(m_val, tile_max);
-                const float alpha = expf(m_val - new_m);
+            if (group_id == 0) {
                 #pragma unroll
                 for (int i = 0; i < kAttnDimsPerThread; ++i) {
-                    acc[i] *= alpha;
+                    smem_acc[warp][dim_offset + i] = acc[i];
                 }
-                l_val *= alpha;
-                m_val = new_m;
+                if (group_lane == 0) {
+                    smem_m[warp] = m_val;
+                    smem_l[warp] = l_val;
+                }
+            }
+            __syncthreads();
+
+            if (warp == 0) {
+                float m_merge = kAttnNegLarge;
+                float l_merge = 0.0f;
+                float a0 = 0.0f;
+                float a1 = 0.0f;
+                float a2 = 0.0f;
+                float a3 = 0.0f;
 
                 #pragma unroll
-                for (int step = 0; step < kAttnTileSteps; ++step) {
-                    const int t = tile_start + step * kAttnGroupsPerWarp + group_id;
-                    const bool valid = (t < tile_end);
-                    if (valid) {
-                        const float p = expf(local_scores[step] - m_val);
-                        l_val += p;
-                        const __half* vp = v_base + t * v_cache_stride_s + dim_offset;
-                        #pragma unroll
-                        for (int i = 0; i < kAttnDimsPerThread; i += 8) {
-                            uint4 d = __ldg(reinterpret_cast<const uint4*>(vp + i));
-                            const __half* h = reinterpret_cast<const __half*>(&d);
-                            #pragma unroll
-                            for (int j = 0; j < 8; ++j) {
-                                acc[i + j] += p * __half2float(h[j]);
-                            }
-                        }
+                for (int s = 0; s < kFullLayerQHeadSplitWarps; ++s) {
+                    const float lv = smem_l[s];
+                    const float mv = smem_m[s];
+                    const float nm = fmaxf(m_merge, mv);
+                    const float s_old = expf(m_merge - nm);
+                    const float s_new = expf(mv - nm);
+                    const float* pv = &smem_acc[s][merge_dim];
+                    a0 = a0 * s_old + pv[0] * s_new;
+                    a1 = a1 * s_old + pv[1] * s_new;
+                    a2 = a2 * s_old + pv[2] * s_new;
+                    a3 = a3 * s_old + pv[3] * s_new;
+                    l_merge = l_merge * s_old + lv * s_new;
+                    m_merge = nm;
+                }
+
+                float* pa = attn_partial_acc
+                    + (q_head_idx * attn_qhead_split_k + split_idx) * kAttnHeadDim
+                    + merge_dim;
+                pa[0] = a0;
+                pa[1] = a1;
+                pa[2] = a2;
+                pa[3] = a3;
+                if (lane == 0) {
+                    float* ps = attn_partial_stats
+                        + (q_head_idx * attn_qhead_split_k + split_idx) * 2;
+                    ps[0] = l_merge;
+                    ps[1] = m_merge;
+                }
+
+                __syncwarp();
+                __threadfence();
+
+                int is_last = 0;
+                if (lane == 0) {
+                    const int arrived = atomicAdd(&attn_split_done_count[q_head_idx], 1);
+                    is_last = (arrived == attn_qhead_split_k - 1) ? 1 : 0;
+                    if (is_last) {
+                        attn_split_done_count[q_head_idx] = 0;
                     }
                 }
-            }
-        }
+                is_last = __shfl_sync(0xffffffff, is_last, 0);
 
-        #pragma unroll
-        for (int xor_mask = kAttnThreadGroup; xor_mask < kAttnWarpSize;
-             xor_mask <<= 1) {
-            const float pm = __shfl_xor_sync(0xffffffff, m_val, xor_mask);
-            const float pl = __shfl_xor_sync(0xffffffff, l_val, xor_mask);
-            const float nm = fmaxf(m_val, pm);
-            const float s_me = expf(m_val - nm);
-            const float s_pa = expf(pm - nm);
-            #pragma unroll
-            for (int i = 0; i < kAttnDimsPerThread; ++i) {
-                const float pa_v = __shfl_xor_sync(0xffffffff, acc[i], xor_mask);
-                acc[i] = acc[i] * s_me + pa_v * s_pa;
-            }
-            l_val = l_val * s_me + pl * s_pa;
-            m_val = nm;
-        }
+                if (is_last) {
+                    float out_m = kAttnNegLarge;
+                    float out_l = 0.0f;
+                    float out0 = 0.0f;
+                    float out1 = 0.0f;
+                    float out2 = 0.0f;
+                    float out3 = 0.0f;
 
-        if (group_id == 0) {
-            #pragma unroll
-            for (int i = 0; i < kAttnDimsPerThread; ++i) {
-                smem_acc[warp][dim_offset + i] = acc[i];
-            }
-            if (group_lane == 0) {
-                smem_m[warp] = m_val;
-                smem_l[warp] = l_val;
+                    for (int s = 0; s < attn_qhead_split_k; ++s) {
+                        const float* ps = attn_partial_stats
+                            + (q_head_idx * attn_qhead_split_k + s) * 2;
+                        const float* pv = attn_partial_acc
+                            + (q_head_idx * attn_qhead_split_k + s) * kAttnHeadDim
+                            + merge_dim;
+                        const float lv = ps[0];
+                        const float mv = ps[1];
+                        const float nm = fmaxf(out_m, mv);
+                        const float s_old = expf(out_m - nm);
+                        const float s_new = expf(mv - nm);
+                        out0 = out0 * s_old + pv[0] * s_new;
+                        out1 = out1 * s_old + pv[1] * s_new;
+                        out2 = out2 * s_old + pv[2] * s_new;
+                        out3 = out3 * s_old + pv[3] * s_new;
+                        out_l = out_l * s_old + lv * s_new;
+                        out_m = nm;
+                    }
+
+                    __half* op = qkv_half + q_head_idx * kAttnHeadDim + merge_dim;
+                    if (out_l > 0.0f) {
+                        const float inv_l = __fdividef(1.0f, out_l);
+                        op[0] = __float2half(out0 * inv_l);
+                        op[1] = __float2half(out1 * inv_l);
+                        op[2] = __float2half(out2 * inv_l);
+                        op[3] = __float2half(out3 * inv_l);
+                    } else {
+                        op[0] = __float2half(0.0f);
+                        op[1] = __float2half(0.0f);
+                        op[2] = __float2half(0.0f);
+                        op[3] = __float2half(0.0f);
+                    }
+                }
             }
         }
         __syncthreads();
+    } else {
+        for (int q_head_idx = blockIdx.x; q_head_idx < num_q_heads; q_head_idx += gridDim.x) {
+            const int kv_head_idx = q_head_idx / kAttnGqaRatio;
+            const int chunk_size =
+                (valid_len + kFullLayerInternalSplits - 1) / kFullLayerInternalSplits;
+            const int chunk_start = warp * chunk_size;
+            const int chunk_end = min(chunk_start + chunk_size, valid_len);
 
-        constexpr int kDimsPerLane = kAttnHeadDim / kAttnWarpSize;  // 4
-        #pragma unroll
-        for (int stride = kFullLayerInternalSplits / 2; stride >= 1; stride >>= 1) {
-            if (warp < stride) {
-                const int src = warp + stride;
-                const float pm = smem_m[src];
-                const float pl = smem_l[src];
-                const float my_m = smem_m[warp];
-                const float my_l = smem_l[warp];
-                const float nm = fmaxf(my_m, pm);
-                const float s_me = expf(my_m - nm);
+            float q_reg[kAttnDimsPerThread];
+            {
+                const __half* qp = qkv_half + q_head_idx * kAttnHeadDim + dim_offset;
+                #pragma unroll
+                for (int i = 0; i < kAttnDimsPerThread; i += 8) {
+                    uint4 d = __ldg(reinterpret_cast<const uint4*>(qp + i));
+                    const __half* h = reinterpret_cast<const __half*>(&d);
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        q_reg[i + j] = __half2float(h[j]);
+                    }
+                }
+            }
+
+            float m_val = kAttnNegLarge;
+            float l_val = 0.0f;
+            float acc[kAttnDimsPerThread];
+            #pragma unroll
+            for (int i = 0; i < kAttnDimsPerThread; ++i) {
+                acc[i] = 0.0f;
+            }
+
+            const __half* k_base = k_cache_half + kv_head_idx * k_cache_stride_h;
+            const __half* v_base = v_cache_half + kv_head_idx * v_cache_stride_h;
+
+            if (chunk_start < chunk_end) {
+                for (int tile_start = chunk_start; tile_start < chunk_end;
+                     tile_start += kAttnTileN) {
+                    const int tile_end = min(tile_start + kAttnTileN, chunk_end);
+                    float local_scores[kAttnTileSteps];
+                    float tile_max = kAttnNegLarge;
+
+                    #pragma unroll
+                    for (int step = 0; step < kAttnTileSteps; ++step) {
+                        const int t = tile_start + step * kAttnGroupsPerWarp + group_id;
+                        const bool valid = (t < tile_end);
+                        float dot = 0.0f;
+                        if (valid) {
+                            const __half* kp = k_base + t * k_cache_stride_s + dim_offset;
+                            #pragma unroll
+                            for (int i = 0; i < kAttnDimsPerThread; i += 8) {
+                                uint4 d = __ldg(reinterpret_cast<const uint4*>(kp + i));
+                                const __half* h = reinterpret_cast<const __half*>(&d);
+                                #pragma unroll
+                                for (int j = 0; j < 8; ++j) {
+                                    dot += q_reg[i + j] * __half2float(h[j]);
+                                }
+                            }
+                        }
+                        dot += __shfl_xor_sync(0xffffffff, dot, 1);
+                        dot += __shfl_xor_sync(0xffffffff, dot, 2);
+                        const float score = valid ? (dot * attn_scale) : kAttnNegLarge;
+                        local_scores[step] = score;
+                        tile_max = fmaxf(tile_max, score);
+                    }
+
+                    tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 4));
+                    tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 8));
+                    tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 16));
+
+                    const float new_m = fmaxf(m_val, tile_max);
+                    const float alpha = expf(m_val - new_m);
+                    #pragma unroll
+                    for (int i = 0; i < kAttnDimsPerThread; ++i) {
+                        acc[i] *= alpha;
+                    }
+                    l_val *= alpha;
+                    m_val = new_m;
+
+                    #pragma unroll
+                    for (int step = 0; step < kAttnTileSteps; ++step) {
+                        const int t = tile_start + step * kAttnGroupsPerWarp + group_id;
+                        const bool valid = (t < tile_end);
+                        if (valid) {
+                            const float p = expf(local_scores[step] - m_val);
+                            l_val += p;
+                            const __half* vp = v_base + t * v_cache_stride_s + dim_offset;
+                            #pragma unroll
+                            for (int i = 0; i < kAttnDimsPerThread; i += 8) {
+                                uint4 d = __ldg(reinterpret_cast<const uint4*>(vp + i));
+                                const __half* h = reinterpret_cast<const __half*>(&d);
+                                #pragma unroll
+                                for (int j = 0; j < 8; ++j) {
+                                    acc[i + j] += p * __half2float(h[j]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            #pragma unroll
+            for (int xor_mask = kAttnThreadGroup; xor_mask < kAttnWarpSize;
+                 xor_mask <<= 1) {
+                const float pm = __shfl_xor_sync(0xffffffff, m_val, xor_mask);
+                const float pl = __shfl_xor_sync(0xffffffff, l_val, xor_mask);
+                const float nm = fmaxf(m_val, pm);
+                const float s_me = expf(m_val - nm);
                 const float s_pa = expf(pm - nm);
                 #pragma unroll
-                for (int i = 0; i < kDimsPerLane; ++i) {
-                    const float my_a = smem_acc[warp][lane * kDimsPerLane + i];
-                    const float pa_v = smem_acc[src][lane * kDimsPerLane + i];
-                    smem_acc[warp][lane * kDimsPerLane + i] = my_a * s_me + pa_v * s_pa;
+                for (int i = 0; i < kAttnDimsPerThread; ++i) {
+                    const float pa_v = __shfl_xor_sync(0xffffffff, acc[i], xor_mask);
+                    acc[i] = acc[i] * s_me + pa_v * s_pa;
                 }
-                if (lane == 0) {
-                    smem_m[warp] = nm;
-                    smem_l[warp] = my_l * s_me + pl * s_pa;
+                l_val = l_val * s_me + pl * s_pa;
+                m_val = nm;
+            }
+
+            if (group_id == 0) {
+                #pragma unroll
+                for (int i = 0; i < kAttnDimsPerThread; ++i) {
+                    smem_acc[warp][dim_offset + i] = acc[i];
+                }
+                if (group_lane == 0) {
+                    smem_m[warp] = m_val;
+                    smem_l[warp] = l_val;
+                }
+            }
+            __syncthreads();
+
+            constexpr int kDimsPerLane = kAttnHeadDim / kAttnWarpSize;  // 4
+            #pragma unroll
+            for (int stride = kFullLayerInternalSplits / 2; stride >= 1; stride >>= 1) {
+                if (warp < stride) {
+                    const int src = warp + stride;
+                    const float pm = smem_m[src];
+                    const float pl = smem_l[src];
+                    const float my_m = smem_m[warp];
+                    const float my_l = smem_l[warp];
+                    const float nm = fmaxf(my_m, pm);
+                    const float s_me = expf(my_m - nm);
+                    const float s_pa = expf(pm - nm);
+                    #pragma unroll
+                    for (int i = 0; i < kDimsPerLane; ++i) {
+                        const float my_a = smem_acc[warp][lane * kDimsPerLane + i];
+                        const float pa_v = smem_acc[src][lane * kDimsPerLane + i];
+                        smem_acc[warp][lane * kDimsPerLane + i] = my_a * s_me + pa_v * s_pa;
+                    }
+                    if (lane == 0) {
+                        smem_m[warp] = nm;
+                        smem_l[warp] = my_l * s_me + pl * s_pa;
+                    }
+                }
+                __syncthreads();
+            }
+
+            if (warp == 0) {
+                const float inv_l = (smem_l[0] > 0.0f) ? (1.0f / smem_l[0]) : 0.0f;
+                __half* op = qkv_half + q_head_idx * kAttnHeadDim;
+                #pragma unroll
+                for (int i = 0; i < kDimsPerLane; ++i) {
+                    op[lane * kDimsPerLane + i] =
+                        __float2half(smem_acc[0][lane * kDimsPerLane + i] * inv_l);
                 }
             }
             __syncthreads();
         }
-
-        if (warp == 0) {
-            const float inv_l = (smem_l[0] > 0.0f) ? (1.0f / smem_l[0]) : 0.0f;
-            __half* op = qkv_half + q_head_idx * kAttnHeadDim;
-            #pragma unroll
-            for (int i = 0; i < kDimsPerLane; ++i) {
-                op[lane * kDimsPerLane + i] =
-                    __float2half(smem_acc[0][lane * kDimsPerLane + i] * inv_l);
-            }
-        }
-        __syncthreads();
     }
 
     if constexpr (kProfile) {
@@ -3688,6 +3935,9 @@ torch::Tensor fused_decode_full_layer_softsync_half_cuda(
     const torch::Tensor& barrier_generation,
     const torch::Tensor& kv_ready_count,
     const torch::Tensor& attn_done_count,
+    const torch::Tensor& attn_partial_acc,
+    const torch::Tensor& attn_partial_stats,
+    const torch::Tensor& attn_split_done_count,
     const torch::Tensor& qkv_out,
     const torch::Tensor& hidden_out,
     const torch::Tensor& out,
@@ -3704,6 +3954,8 @@ torch::Tensor fused_decode_full_layer_softsync_half_cuda(
             && gate_up_weight.is_cuda() && down_proj_weight.is_cuda()
             && barrier_count.is_cuda() && barrier_generation.is_cuda()
             && kv_ready_count.is_cuda() && attn_done_count.is_cuda()
+            && attn_partial_acc.is_cuda() && attn_partial_stats.is_cuda()
+            && attn_split_done_count.is_cuda()
             && qkv_out.is_cuda() && hidden_out.is_cuda() && out.is_cuda(),
         "fused full layer softsync expects CUDA tensors");
     TORCH_CHECK(hidden_states.scalar_type() == torch::kFloat16, "hidden_states must be fp16");
@@ -3723,6 +3975,9 @@ torch::Tensor fused_decode_full_layer_softsync_half_cuda(
     TORCH_CHECK(barrier_generation.scalar_type() == torch::kInt32, "barrier_generation must be int32");
     TORCH_CHECK(kv_ready_count.scalar_type() == torch::kInt32, "kv_ready_count must be int32");
     TORCH_CHECK(attn_done_count.scalar_type() == torch::kInt32, "attn_done_count must be int32");
+    TORCH_CHECK(attn_partial_acc.scalar_type() == torch::kFloat, "attn_partial_acc must be fp32");
+    TORCH_CHECK(attn_partial_stats.scalar_type() == torch::kFloat, "attn_partial_stats must be fp32");
+    TORCH_CHECK(attn_split_done_count.scalar_type() == torch::kInt32, "attn_split_done_count must be int32");
     TORCH_CHECK(qkv_out.scalar_type() == torch::kFloat16, "qkv_out must be fp16");
     TORCH_CHECK(hidden_out.scalar_type() == torch::kFloat16, "hidden_out must be fp16");
     TORCH_CHECK(out.scalar_type() == torch::kFloat16, "out must be fp16");
@@ -3752,6 +4007,9 @@ torch::Tensor fused_decode_full_layer_softsync_half_cuda(
     TORCH_CHECK(k_cache.size(1) == 8 && v_cache.size(1) == 8, "k_cache/v_cache must have 8 kv heads");
     TORCH_CHECK(k_cache.size(3) == kAttnHeadDim && v_cache.size(3) == kAttnHeadDim,
         "k_cache/v_cache head_dim must be 128");
+    const int attn_qhead_split_k = max(
+        2, getenv_int_or("CUDA_FUSED_FULL_LAYER_SOFTSYNC_ATTN_QHEAD_SPLITKV_SPLIT_K", 4));
+    const int64_t num_q_heads = k_cache.size(1) * kAttnGqaRatio;
     TORCH_CHECK(cache_position.dim() == 1 && cache_position.numel() == 1, "cache_position must be [1]");
     TORCH_CHECK(
         o_proj_weight.dim() == 2
@@ -3782,6 +4040,23 @@ torch::Tensor fused_decode_full_layer_softsync_half_cuda(
         "kv_ready_count must be [1]");
     TORCH_CHECK(attn_done_count.dim() == 1 && attn_done_count.numel() == 1,
         "attn_done_count must be [1]");
+    TORCH_CHECK(
+        attn_partial_acc.dim() == 3
+            && attn_partial_acc.size(0) == num_q_heads
+            && attn_partial_acc.size(1) == attn_qhead_split_k
+            && attn_partial_acc.size(2) == kAttnHeadDim
+            && attn_partial_acc.stride(2) == 1,
+        "attn_partial_acc must be contiguous [num_q_heads, split_k, 128]");
+    TORCH_CHECK(
+        attn_partial_stats.dim() == 3
+            && attn_partial_stats.size(0) == num_q_heads
+            && attn_partial_stats.size(1) == attn_qhead_split_k
+            && attn_partial_stats.size(2) == 2
+            && attn_partial_stats.stride(2) == 1,
+        "attn_partial_stats must be contiguous [num_q_heads, split_k, 2]");
+    TORCH_CHECK(
+        attn_split_done_count.dim() == 1 && attn_split_done_count.numel() == num_q_heads,
+        "attn_split_done_count must be [num_q_heads]");
     TORCH_CHECK(qkv_out.dim() == 1 && qkv_out.numel() == 4096, "qkv_out must be [4096]");
     TORCH_CHECK(hidden_out.dim() == 1 && hidden_out.numel() == 6144, "hidden_out must be [6144]");
     TORCH_CHECK(out.dim() == 1 && out.numel() == 2048, "out must be [2048]");
@@ -3842,6 +4117,9 @@ torch::Tensor fused_decode_full_layer_softsync_half_cuda(
     auto* barrier_generation_ptr = reinterpret_cast<unsigned int*>(barrier_generation.data_ptr<int32_t>());
     auto* kv_ready_count_ptr = reinterpret_cast<unsigned int*>(kv_ready_count.data_ptr<int32_t>());
     auto* attn_done_count_ptr = reinterpret_cast<unsigned int*>(attn_done_count.data_ptr<int32_t>());
+    auto* attn_partial_acc_ptr = attn_partial_acc.data_ptr<float>();
+    auto* attn_partial_stats_ptr = attn_partial_stats.data_ptr<float>();
+    auto* attn_split_done_count_ptr = attn_split_done_count.data_ptr<int32_t>();
     auto* qkv_out_ptr = qkv_out.data_ptr<at::Half>();
     auto* hidden_out_ptr = hidden_out.data_ptr<at::Half>();
     auto* out_ptr = out.data_ptr<at::Half>();
@@ -3863,8 +4141,18 @@ torch::Tensor fused_decode_full_layer_softsync_half_cuda(
         getenv_int_or("ENABLE_CUDA_FUSED_FULL_LAYER_SOFTSYNC_PARTIAL_ATTN_FLAGS", 0) == 1;
     const bool o_proj_idle_only =
         getenv_int_or("ENABLE_CUDA_FUSED_FULL_LAYER_SOFTSYNC_O_PROJ_IDLE_ONLY", 0) == 1;
-    const int num_q_heads = n_kv * kAttnGqaRatio;
-    const int idle_blocks = max(0, grid_blocks - num_q_heads);
+    const bool enable_attn_qhead_splitkv =
+        getenv_int_or("ENABLE_CUDA_FUSED_FULL_LAYER_SOFTSYNC_ATTN_QHEAD_SPLITKV", 1) == 1;
+    const int attn_qhead_splitkv_max_seq_len = getenv_int_or(
+        "CUDA_FUSED_FULL_LAYER_SOFTSYNC_ATTN_QHEAD_SPLITKV_MAX_SEQ_LEN", 4096);
+    const bool use_attn_qhead_splitkv =
+        enable_attn_qhead_splitkv
+        && grid_blocks >= n_kv * kAttnGqaRatio * attn_qhead_split_k
+        && (attn_qhead_splitkv_max_seq_len <= 0 || max_sl <= attn_qhead_splitkv_max_seq_len);
+    const int attn_active_blocks = min(
+        grid_blocks,
+        use_attn_qhead_splitkv ? n_kv * kAttnGqaRatio * attn_qhead_split_k : n_kv * kAttnGqaRatio);
+    const int idle_blocks = max(0, grid_blocks - attn_active_blocks);
     const int requested_o_proj_prefetch_blocks = getenv_int_or(
         "CUDA_FUSED_FULL_LAYER_SOFTSYNC_O_PROJ_PREFETCH_BLOCKS", 0);
     const int o_proj_prefetch_blocks = enable_o_proj_prefetch
@@ -3904,6 +4192,9 @@ torch::Tensor fused_decode_full_layer_softsync_half_cuda(
         barrier_generation_ptr,
         kv_ready_count_ptr,
         attn_done_count_ptr,
+        attn_partial_acc_ptr,
+        attn_partial_stats_ptr,
+        attn_split_done_count_ptr,
         qkv_out_ptr,
         hidden_out_ptr,
         out_ptr,
@@ -3926,7 +4217,9 @@ torch::Tensor fused_decode_full_layer_softsync_half_cuda(
         o_proj_prefetch_start_delay_ns,
         o_proj_prefetch_budget_ns,
         max_sl,
-        n_kv);
+        n_kv,
+        use_attn_qhead_splitkv,
+        attn_qhead_split_k);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
@@ -3952,6 +4245,9 @@ torch::Tensor fused_decode_full_layer_softsync_profile_half_cuda(
     const torch::Tensor& barrier_generation,
     const torch::Tensor& kv_ready_count,
     const torch::Tensor& attn_done_count,
+    const torch::Tensor& attn_partial_acc,
+    const torch::Tensor& attn_partial_stats,
+    const torch::Tensor& attn_split_done_count,
     const torch::Tensor& qkv_out,
     const torch::Tensor& hidden_out,
     const torch::Tensor& out,
@@ -3969,6 +4265,8 @@ torch::Tensor fused_decode_full_layer_softsync_profile_half_cuda(
             && gate_up_weight.is_cuda() && down_proj_weight.is_cuda()
             && barrier_count.is_cuda() && barrier_generation.is_cuda()
             && kv_ready_count.is_cuda() && attn_done_count.is_cuda()
+            && attn_partial_acc.is_cuda() && attn_partial_stats.is_cuda()
+            && attn_split_done_count.is_cuda()
             && qkv_out.is_cuda() && hidden_out.is_cuda() && out.is_cuda()
             && profile.is_cuda(),
         "fused full layer softsync profile expects CUDA tensors");
@@ -3989,6 +4287,9 @@ torch::Tensor fused_decode_full_layer_softsync_profile_half_cuda(
     TORCH_CHECK(barrier_generation.scalar_type() == torch::kInt32, "barrier_generation must be int32");
     TORCH_CHECK(kv_ready_count.scalar_type() == torch::kInt32, "kv_ready_count must be int32");
     TORCH_CHECK(attn_done_count.scalar_type() == torch::kInt32, "attn_done_count must be int32");
+    TORCH_CHECK(attn_partial_acc.scalar_type() == torch::kFloat, "attn_partial_acc must be fp32");
+    TORCH_CHECK(attn_partial_stats.scalar_type() == torch::kFloat, "attn_partial_stats must be fp32");
+    TORCH_CHECK(attn_split_done_count.scalar_type() == torch::kInt32, "attn_split_done_count must be int32");
     TORCH_CHECK(qkv_out.scalar_type() == torch::kFloat16, "qkv_out must be fp16");
     TORCH_CHECK(hidden_out.scalar_type() == torch::kFloat16, "hidden_out must be fp16");
     TORCH_CHECK(out.scalar_type() == torch::kFloat16, "out must be fp16");
@@ -4019,6 +4320,9 @@ torch::Tensor fused_decode_full_layer_softsync_profile_half_cuda(
     TORCH_CHECK(k_cache.size(1) == 8 && v_cache.size(1) == 8, "k_cache/v_cache must have 8 kv heads");
     TORCH_CHECK(k_cache.size(3) == kAttnHeadDim && v_cache.size(3) == kAttnHeadDim,
         "k_cache/v_cache head_dim must be 128");
+    const int attn_qhead_split_k = max(
+        2, getenv_int_or("CUDA_FUSED_FULL_LAYER_SOFTSYNC_ATTN_QHEAD_SPLITKV_SPLIT_K", 4));
+    const int64_t num_q_heads = k_cache.size(1) * kAttnGqaRatio;
     TORCH_CHECK(cache_position.dim() == 1 && cache_position.numel() == 1, "cache_position must be [1]");
     TORCH_CHECK(
         o_proj_weight.dim() == 2
@@ -4049,6 +4353,23 @@ torch::Tensor fused_decode_full_layer_softsync_profile_half_cuda(
         "kv_ready_count must be [1]");
     TORCH_CHECK(attn_done_count.dim() == 1 && attn_done_count.numel() == 1,
         "attn_done_count must be [1]");
+    TORCH_CHECK(
+        attn_partial_acc.dim() == 3
+            && attn_partial_acc.size(0) == num_q_heads
+            && attn_partial_acc.size(1) == attn_qhead_split_k
+            && attn_partial_acc.size(2) == kAttnHeadDim
+            && attn_partial_acc.stride(2) == 1,
+        "attn_partial_acc must be contiguous [num_q_heads, split_k, 128]");
+    TORCH_CHECK(
+        attn_partial_stats.dim() == 3
+            && attn_partial_stats.size(0) == num_q_heads
+            && attn_partial_stats.size(1) == attn_qhead_split_k
+            && attn_partial_stats.size(2) == 2
+            && attn_partial_stats.stride(2) == 1,
+        "attn_partial_stats must be contiguous [num_q_heads, split_k, 2]");
+    TORCH_CHECK(
+        attn_split_done_count.dim() == 1 && attn_split_done_count.numel() == num_q_heads,
+        "attn_split_done_count must be [num_q_heads]");
     TORCH_CHECK(qkv_out.dim() == 1 && qkv_out.numel() == 4096, "qkv_out must be [4096]");
     TORCH_CHECK(hidden_out.dim() == 1 && hidden_out.numel() == 6144, "hidden_out must be [6144]");
     TORCH_CHECK(out.dim() == 1 && out.numel() == 2048, "out must be [2048]");
@@ -4114,6 +4435,9 @@ torch::Tensor fused_decode_full_layer_softsync_profile_half_cuda(
     auto* barrier_generation_ptr = reinterpret_cast<unsigned int*>(barrier_generation.data_ptr<int32_t>());
     auto* kv_ready_count_ptr = reinterpret_cast<unsigned int*>(kv_ready_count.data_ptr<int32_t>());
     auto* attn_done_count_ptr = reinterpret_cast<unsigned int*>(attn_done_count.data_ptr<int32_t>());
+    auto* attn_partial_acc_ptr = attn_partial_acc.data_ptr<float>();
+    auto* attn_partial_stats_ptr = attn_partial_stats.data_ptr<float>();
+    auto* attn_split_done_count_ptr = attn_split_done_count.data_ptr<int32_t>();
     auto* qkv_out_ptr = qkv_out.data_ptr<at::Half>();
     auto* hidden_out_ptr = hidden_out.data_ptr<at::Half>();
     auto* out_ptr = out.data_ptr<at::Half>();
@@ -4136,8 +4460,18 @@ torch::Tensor fused_decode_full_layer_softsync_profile_half_cuda(
         getenv_int_or("ENABLE_CUDA_FUSED_FULL_LAYER_SOFTSYNC_PARTIAL_ATTN_FLAGS", 0) == 1;
     const bool o_proj_idle_only =
         getenv_int_or("ENABLE_CUDA_FUSED_FULL_LAYER_SOFTSYNC_O_PROJ_IDLE_ONLY", 0) == 1;
-    const int num_q_heads = n_kv * kAttnGqaRatio;
-    const int idle_blocks = max(0, grid_blocks - num_q_heads);
+    const bool enable_attn_qhead_splitkv =
+        getenv_int_or("ENABLE_CUDA_FUSED_FULL_LAYER_SOFTSYNC_ATTN_QHEAD_SPLITKV", 1) == 1;
+    const int attn_qhead_splitkv_max_seq_len = getenv_int_or(
+        "CUDA_FUSED_FULL_LAYER_SOFTSYNC_ATTN_QHEAD_SPLITKV_MAX_SEQ_LEN", 4096);
+    const bool use_attn_qhead_splitkv =
+        enable_attn_qhead_splitkv
+        && grid_blocks >= n_kv * kAttnGqaRatio * attn_qhead_split_k
+        && (attn_qhead_splitkv_max_seq_len <= 0 || max_sl <= attn_qhead_splitkv_max_seq_len);
+    const int attn_active_blocks = min(
+        grid_blocks,
+        use_attn_qhead_splitkv ? n_kv * kAttnGqaRatio * attn_qhead_split_k : n_kv * kAttnGqaRatio);
+    const int idle_blocks = max(0, grid_blocks - attn_active_blocks);
     const int requested_o_proj_prefetch_blocks = getenv_int_or(
         "CUDA_FUSED_FULL_LAYER_SOFTSYNC_O_PROJ_PREFETCH_BLOCKS", 0);
     const int o_proj_prefetch_blocks = enable_o_proj_prefetch
@@ -4177,6 +4511,9 @@ torch::Tensor fused_decode_full_layer_softsync_profile_half_cuda(
         barrier_generation_ptr,
         kv_ready_count_ptr,
         attn_done_count_ptr,
+        attn_partial_acc_ptr,
+        attn_partial_stats_ptr,
+        attn_split_done_count_ptr,
         qkv_out_ptr,
         hidden_out_ptr,
         out_ptr,
@@ -4199,7 +4536,9 @@ torch::Tensor fused_decode_full_layer_softsync_profile_half_cuda(
         o_proj_prefetch_start_delay_ns,
         o_proj_prefetch_budget_ns,
         max_sl,
-        n_kv);
+        n_kv,
+        use_attn_qhead_splitkv,
+        attn_qhead_split_k);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }

@@ -93,6 +93,11 @@ def fused_decode_full_layer_softsync_profile_half(
     requested_blocks = int(launch_blocks)
     grid_blocks = max(1, min(num_sms, requested_blocks if requested_blocks > 0 else num_sms))
     num_slots = len(FULL_LAYER_PROFILE_SLOT_NAMES)
+    attn_split_k = max(
+        2,
+        int(os.environ.get("CUDA_FUSED_FULL_LAYER_SOFTSYNC_ATTN_QHEAD_SPLITKV_SPLIT_K", "4")),
+    )
+    num_q_heads = int(k_cache.shape[1]) * 2
 
     if (
         workspace is not None
@@ -101,6 +106,9 @@ def fused_decode_full_layer_softsync_profile_half(
         and tuple(workspace["barrier_generation"].shape) == (1,)
         and tuple(workspace["kv_ready_count"].shape) == (1,)
         and tuple(workspace["attn_done_count"].shape) == (1,)
+        and tuple(workspace["attn_partial_acc"].shape) == (num_q_heads, attn_split_k, 128)
+        and tuple(workspace["attn_partial_stats"].shape) == (num_q_heads, attn_split_k, 2)
+        and tuple(workspace["attn_split_done_count"].shape) == (num_q_heads,)
         and tuple(workspace["qkv_out"].shape) == (4096,)
         and tuple(workspace["hidden_out"].shape) == (6144,)
         and tuple(workspace["out"].shape) == (n,)
@@ -108,6 +116,9 @@ def fused_decode_full_layer_softsync_profile_half(
         and workspace["barrier_generation"].device == hidden_states.device
         and workspace["kv_ready_count"].device == hidden_states.device
         and workspace["attn_done_count"].device == hidden_states.device
+        and workspace["attn_partial_acc"].device == hidden_states.device
+        and workspace["attn_partial_stats"].device == hidden_states.device
+        and workspace["attn_split_done_count"].device == hidden_states.device
         and workspace["qkv_out"].device == hidden_states.device
         and workspace["hidden_out"].device == hidden_states.device
         and workspace["out"].device == hidden_states.device
@@ -115,6 +126,9 @@ def fused_decode_full_layer_softsync_profile_half(
         and workspace["barrier_generation"].dtype == torch.int32
         and workspace["kv_ready_count"].dtype == torch.int32
         and workspace["attn_done_count"].dtype == torch.int32
+        and workspace["attn_partial_acc"].dtype == torch.float32
+        and workspace["attn_partial_stats"].dtype == torch.float32
+        and workspace["attn_split_done_count"].dtype == torch.int32
         and workspace["qkv_out"].dtype == hidden_states.dtype
         and workspace["hidden_out"].dtype == hidden_states.dtype
         and workspace["out"].dtype == hidden_states.dtype
@@ -127,6 +141,9 @@ def fused_decode_full_layer_softsync_profile_half(
         barrier_generation = workspace["barrier_generation"]
         kv_ready_count = workspace["kv_ready_count"]
         attn_done_count = workspace["attn_done_count"]
+        attn_partial_acc = workspace["attn_partial_acc"]
+        attn_partial_stats = workspace["attn_partial_stats"]
+        attn_split_done_count = workspace["attn_split_done_count"]
         qkv_out = workspace["qkv_out"]
         hidden_out = workspace["hidden_out"]
         out_vec = workspace["out"]
@@ -136,6 +153,17 @@ def fused_decode_full_layer_softsync_profile_half(
         barrier_generation = torch.zeros((1,), dtype=torch.int32, device=hidden_states.device)
         kv_ready_count = torch.zeros((1,), dtype=torch.int32, device=hidden_states.device)
         attn_done_count = torch.zeros((1,), dtype=torch.int32, device=hidden_states.device)
+        attn_partial_acc = torch.empty(
+            (num_q_heads, attn_split_k, 128),
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
+        attn_partial_stats = torch.empty(
+            (num_q_heads, attn_split_k, 2),
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
+        attn_split_done_count = torch.zeros((num_q_heads,), dtype=torch.int32, device=hidden_states.device)
         qkv_out = torch.empty((4096,), dtype=hidden_states.dtype, device=hidden_states.device)
         hidden_out = torch.empty((6144,), dtype=hidden_states.dtype, device=hidden_states.device)
         out_vec = torch.empty((n,), dtype=hidden_states.dtype, device=hidden_states.device)
@@ -163,6 +191,9 @@ def fused_decode_full_layer_softsync_profile_half(
         barrier_generation,
         kv_ready_count,
         attn_done_count,
+        attn_partial_acc,
+        attn_partial_stats,
+        attn_split_done_count,
         qkv_out,
         hidden_out,
         out_vec,
@@ -175,19 +206,37 @@ def fused_decode_full_layer_softsync_profile_half(
     )
     full_layer_gqa_ratio = 2
     num_q_heads = int(k_cache.shape[1]) * full_layer_gqa_ratio
+    enable_attn_qsplit = os.environ.get(
+        "ENABLE_CUDA_FUSED_FULL_LAYER_SOFTSYNC_ATTN_QHEAD_SPLITKV", "1"
+    ) == "1"
+    attn_qsplit_max_seq = int(
+        os.environ.get("CUDA_FUSED_FULL_LAYER_SOFTSYNC_ATTN_QHEAD_SPLITKV_MAX_SEQ_LEN", "4096")
+    )
+    use_attn_qsplit = (
+        enable_attn_qsplit
+        and grid_blocks >= num_q_heads * attn_split_k
+        and (attn_qsplit_max_seq <= 0 or int(k_cache.shape[2]) <= attn_qsplit_max_seq)
+    )
+    attn_active_blocks = min(
+        grid_blocks,
+        num_q_heads * attn_split_k if use_attn_qsplit else num_q_heads,
+    )
     o_proj_idle_only = os.environ.get(
         "ENABLE_CUDA_FUSED_FULL_LAYER_SOFTSYNC_O_PROJ_IDLE_ONLY", "0"
     ) == "1"
     partial_attn_flags = os.environ.get(
         "ENABLE_CUDA_FUSED_FULL_LAYER_SOFTSYNC_PARTIAL_ATTN_FLAGS", "0"
     ) == "1"
-    idle_blocks = max(0, grid_blocks - num_q_heads)
+    idle_blocks = max(0, grid_blocks - attn_active_blocks)
     o_proj_active_blocks = idle_blocks if o_proj_idle_only else grid_blocks
 
     meta = {
         "kernel_name": "fused_decode_full_layer_softsync_profile",
         "grid_blocks": grid_blocks,
         "num_q_heads": num_q_heads,
+        "attn_qhead_splitkv": use_attn_qsplit,
+        "attn_split_k": attn_split_k if use_attn_qsplit else 1,
+        "attn_active_blocks": attn_active_blocks,
         "idle_blocks": idle_blocks,
         "partial_attn_flags": partial_attn_flags,
         "o_proj_idle_only": o_proj_idle_only,

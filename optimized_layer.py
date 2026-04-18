@@ -687,6 +687,7 @@ class OptimizedDecoderLayer(nn.Module):
     def _ensure_full_layer_softsync_workspace(self):
         device = self.qkv_weight.device
         dtype = self.qkv_weight.dtype
+        attn_split_k = _CUDA_FUSED_FULL_LAYER_SOFTSYNC_ATTN_QHEAD_SPLITKV_SPLIT_K
         workspace = self._full_layer_softsync_workspace
         if (
             workspace is not None
@@ -695,6 +696,9 @@ class OptimizedDecoderLayer(nn.Module):
             and tuple(workspace["barrier_generation"].shape) == (1,)
             and tuple(workspace["kv_ready_count"].shape) == (1,)
             and tuple(workspace["attn_done_count"].shape) == (1,)
+            and tuple(workspace["attn_partial_acc"].shape) == (self.num_heads, attn_split_k, self.head_dim)
+            and tuple(workspace["attn_partial_stats"].shape) == (self.num_heads, attn_split_k, 2)
+            and tuple(workspace["attn_split_done_count"].shape) == (self.num_heads,)
             and tuple(workspace["qkv_out"].shape) == (4096,)
             and tuple(workspace["hidden_out"].shape) == (6144,)
             and tuple(workspace["out"].shape) == (2048,)
@@ -702,6 +706,9 @@ class OptimizedDecoderLayer(nn.Module):
             and workspace["barrier_generation"].device == device
             and workspace["kv_ready_count"].device == device
             and workspace["attn_done_count"].device == device
+            and workspace["attn_partial_acc"].device == device
+            and workspace["attn_partial_stats"].device == device
+            and workspace["attn_split_done_count"].device == device
             and workspace["qkv_out"].device == device
             and workspace["hidden_out"].device == device
             and workspace["out"].device == device
@@ -709,6 +716,9 @@ class OptimizedDecoderLayer(nn.Module):
             and workspace["barrier_generation"].dtype == torch.int32
             and workspace["kv_ready_count"].dtype == torch.int32
             and workspace["attn_done_count"].dtype == torch.int32
+            and workspace["attn_partial_acc"].dtype == torch.float32
+            and workspace["attn_partial_stats"].dtype == torch.float32
+            and workspace["attn_split_done_count"].dtype == torch.int32
             and workspace["qkv_out"].dtype == dtype
             and workspace["hidden_out"].dtype == dtype
             and workspace["out"].dtype == dtype
@@ -720,6 +730,17 @@ class OptimizedDecoderLayer(nn.Module):
             "barrier_generation": torch.zeros((1,), dtype=torch.int32, device=device),
             "kv_ready_count": torch.zeros((1,), dtype=torch.int32, device=device),
             "attn_done_count": torch.zeros((1,), dtype=torch.int32, device=device),
+            "attn_partial_acc": torch.empty(
+                (self.num_heads, attn_split_k, self.head_dim),
+                dtype=torch.float32,
+                device=device,
+            ),
+            "attn_partial_stats": torch.empty(
+                (self.num_heads, attn_split_k, 2),
+                dtype=torch.float32,
+                device=device,
+            ),
+            "attn_split_done_count": torch.zeros((self.num_heads,), dtype=torch.int32, device=device),
             "qkv_out": torch.empty((4096,), dtype=dtype, device=device),
             "hidden_out": torch.empty((6144,), dtype=dtype, device=device),
             "out": torch.empty((2048,), dtype=dtype, device=device),
@@ -825,6 +846,15 @@ _ENABLE_CUDA_FUSED_POST_ATTN_MLP_PERSISTENT = os.environ.get("ENABLE_CUDA_FUSED_
 _FUSED_POST_ATTN_MLP_THREADS = int(os.environ.get("FUSED_POST_ATTN_MLP_THREADS", "1024"))
 _FUSED_POST_ATTN_MLP_BLOCKS = int(os.environ.get("FUSED_POST_ATTN_MLP_BLOCKS", "0"))
 _ENABLE_CUDA_FUSED_FULL_LAYER_SOFTSYNC = os.environ.get("ENABLE_CUDA_FUSED_FULL_LAYER_SOFTSYNC", "0") == "1"
+_ENABLE_CUDA_FUSED_FULL_LAYER_SOFTSYNC_ATTN_QHEAD_SPLITKV = os.environ.get(
+    "ENABLE_CUDA_FUSED_FULL_LAYER_SOFTSYNC_ATTN_QHEAD_SPLITKV", "1"
+) == "1"
+_CUDA_FUSED_FULL_LAYER_SOFTSYNC_ATTN_QHEAD_SPLITKV_SPLIT_K = max(
+    2, int(os.environ.get("CUDA_FUSED_FULL_LAYER_SOFTSYNC_ATTN_QHEAD_SPLITKV_SPLIT_K", "4"))
+)
+_CUDA_FUSED_FULL_LAYER_SOFTSYNC_ATTN_QHEAD_SPLITKV_MAX_SEQ_LEN = int(
+    os.environ.get("CUDA_FUSED_FULL_LAYER_SOFTSYNC_ATTN_QHEAD_SPLITKV_MAX_SEQ_LEN", "4096")
+)
 _ENABLE_CUDA_FUSED_O_PROJ_POST_ATTN_MLP_PERSISTENT = os.environ.get(
     "ENABLE_CUDA_FUSED_O_PROJ_POST_ATTN_MLP_PERSISTENT", "0"
 ) == "1"
