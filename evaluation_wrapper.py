@@ -1145,10 +1145,14 @@ class VLMModel:
             self._optimizations_applied.append("decode:fused_rmsnorm_qkv")
         if os.environ.get("ENABLE_CUDA_SMALL_DECODE_ATTENTION_O_PROJ_PREFETCH", "0") == "1":
             self._optimizations_applied.append("decode:attn_o_proj_prefetch")
-        if os.environ.get("ENABLE_CUDA_SMALL_DECODE_ATTENTION_V4_QHEAD_SPLITKV", "0") == "1":
+        if os.environ.get("ENABLE_CUDA_SMALL_DECODE_ATTENTION_V4_QHEAD_SPLITKV", "1") == "1":
             split_k = os.environ.get("CUDA_SMALL_DECODE_ATTENTION_V4_QHEAD_SPLITKV_SPLIT_K", "4")
-            min_seq = os.environ.get("CUDA_SMALL_DECODE_ATTENTION_V4_QHEAD_SPLITKV_MIN_SEQ_LEN", "705")
-            self._optimizations_applied.append(f"decode:attn_v4_qhead_splitkv_k{split_k}_min{min_seq}")
+            max_seq = os.environ.get("CUDA_SMALL_DECODE_ATTENTION_V4_QHEAD_SPLITKV_MAX_SEQ_LEN", "4096")
+            tag = f"decode:attn_v4_qhead_splitkv_k{split_k}_max{max_seq}"
+            min_seq = os.environ.get("CUDA_SMALL_DECODE_ATTENTION_V4_QHEAD_SPLITKV_MIN_SEQ_LEN")
+            if min_seq is not None:
+                tag += f"_min{min_seq}"
+            self._optimizations_applied.append(tag)
         if os.environ.get("ENABLE_CUDA_FUSED_GATEUP_SILU_DOWNPROJ", "0") == "1":
             variant = os.environ.get("CUDA_FUSED_GATEUP_SILU_DOWNPROJ_VARIANT", "persistent").strip().lower()
             self._optimizations_applied.append(f"decode:mlp_fused_{variant}")
